@@ -1,0 +1,207 @@
+/* ─── First-run setup wizard ──────────────────────────────────────────────────
+   Loaded before app.js. Fetches /setup/status; if not configured, takes over
+   the screen with a step-by-step wizard. Does nothing once a key is saved.
+   Self-contained styles so it does not collide with the HUD layout. */
+
+#setup-wizard {
+  position: fixed;
+  inset: 0;
+  z-index: 99999;
+  display: none;                     /* shown by setup-wizard.js when needed */
+  flex-direction: column;
+  background: radial-gradient(ellipse at 50% 0%, #001428 0%, #000810 55%, #00040e 100%);
+  color: #cce8f8;
+  font-family: 'SF Mono', 'Menlo', 'Courier New', monospace;
+  font-size: 12px;
+  padding: 28px 28px 22px;
+  border-radius: 14px;
+  border: 1px solid rgba(0, 212, 255, 0.30);
+  -webkit-app-region: drag;          /* whole panel is a drag handle */
+}
+#setup-wizard.visible { display: flex; }
+
+#setup-wizard * { -webkit-app-region: no-drag; box-sizing: border-box; }
+
+#setup-wizard h1 {
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', sans-serif;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: #e2f3ff;
+  margin-bottom: 6px;
+}
+#setup-wizard h2 {
+  font-size: 13px;
+  font-weight: 500;
+  color: rgba(160, 210, 240, 0.70);
+  letter-spacing: 0.06em;
+  margin-bottom: 18px;
+  text-transform: uppercase;
+}
+#setup-wizard p  { line-height: 1.55; color: rgba(200, 226, 246, 0.85); margin-bottom: 14px; font-family: -apple-system, sans-serif; }
+#setup-wizard small { color: rgba(160, 210, 240, 0.55); font-family: -apple-system, sans-serif; }
+
+#setup-wizard .sw-logo {
+  font-size: 13px;
+  letter-spacing: 0.18em;
+  color: #00d4ff;
+  margin-bottom: 24px;
+}
+
+#setup-wizard .sw-step {
+  display: none;
+  flex: 1;
+  flex-direction: column;
+  overflow: auto;
+}
+#setup-wizard .sw-step.active { display: flex; }
+
+#setup-wizard .sw-progress {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 20px;
+}
+#setup-wizard .sw-pip {
+  flex: 1;
+  height: 3px;
+  background: rgba(0, 212, 255, 0.12);
+  border-radius: 2px;
+  transition: background 0.4s ease;
+}
+#setup-wizard .sw-pip.done   { background: rgba(0, 212, 255, 0.85); }
+#setup-wizard .sw-pip.active { background: rgba(0, 212, 255, 0.45); box-shadow: 0 0 8px rgba(0, 212, 255, 0.5); }
+
+#setup-wizard .sw-card {
+  background: rgba(0, 12, 30, 0.6);
+  border: 1px solid rgba(0, 212, 255, 0.18);
+  border-radius: 10px;
+  padding: 16px 18px;
+  margin-bottom: 12px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  font-family: -apple-system, sans-serif;
+}
+#setup-wizard .sw-card:hover { border-color: rgba(0, 212, 255, 0.55); background: rgba(0, 18, 42, 0.8); }
+#setup-wizard .sw-card.selected { border-color: #00d4ff; box-shadow: 0 0 0 1px rgba(0, 212, 255, 0.4) inset; }
+#setup-wizard .sw-card .title { font-size: 14px; font-weight: 600; color: #e2f3ff; margin-bottom: 4px; display: flex; align-items: center; gap: 8px; }
+#setup-wizard .sw-card .title .badge { font-size: 10px; padding: 2px 6px; border-radius: 4px; background: rgba(0, 232, 122, 0.16); color: #5fffaa; letter-spacing: 0.05em; font-weight: 500; }
+#setup-wizard .sw-card .desc  { font-size: 12px; color: rgba(180, 210, 230, 0.72); line-height: 1.5; }
+
+#setup-wizard input[type="text"],
+#setup-wizard input[type="password"] {
+  width: 100%;
+  padding: 11px 12px;
+  background: rgba(0, 8, 22, 0.85);
+  border: 1px solid rgba(0, 212, 255, 0.22);
+  border-radius: 8px;
+  color: #e2f3ff;
+  font-family: 'SF Mono', monospace;
+  font-size: 12px;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+#setup-wizard input:focus { border-color: rgba(0, 212, 255, 0.65); }
+
+#setup-wizard label.sw-label {
+  display: block;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: rgba(160, 210, 240, 0.65);
+  margin-bottom: 6px;
+}
+
+#setup-wizard a.sw-link {
+  color: #00d4ff;
+  text-decoration: none;
+  cursor: pointer;
+}
+#setup-wizard a.sw-link:hover { text-decoration: underline; }
+
+#setup-wizard .sw-result {
+  font-family: -apple-system, sans-serif;
+  font-size: 12px;
+  margin-top: 10px;
+  min-height: 18px;
+}
+#setup-wizard .sw-result.ok   { color: #5fffaa; }
+#setup-wizard .sw-result.err  { color: #ff7090; }
+#setup-wizard .sw-result.busy { color: rgba(160, 210, 240, 0.65); }
+
+#setup-wizard .sw-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+#setup-wizard .sw-perm {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  background: rgba(0, 12, 30, 0.5);
+  border: 1px solid rgba(0, 212, 255, 0.14);
+  border-radius: 8px;
+  margin-bottom: 8px;
+  font-family: -apple-system, sans-serif;
+}
+#setup-wizard .sw-perm .info { flex: 1; }
+#setup-wizard .sw-perm .info .name { font-weight: 600; color: #e2f3ff; }
+#setup-wizard .sw-perm .info .why  { font-size: 11px; color: rgba(180, 210, 230, 0.65); margin-top: 2px; }
+
+#setup-wizard .sw-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: auto;
+  padding-top: 18px;
+}
+
+#setup-wizard button {
+  font-family: -apple-system, sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  padding: 10px 20px;
+  border-radius: 8px;
+  border: 1px solid rgba(0, 212, 255, 0.30);
+  background: rgba(0, 18, 42, 0.6);
+  color: #cce8f8;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  letter-spacing: 0.02em;
+}
+#setup-wizard button:hover:not(:disabled) {
+  border-color: rgba(0, 212, 255, 0.6);
+  background: rgba(0, 30, 60, 0.8);
+}
+#setup-wizard button:disabled { opacity: 0.45; cursor: not-allowed; }
+#setup-wizard button.primary {
+  background: linear-gradient(180deg, #00d4ff 0%, #0099bb 100%);
+  border-color: transparent;
+  color: #001828;
+  font-weight: 600;
+}
+#setup-wizard button.primary:hover:not(:disabled) {
+  background: linear-gradient(180deg, #33ddff 0%, #00aaccc) #00aacc;
+}
+#setup-wizard button.ghost {
+  border-color: rgba(160, 210, 240, 0.18);
+  color: rgba(180, 210, 230, 0.7);
+}
+#setup-wizard button.spacer { margin-left: auto; }
+
+#setup-wizard #sw-final {
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+#setup-wizard #sw-final .check {
+  width: 64px; height: 64px;
+  border-radius: 50%;
+  background: rgba(0, 232, 122, 0.12);
+  border: 2px solid rgba(0, 232, 122, 0.5);
+  color: #5fffaa;
+  font-size: 32px;
+  display: flex; align-items: center; justify-content: center;
+  margin: 0 auto 18px;
+}

@@ -1,0 +1,99 @@
+{
+  "name": "jarvis",
+  "version": "1.0.0",
+  "description": "JARVIS — AI Personal Assistant",
+  "author": "Dylan Roe",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "prebuild": "rm -rf dist",
+    "build:mac": "npm run prebuild && electron-builder --mac --arm64",
+    "build:mac:signed": "npm run prebuild && electron-builder --mac --arm64 --publish never",
+    "build:mac:unsigned": "npm run prebuild && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac --arm64 --publish never",
+    "build:win": "electron-builder --win",
+    "build:all": "electron-builder --mac --win"
+  },
+  "build": {
+    "appId": "app.jarvis.desktop",
+    "productName": "JARVIS",
+    "copyright": "Dylan Roe",
+    "files": [
+      "**/*",
+      "!node_modules/.cache"
+    ],
+    "extraResources": [
+      {
+        "from": "../",
+        "to": "jarvis",
+        "filter": [
+          "brain/**/*.py",
+          "voice/**/*.py",
+          "tools/**/*.py",
+          "ui/**/*.py",
+          "memory/**/*.py",
+          "server.py",
+          "app.py",
+          "chat.py",
+          "main.py",
+          "config.py",
+          "setup.py",
+          "setup_api.py",
+          "requirements.txt",
+          "setup.sh",
+          ".env.example",
+          "!**/.env",
+          "!**/.env.*",
+          "!**/.setup_done",
+          "!**/memory.txt",
+          "!**/__pycache__/**",
+          "!**/*.pyc",
+          "!**/.venv/**",
+          "!**/node_modules/**",
+          "!jarvis-app/**",
+          "!agents/**",
+          "!.octogent/**",
+          "!study_notes/**",
+          "!dist/**"
+        ]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "icon": "assets/icon.icns",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "darkModeSupport": true
+    },
+    "win": {
+      "icon": "assets/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "dmg": {
+      "title": "JARVIS Installer",
+      "background": "assets/dmg-background.png"
+    }
+  },
+  "devDependencies": {
+    "electron": "^28.3.3",
+    "electron-builder": "^24.0.0"
+  },
+  "dependencies": {
+    "@mediapipe/hands": "^0.4.1675469240",
+    "three": "^0.184.0",
+    "webgazer": "^3.5.3"
+  }
+}

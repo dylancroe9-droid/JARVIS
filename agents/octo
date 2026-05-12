@@ -1,0 +1,345 @@
+#!/usr/bin/env bash
+# `octo` — control surface for the JARVIS agent swarm.
+#
+# Usage:
+#   octo                        — show status
+#   octo status                 — show status (verbose)
+#   octo chill                  — gentle 24/7 mode (default)
+#   octo night                  — aggressive overnight mode
+#   octo stop                   — pause autopilot (agents stay alive)
+#   octo resume                 — alias for `octo chill`
+#
+#   octo say <agent> "<text>"   — quick message to existing agent chat
+#   octo do  <agent> "<text>"   — NEW per-task chat (spawns its own terminal,
+#                                 own ghost in the graph, focused on this one
+#                                 task). Use this when you want each request
+#                                 in its own conversation thread.
+#   octo ask "<text>"           — drop a task in the inbox; autopilot routes
+#   octo feedback <agent> "..." — log feedback + tell the agent to adapt
+#   octo show / done            — see what every agent finished + the answer
+#   octo asks                   — see questions agents have for you
+#   octo wake                   — manually wake all live terminals
+#
+#   octo on                     — start autopilot via launchd (24/7)
+#   octo off                    — stop autopilot via launchd
+#   octo logs                   — tail the autopilot log
+#
+#   octo chat                   — open the simple chat UI (recommended)
+#   octo dash                   — open the OctoGent dashboard in browser
+#   octo restart                — restart the OctoGent server
+set -euo pipefail
+
+JARVIS="$HOME/JARVIS"
+AGENTS="$JARVIS/agents"
+MODE_FILE="$AGENTS/.mode"
+INBOX_FILE="$AGENTS/inbox.txt"
+LOG=/tmp/autopilot.log
+PLIST="$HOME/Library/LaunchAgents/com.dylan.jarvis-autopilot.plist"
+OCTOGENT_BIN="$HOME/.npm-global/bin/octogent"
+
+cmd="${1:-status}"
+shift || true
+
+set_mode() {
+  echo "$1" > "$MODE_FILE"
+  echo "mode → $1"
+}
+
+show_status() {
+  local mode="chill"
+  [[ -f "$MODE_FILE" ]] && mode="$(cat "$MODE_FILE")"
+  echo "mode: $mode"
+
+  if curl -sf -o /dev/null --max-time 1 http://127.0.0.1:8787/; then
+    echo "octogent: UP (http://127.0.0.1:8787)"
+  else
+    echo "octogent: DOWN"
+  fi
+
+  if pgrep -f autopilot.py >/dev/null; then
+    echo "autopilot: RUNNING (pid $(pgrep -f autopilot.py))"
+  else
+    echo "autopilot: STOPPED"
+  fi
+
+  if [[ -n "$(launchctl list 2>/dev/null | grep com.dylan.jarvis-autopilot || true)" ]]; then
+    echo "launchd: registered (24/7 enabled)"
+  else
+    echo "launchd: not registered  (run: octo on)"
+  fi
+
+  echo
+  echo "agents:"
+  curl -s --max-time 2 http://127.0.0.1:8787/api/terminal-snapshots 2>/dev/null \
+    | python3 -c '
+import json, sys, pathlib, re
+try:
+    data = json.load(sys.stdin)
+except:
+    print("  (could not load)"); sys.exit(0)
+TENT = pathlib.Path.home() / "JARVIS/.octogent/tentacles"
+def todos(t):
+    p = TENT / t / "todo.md"
+    if not p.exists(): return (0,0)
+    txt = p.read_text()
+    u = len(re.findall(r"^\s*-\s*\[\s*\]\s+", txt, flags=re.MULTILINE))
+    c = len(re.findall(r"^\s*-\s*\[x\]\s+", txt, flags=re.MULTILINE|re.IGNORECASE))
+    return (u, c)
+seen = set()
+for t in data:
+    if t.get("state") != "live": continue
+    tid = t.get("terminalId","")
+    if not tid.startswith("terminal-"): continue
+    tent = t.get("tentacleId","?")
+    if tent in seen: continue
+    seen.add(tent)
+    u, c = todos(tent)
+    rt = t.get("agentRuntimeState","?")
+    print(f"  {tent:11s}  {tid:14s}  runtime={rt:10s}  todos={c}+{u}")
+' || true
+
+  echo
+  echo "inbox:"
+  if [[ -s "$INBOX_FILE" ]]; then
+    sed 's/^/  | /' "$INBOX_FILE"
+  else
+    echo "  (empty)"
+  fi
+}
+
+case "$cmd" in
+  status|"")
+    show_status
+    ;;
+  show|done|recent)
+    # Print the most recent checked-off todos across all tentacles, with
+    # their done-notes (the answers).
+    python3 <<'PY'
+import pathlib, re
+TENT = pathlib.Path.home() / "JARVIS/.octogent/tentacles"
+pat = re.compile(r"^\s*-\s*\[x\]\s+(.+?)(?:\s+\*\((.*?)\)\*)?\s*$", re.IGNORECASE)
+print("Recent finished work across all tentacles:\n")
+for d in sorted(TENT.iterdir()):
+    todo = d / "todo.md"
+    if not todo.exists(): continue
+    rows = []
+    for line in todo.read_text().splitlines():
+        m = pat.match(line)
+        if not m: continue
+        item, note = m.group(1).strip(), (m.group(2) or "").strip()
+        if note:
+            rows.append((item, note))
+    if not rows: continue
+    print(f"=== {d.name} ===")
+    for item, note in rows[-5:]:  # last 5 done items per tentacle
+        item = item.split('—')[0].strip()  # trim long descriptions
+        if len(item) > 80: item = item[:77] + "..."
+        print(f"  ✓ {item}")
+        print(f"      → {note}")
+    print()
+PY
+    ;;
+  asks)
+    f="$HOME/JARVIS/agents/asks.md"
+    if [[ -s "$f" ]]; then
+      cat "$f"
+    else
+      echo "(no questions queued — agents are unblocked or just running)"
+    fi
+    ;;
+  do|task)
+    # `octo do <agent> "<task>"` — spawn a NEW terminal under the given
+    # tentacle dedicated to this one task. Each call = its own chat thread.
+    # The terminal stays around so you can reopen it from the dashboard.
+    if [[ $# -lt 2 ]]; then
+      echo "usage: octo do <agent> \"<task>\"" >&2
+      exit 1
+    fi
+    agent="$1"; shift
+    text="$*"
+    # find a parent terminal for the tentacle (the long-lived agent)
+    parent=$(curl -s http://127.0.0.1:8787/api/terminal-snapshots \
+      | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+cands = [t for t in data if t.get('state')=='live' and t.get('tentacleId')==sys.argv[1] and t.get('terminalId','').startswith('terminal-')]
+cands.sort(key=lambda t: t.get('createdAt',''))
+print(cands[0]['terminalId'] if cands else '')
+" "$agent")
+    name="${text:0:40}"  # short label = first 40 chars of task
+    if [[ -n "$parent" ]]; then
+      tid=$("$OCTOGENT_BIN" terminal create \
+        --tentacle-id "$agent" \
+        --workspace-mode shared \
+        --parent-terminal-id "$parent" \
+        --name "$name" \
+        --initial-prompt "Single-task focus. Read .octogent/tentacles/$agent/CONTEXT.md, then do ONLY this: $text. When you have the answer, write it to chat AND append a one-line entry to ~/JARVIS/agents/results.md so Dylan can see it via 'octo show'. Don't pick up other todos." \
+        2>&1 | grep -oE 'terminal-[0-9]+')
+    else
+      tid=$("$OCTOGENT_BIN" terminal create \
+        --tentacle-id "$agent" \
+        --workspace-mode shared \
+        --name "$name" \
+        --initial-prompt "Single-task focus. Read .octogent/tentacles/$agent/CONTEXT.md, then do ONLY this: $text. When you have the answer, write it to chat AND append a one-line entry to ~/JARVIS/agents/results.md. Don't pick up other todos." \
+        2>&1 | grep -oE 'terminal-[0-9]+')
+    fi
+    echo "spawned task chat: $tid (under $agent)"
+    sleep 2
+    # wake it so claude actually launches
+    "$HOME/JARVIS/.venv/bin/python" "$AGENTS/wake-octogent.py" 2>&1 | grep -E "^\s+(✓|✗) $tid" | head -1
+    echo "→ open the dashboard, click the new ghost under '$agent' to watch it work"
+    ;;
+  feedback|fb)
+    # `octo feedback <agent> "<text>"` — give an agent feedback about
+    # a previous result. The agent is told to log the feedback and adapt.
+    if [[ $# -lt 2 ]]; then
+      echo "usage: octo feedback <agent> \"<text>\"" >&2
+      exit 1
+    fi
+    agent="$1"; shift
+    text="$*"
+    fb_dir="$HOME/Code/$agent"
+    mkdir -p "$fb_dir"
+    fb_file="$fb_dir/feedback.md"
+    if [[ ! -f "$fb_file" ]]; then
+      echo "# Feedback from Dylan" > "$fb_file"
+      echo "" >> "$fb_file"
+    fi
+    {
+      echo "## $(date '+%Y-%m-%d %H:%M')"
+      echo
+      echo "$text"
+      echo
+    } >> "$fb_file"
+    echo "logged to $fb_file"
+    # also send it to the agent so it can react now
+    tid=$(curl -s http://127.0.0.1:8787/api/terminal-snapshots \
+      | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+cands = [t for t in data if t.get('state')=='live' and t.get('tentacleId')==sys.argv[1] and t.get('terminalId','').startswith('terminal-')]
+cands.sort(key=lambda t: t.get('createdAt',''), reverse=True)
+print(cands[0]['terminalId'] if cands else '')
+" "$agent")
+    if [[ -n "$tid" ]]; then
+      msg="FEEDBACK FROM DYLAN (also appended to $fb_file): $text — read the feedback file, log this in your tracking files (e.g. call-log.md if relevant), and adapt. Then suggest the next best move."
+      "$OCTOGENT_BIN" channel send "$tid" "$msg" >/dev/null
+      "$HOME/JARVIS/.venv/bin/python" - "$tid" <<'PY'
+import asyncio, json, sys, websockets
+tid = sys.argv[1]
+async def main():
+    async with websockets.connect(f"ws://127.0.0.1:8787/api/terminals/{tid}/ws", max_size=8*1024*1024) as ws:
+        try: await asyncio.wait_for(ws.recv(), timeout=2)
+        except: pass
+        await ws.send(json.dumps({"type":"input","data":"\r"}))
+        await asyncio.sleep(0.5)
+asyncio.run(main())
+PY
+      echo "→ delivered to $agent ($tid). Run 'octo show' in a minute for the response."
+    else
+      echo "→ no live $agent agent; feedback file written but not delivered to a chat"
+    fi
+    ;;
+  chill|resume)
+    set_mode chill
+    ;;
+  night)
+    set_mode night
+    echo "(autopilot will broadcast a 'work hard' message to all agents on next tick)"
+    ;;
+  stop|pause)
+    set_mode stop
+    ;;
+  say)
+    if [[ $# -lt 2 ]]; then
+      echo "usage: octo say <agent> \"<text>\"" >&2
+      exit 1
+    fi
+    agent="$1"; shift
+    text="$*"
+    # Find the most recent live terminal for that tentacle
+    tid=$(curl -s http://127.0.0.1:8787/api/terminal-snapshots \
+      | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+cands = [t for t in data if t.get('state')=='live' and t.get('tentacleId')==sys.argv[1] and t.get('terminalId','').startswith('terminal-')]
+cands.sort(key=lambda t: t.get('createdAt',''), reverse=True)
+print(cands[0]['terminalId'] if cands else '')
+" "$agent")
+    if [[ -z "$tid" ]]; then
+      echo "no live terminal for tentacle '$agent'" >&2
+      echo "available:" >&2
+      "$OCTOGENT_BIN" tentacle list 2>&1 | sed 's/^/  /' >&2
+      exit 1
+    fi
+    "$OCTOGENT_BIN" channel send "$tid" "$text" >/dev/null
+    "$HOME/JARVIS/.venv/bin/python" - "$tid" <<'PY'
+import asyncio, json, sys, websockets
+tid = sys.argv[1]
+async def main():
+    async with websockets.connect(f"ws://127.0.0.1:8787/api/terminals/{tid}/ws", max_size=8*1024*1024) as ws:
+        try: await asyncio.wait_for(ws.recv(), timeout=2)
+        except: pass
+        await ws.send(json.dumps({"type":"input","data":"\r"}))
+        await asyncio.sleep(0.5)
+asyncio.run(main())
+PY
+    echo "→ sent to $agent ($tid)"
+    ;;
+  ask)
+    if [[ $# -lt 1 ]]; then
+      echo "usage: octo ask \"<task>\"" >&2
+      exit 1
+    fi
+    text="$*"
+    echo "$text" >> "$INBOX_FILE"
+    echo "queued in $INBOX_FILE — autopilot will route to the right agent"
+    ;;
+  wake)
+    "$HOME/JARVIS/.venv/bin/python" "$AGENTS/wake-octogent.py"
+    ;;
+  on)
+    if [[ ! -f "$PLIST" ]]; then
+      echo "plist not found — run the installer first." >&2
+      exit 1
+    fi
+    launchctl unload "$PLIST" 2>/dev/null || true
+    launchctl load "$PLIST"
+    echo "autopilot loaded into launchd (24/7)"
+    ;;
+  off)
+    launchctl unload "$PLIST" 2>/dev/null || true
+    pkill -f autopilot.py 2>/dev/null || true
+    echo "autopilot disabled"
+    ;;
+  logs)
+    tail -f "$LOG"
+    ;;
+  dash|dashboard)
+    open http://127.0.0.1:8787
+    ;;
+  chat)
+    # Make sure the chat-server is running, then open it.
+    if ! curl -sf -o /dev/null --max-time 1 http://127.0.0.1:8766/; then
+      echo "starting chat-server..."
+      pkill -f chat-server.py 2>/dev/null || true
+      nohup "$HOME/JARVIS/.venv/bin/python" "$AGENTS/chat-server.py" \
+        > /tmp/chat-server.log 2>&1 &
+      for i in 1 2 3 4 5; do
+        sleep 1
+        curl -sf -o /dev/null --max-time 1 http://127.0.0.1:8766/ && break
+      done
+    fi
+    echo "→ http://localhost:8766"
+    open http://localhost:8766 || true
+    ;;
+  restart)
+    "$JARVIS/start-octogent.sh" stop || true
+    "$JARVIS/start-octogent.sh"
+    ;;
+  *)
+    echo "unknown command: $cmd" >&2
+    grep -E "^#\s+octo" "$0" | sed 's/^# //'
+    exit 1
+    ;;
+esac

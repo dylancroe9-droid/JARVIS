@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "imessage": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@daveremy/imessage-mcp"
+      ],
+      "env": {}
+    },
+    "Control_your_Mac": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@peakmojo/applescript-mcp"
+      ],
+      "env": {}
+    }
+  }
+}

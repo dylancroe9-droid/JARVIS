@@ -1,0 +1,36 @@
+.octogent
+
+# ── Secrets — NEVER commit these ──────────────────────────────────────────────
+.env
+user_profile.json
+
+# ── Python ────────────────────────────────────────────────────────────────────
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.log
+
+# ── Node / Electron ───────────────────────────────────────────────────────────
+jarvis-app/node_modules/
+jarvis-app/dist/
+jarvis-app/out/
+*.tgz
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── Memory / personal data ────────────────────────────────────────────────────
+memory.txt
+study_notes/
+.arrival_used
+memory/
+
+# ── Editor ────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
