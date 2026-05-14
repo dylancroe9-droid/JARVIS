@@ -469,12 +469,35 @@ _RESET_SETUP_PHRASES = (
     "first run", "reconfigure jarvis", "setup mode",
 )
 
+_UPDATE_PHRASES = (
+    "update jarvis", "update yourself", "pull updates",
+    "check for updates", "update your code",
+)
+
 def process(text: str, skip_echo: bool = False) -> None:
     """Top-level guard — wraps _process_unsafe so a single tool failure
     can't hang JARVIS or kill the worker thread silently."""
 
     # ── Setup reset shortcut ───────────────────────────────────────────────────
     low = text.lower().strip()
+
+    # ── Self-update shortcut ───────────────────────────────────────────────────
+    if any(low.startswith(p) or p in low for p in _UPDATE_PHRASES):
+        import subprocess as _sp
+        result = _sp.run(
+            ["git", "-C", os.path.dirname(os.path.abspath(__file__)), "pull"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if "Already up to date" in result.stdout:
+            msg = "Already up to date — you're running the latest version."
+        elif result.returncode == 0:
+            msg = "Updated! Restart JARVIS to apply the latest changes."
+        else:
+            msg = f"Update failed: {result.stderr.strip()[:120]}"
+        broadcast({"type": "chunk", "text": msg})
+        broadcast({"type": "done", "full_text": msg})
+        return
+
     if any(low.startswith(p) or p in low for p in _RESET_SETUP_PHRASES):
         from profile import reset_setup
         reset_setup()
