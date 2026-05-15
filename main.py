@@ -17,7 +17,7 @@ from rich.panel import Panel
 from rich.text import Text
 from rich import print as rprint
 
-from config import USER_NAME, GROQ_API_KEY as ANTHROPIC_API_KEY
+from config import USER_NAME, ANTHROPIC_API_KEY, GROQ_API_KEY
 
 console = Console()
 
@@ -50,10 +50,10 @@ def main() -> None:
     print_banner()
 
     # ── Validate API key early ───────────────────────────────────────────────
-    if not ANTHROPIC_API_KEY:
+    if not ANTHROPIC_API_KEY and not GROQ_API_KEY:
         console.print(
-            "[red bold]No ANTHROPIC_API_KEY found.[/red bold]\n"
-            "Copy [dim].env.example[/dim] → [dim].env[/dim] and add your key, then try again."
+            "[red bold]No API key found.[/red bold]\n"
+            "Copy [dim].env.example[/dim] → [dim].env[/dim] and add your Anthropic or Groq key, then try again."
         )
         sys.exit(1)
 
@@ -90,7 +90,7 @@ def main() -> None:
     def _handle_sigint(sig, frame):
         nonlocal interrupted
         if interrupted:
-            console.print("\n[dim]Shutting down. Goodbye, {}.[/dim]".format(USER_NAME))
+            console.print(f"\n[dim]Shutting down. Goodbye, {USER_NAME}.[/dim]")
             sys.exit(0)
         interrupted = True
         console.print(
