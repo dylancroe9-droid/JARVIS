@@ -474,6 +474,12 @@ _UPDATE_PHRASES = (
     "check for updates", "update your code",
 )
 
+_HELP_PHRASES = (
+    "what can you do", "what do you do", "help me", "list your tools",
+    "what are your abilities", "what are your features", "show me what you can do",
+    "what are you capable of", "how can you help", "what tools do you have",
+)
+
 def process(text: str, skip_echo: bool = False) -> None:
     """Top-level guard — wraps _process_unsafe so a single tool failure
     can't hang JARVIS or kill the worker thread silently."""
@@ -494,6 +500,30 @@ def process(text: str, skip_echo: bool = False) -> None:
             msg = "Updated! Restart JARVIS to apply the latest changes."
         else:
             msg = f"Update failed: {result.stderr.strip()[:120]}"
+        broadcast({"type": "chunk", "text": msg})
+        broadcast({"type": "done", "full_text": msg})
+        return
+
+    # ── Help shortcut ─────────────────────────────────────────────────────────
+    if any(low.startswith(p) or p in low for p in _HELP_PHRASES):
+        msg = (
+            "Here's what I can do:\n\n"
+            "🎙️ Voice & chat — just talk to me or type. I hear you from anywhere with the wake word.\n"
+            "👁️ Screen vision — ask me what's on your screen and I'll read it.\n"
+            "🌐 Web browsing — I can open sites, click around, and pull info from the web.\n"
+            "📧 Email & messages — read, search, and send iMessages or emails.\n"
+            "📅 Calendar — check your schedule, add events, set reminders.\n"
+            "🎵 Music — control Spotify and your local music.\n"
+            "🖥️ Shell commands — run terminal commands, manage files, create projects.\n"
+            "🔬 Research — deep-dive topics and summarise what I find.\n"
+            "🧮 Math — calculate anything you throw at me.\n"
+            "💾 Memory — I remember things you tell me across conversations.\n\n"
+            "Built-in voice shortcuts:\n"
+            "• 'Update JARVIS' — pull the latest code from GitHub\n"
+            "• 'Reset setup' — re-run the setup wizard\n"
+            "• 'What's new' — hear recent changes\n\n"
+            "Hotkey: ⌘⇧J to show or hide me from anywhere."
+        )
         broadcast({"type": "chunk", "text": msg})
         broadcast({"type": "done", "full_text": msg})
         return
