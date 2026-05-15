@@ -480,6 +480,12 @@ _HELP_PHRASES = (
     "what are you capable of", "how can you help", "what tools do you have",
 )
 
+_WHATS_NEW_PHRASES = (
+    "what's new", "whats new", "any updates", "what changed",
+    "show changelog", "show me the changelog", "what have you changed",
+    "recent changes", "what did you update",
+)
+
 def process(text: str, skip_echo: bool = False) -> None:
     """Top-level guard — wraps _process_unsafe so a single tool failure
     can't hang JARVIS or kill the worker thread silently."""
@@ -524,6 +530,23 @@ def process(text: str, skip_echo: bool = False) -> None:
             "• 'What's new' — hear recent changes\n\n"
             "Hotkey: ⌘⇧J to show or hide me from anywhere."
         )
+        broadcast({"type": "chunk", "text": msg})
+        broadcast({"type": "done", "full_text": msg})
+        return
+
+    # ── What's new shortcut ────────────────────────────────────────────────────
+    if any(low.startswith(p) or p in low for p in _WHATS_NEW_PHRASES):
+        import subprocess as _sp
+        result = _sp.run(
+            ["git", "-C", JARVIS_DIR, "log", "--oneline", "-10"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            lines = result.stdout.strip().splitlines()
+            entries = "\n".join(f"  • {l.split(' ', 1)[-1]}" for l in lines)
+            msg = f"Here's what changed recently:\n{entries}"
+        else:
+            msg = "No git history found — can't check what's changed."
         broadcast({"type": "chunk", "text": msg})
         broadcast({"type": "done", "full_text": msg})
         return
