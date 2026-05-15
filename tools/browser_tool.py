@@ -36,7 +36,12 @@ def _get_page():
     if _page is not None:
         return _page
 
-    from playwright.sync_api import sync_playwright
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise RuntimeError(
+            "The browser tool needs Playwright. Run: pip install playwright && playwright install chromium"
+        )
 
     _pw_instance = sync_playwright().start()
     _browser_context = _pw_instance.chromium.launch_persistent_context(
@@ -85,7 +90,12 @@ def browser_navigate(url: str, wait_for: str = "networkidle") -> str:
         time.sleep(0.5)  # let JS settle
         return f"Navigated to: {page.url}\nPage title: {page.title()}"
     except Exception as e:
-        return f"Navigation error: {e}"
+        err = str(e)
+        if "net::ERR_NAME_NOT_RESOLVED" in err or "net::ERR_CONNECTION_REFUSED" in err:
+            return f"Couldn't reach that URL — make sure the address is correct and you're online."
+        if "Timeout" in err or "timeout" in err:
+            return f"Page took too long to load. Try again, or the site may be down."
+        return f"Navigation failed: {err}"
 
 
 # --------------------------------------------------------------------------- #
@@ -160,7 +170,7 @@ def browser_click(target: str) -> str:
         time.sleep(0.5)
         return f"Clicked: {target}"
     except Exception as e:
-        return f"Could not click '{target}': {e}"
+        return f"Couldn't find anything to click for '{target}' — the element may not exist or the page hasn't loaded yet."
 
 
 def browser_type(selector: str, text: str, clear_first: bool = True) -> str:
@@ -179,7 +189,7 @@ def browser_type(selector: str, text: str, clear_first: bool = True) -> str:
 
         return f"Typed into '{selector}'"
     except Exception as e:
-        return f"Could not type into '{selector}': {e}"
+        return f"Couldn't type into '{selector}' — the field may not exist or isn't editable."
 
 
 def browser_select_option(selector: str, value: str) -> str:
@@ -189,7 +199,7 @@ def browser_select_option(selector: str, value: str) -> str:
         page.locator(selector).first.select_option(value, timeout=8_000)
         return f"Selected '{value}' in '{selector}'"
     except Exception as e:
-        return f"Could not select option: {e}"
+        return f"Couldn't select that option — the dropdown may not exist or '{value}' isn't available."
 
 
 def browser_scroll(direction: str = "down", amount: int = 300) -> str:
@@ -227,7 +237,7 @@ def browser_press_key(key: str) -> str:
         time.sleep(0.2)
         return f"Pressed key: {key}"
     except Exception as e:
-        return f"Key press failed: {e}"
+        return f"Couldn't press '{key}' — make sure the browser is open and focused."
 
 
 def browser_go_back() -> str:

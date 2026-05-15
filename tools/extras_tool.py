@@ -193,7 +193,7 @@ def calculate(expression: str) -> str:
             result = int(result)
         return f"{expression} = {result}"
     except Exception as e:
-        return f"Math error: {e}"
+        return "I couldn't evaluate that expression — make sure it's valid math (e.g. '2 + 2', 'sqrt(16)', '5 ** 3')."
 
 
 # ── Clipboard ────────────────────────────────────────────────────────────────
