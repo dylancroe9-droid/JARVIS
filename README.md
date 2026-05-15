@@ -40,7 +40,7 @@ This is the simple path. If you're comfortable with a terminal, see
 ### Step-by-step
 
 1. **Download JARVIS.** Grab the latest `JARVIS-1.0.0-arm64.dmg` from the
-   [releases page]([replace with link]).
+   [releases page](https://github.com/dylancroe9-droid/JARVIS/releases).
 
 2. **Open the DMG and drag JARVIS to Applications.** The first time you
    open it, macOS will say "JARVIS can't be opened because Apple cannot
@@ -146,8 +146,32 @@ directly.
 
 ---
 
+## Voice Commands
+
+These shortcuts are handled directly by JARVIS before the AI even sees them — instant response, no API call needed.
+
+| Say | What it does |
+|-----|-------------|
+| "Update JARVIS" / "update yourself" / "pull updates" | Pulls the latest code from GitHub |
+| "What can you do" / "list your tools" / "help me" | Shows a full capability overview |
+| "What's new" / "any updates" / "what changed" | Reads the last 10 git commit messages |
+| "Reset setup" / "go back to setup" / "setup wizard" | Re-runs the first-run setup wizard |
+
+---
+
+## Friends Install
+
+If someone shared this repo with you, here's how to get running in one step:
+
+```bash
+git clone https://github.com/dylancroe9-droid/JARVIS.git && cd JARVIS && bash install.sh
+```
+
+The install script sets up Python, installs dependencies, and guides you through getting an API key.
+
+---
+
 ## Support
 
-- **Bugs** → file at [github.com/.../issues]([replace])
+- **Bugs** → file at [github.com/dylancroe9-droid/JARVIS/issues](https://github.com/dylancroe9-droid/JARVIS/issues)
 - **Feature requests** → same place, tag `feature`
-- **Email** → `[support@jarvis.app]`
