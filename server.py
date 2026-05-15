@@ -24,7 +24,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-from config import ANTHROPIC_API_KEY, GROQ_API_KEY, USER_ADDRESS
+from config import ANTHROPIC_API_KEY, GROQ_API_KEY, USER_ADDRESS, JARVIS_DIR
 
 # Demo mode lets the user try JARVIS without an API key — voice in/out works
 # (Whisper local + edge-tts free) and a small canned brain handles input.
@@ -485,7 +485,7 @@ def process(text: str, skip_echo: bool = False) -> None:
     if any(low.startswith(p) or p in low for p in _UPDATE_PHRASES):
         import subprocess as _sp
         result = _sp.run(
-            ["git", "-C", os.path.dirname(os.path.abspath(__file__)), "pull"],
+            ["git", "-C", JARVIS_DIR, "pull"],
             capture_output=True, text=True, timeout=30,
         )
         if "Already up to date" in result.stdout:
