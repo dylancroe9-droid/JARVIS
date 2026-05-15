@@ -2,12 +2,16 @@
 Persistent memory for JARVIS — things he's learned about Dylan
 that survive between sessions.
 Stored as plain text in ~/JARVIS/memory.txt (one fact per line).
+Format: - [YYYY-MM-DD] fact text
 """
 
+import re
+from datetime import date
 from pathlib import Path
 
 MEMORY_FILE = Path(__file__).parent.parent / "memory.txt"
 _MAX_FACTS   = 100   # prune oldest when we exceed this
+_TS_RE       = re.compile(r"^\[\d{4}-\d{2}-\d{2}\]\s*")
 
 
 def load_memory() -> str:
@@ -35,13 +39,19 @@ def _parse_facts() -> list[str]:
         return []
 
 
+def _strip_ts(fact: str) -> str:
+    """Strip optional leading [YYYY-MM-DD] timestamp for comparison."""
+    return _TS_RE.sub("", fact).strip()
+
+
 def _facts_match(a: str, b: str) -> bool:
     """
     True if two facts are about the same subject and should be merged.
     Uses first-5-words match OR substring containment — catches both
     "Dylan likes X" → "Dylan likes Y" and shorter fact being a subset of longer.
+    Timestamps are stripped before comparison so dated facts still deduplicate.
     """
-    a_l, b_l = a.lower(), b.lower()
+    a_l, b_l = _strip_ts(a).lower(), _strip_ts(b).lower()
     # Substring: one fact is already contained in the other
     if a_l in b_l or b_l in a_l:
         return True
@@ -57,20 +67,23 @@ def save_fact(fact: str) -> str:
     Prunes to _MAX_FACTS most recent entries to prevent unbounded growth.
     """
     fact = fact.strip().lstrip("- ")
+    # Strip any existing timestamp prefix so we always stamp with today
+    fact = _strip_ts(fact)
     if not fact:
         return "Nothing to save."
+    stamped = f"[{date.today()}] {fact}"
     try:
         existing = _parse_facts()
 
-        # Replace near-duplicate if found, otherwise append
+        # Replace near-duplicate if found (keeps the updated timestamp), otherwise append
         updated = False
         for i, e in enumerate(existing):
             if _facts_match(fact, e):
-                existing[i] = fact
+                existing[i] = stamped
                 updated = True
                 break
         if not updated:
-            existing.append(fact)
+            existing.append(stamped)
 
         # Prune oldest if over the cap
         if len(existing) > _MAX_FACTS:
