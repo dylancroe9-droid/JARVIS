@@ -486,6 +486,22 @@ _WHATS_NEW_PHRASES = (
     "recent changes", "what did you update",
 )
 
+_MEMORY_RECALL_PHRASES = (
+    "what do you remember", "what do you know about me",
+    "show my memory", "what have you saved", "show me my memory",
+    "what have you remembered", "what's in your memory",
+)
+
+_MEMORY_FORGET_PHRASES = (
+    "forget that", "forget about", "don't remember", "remove from memory",
+    "delete that memory", "wipe that",
+)
+
+_RESTART_PHRASES = (
+    "restart jarvis", "restart yourself", "reboot jarvis",
+    "reboot yourself", "restart the server",
+)
+
 def process(text: str, skip_echo: bool = False) -> None:
     """Top-level guard — wraps _process_unsafe so a single tool failure
     can't hang JARVIS or kill the worker thread silently."""
@@ -549,6 +565,46 @@ def process(text: str, skip_echo: bool = False) -> None:
             msg = "No git history found — can't check what's changed."
         broadcast({"type": "chunk", "text": msg})
         broadcast({"type": "done", "full_text": msg})
+        return
+
+    # ── Memory recall shortcut ────────────────────────────────────────────────
+    if any(low.startswith(p) or p in low for p in _MEMORY_RECALL_PHRASES):
+        from brain.memory import load_memory
+        facts = load_memory()
+        if facts:
+            msg = f"Here's what I remember about you:\n\n{facts}"
+        else:
+            msg = "My memory is empty — I haven't saved anything about you yet."
+        broadcast({"type": "chunk", "text": msg})
+        broadcast({"type": "done", "full_text": msg})
+        return
+
+    # ── Memory forget shortcut ────────────────────────────────────────────────
+    if any(low.startswith(p) or p in low for p in _MEMORY_FORGET_PHRASES):
+        from brain.memory import forget_fact
+        # Extract the subject after the trigger phrase
+        keyword = low
+        for p in sorted(_MEMORY_FORGET_PHRASES, key=len, reverse=True):
+            if low.startswith(p):
+                keyword = low[len(p):].strip(" .,")
+                break
+            elif p in low:
+                keyword = low.split(p, 1)[-1].strip(" .,")
+                break
+        msg = forget_fact(keyword) if keyword else "What should I forget? Try: 'forget my gym schedule'."
+        broadcast({"type": "chunk", "text": msg})
+        broadcast({"type": "done", "full_text": msg})
+        return
+
+    # ── Restart shortcut ──────────────────────────────────────────────────────
+    if any(low.startswith(p) or p in low for p in _RESTART_PHRASES):
+        broadcast({"type": "chunk", "text": "Restarting now — back in a moment."})
+        broadcast({"type": "done", "full_text": "Restarting now — back in a moment."})
+        import threading as _th
+        def _do_restart():
+            import time as _t; _t.sleep(1.0)
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        _th.Thread(target=_do_restart, daemon=True, name="restart").start()
         return
 
     if any(low.startswith(p) or p in low for p in _RESET_SETUP_PHRASES):

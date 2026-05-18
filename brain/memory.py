@@ -98,6 +98,26 @@ def save_fact(fact: str) -> str:
         return f"Couldn't save to memory: {exc}"
 
 
+def forget_fact(keyword: str) -> str:
+    """Remove all facts that mention the given keyword."""
+    keyword = keyword.lower().strip()
+    if not keyword:
+        return "What should I forget? Try: 'forget my gym schedule'."
+    try:
+        existing = _parse_facts()
+        remaining = [f for f in existing if keyword not in _strip_ts(f).lower()]
+        removed = len(existing) - len(remaining)
+        if removed == 0:
+            return f"I don't have anything about '{keyword}' in my memory."
+        MEMORY_FILE.write_text(
+            "\n".join(f"- {e}" for e in remaining) + "\n",
+            encoding="utf-8",
+        )
+        return f"Done — forgot {removed} fact{'s' if removed > 1 else ''} about '{keyword}'."
+    except OSError as exc:
+        return f"Couldn't update memory: {exc}"
+
+
 def clear_memory() -> str:
     """Wipe all saved facts."""
     try:
