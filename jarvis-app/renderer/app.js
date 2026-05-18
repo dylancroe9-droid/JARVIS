@@ -479,7 +479,9 @@ function connect () {
     } else if (msg.type === 'listening') {
       applyState('listening')
     } else if (msg.type === 'confirm_request') {
-      showConfirm(msg.id, msg.message)
+      showConfirm(msg.id, msg.message, msg.title)
+    } else if (msg.type === 'proactive') {
+      showProactiveToast(msg.text)
     } else if (msg.type === 'confirm_expired') {
       hideConfirm()
     } else if (msg.type === 'study_chunk') {
@@ -601,9 +603,11 @@ function captureAndSendFrame (reqId) {
 
 let _confirmId = null
 
-function showConfirm (id, message) {
+function showConfirm (id, message, title) {
   _confirmId = id
   $confirmMsg.textContent = message
+  const $icon = document.getElementById('confirm-icon')
+  if ($icon) $icon.textContent = title || '⚠ ACCESS REQUEST'
   $confirmOverlay.classList.add('visible')
 }
 
@@ -619,6 +623,26 @@ function respondConfirm (approved) {
 
 $confirmAllow.addEventListener('click', () => respondConfirm(true))
 $confirmDeny.addEventListener('click',  () => respondConfirm(false))
+
+// ─── Proactive alert toast ────────────────────────────────────────────────────
+
+const $proactiveToast    = document.getElementById('proactive-toast')
+const $proactiveToastMsg = document.getElementById('proactive-toast-msg')
+let   _proactiveTimer    = null
+
+function showProactiveToast (text) {
+  if (!$proactiveToast || !$proactiveToastMsg) return
+  $proactiveToastMsg.textContent = text
+  $proactiveToast.classList.add('visible')
+  // Also surface in the chat so it's logged
+  addMessage('jarvis', text)
+  // Auto-dismiss after 8 seconds
+  if (_proactiveTimer) clearTimeout(_proactiveTimer)
+  _proactiveTimer = setTimeout(() => {
+    $proactiveToast.classList.remove('visible')
+    _proactiveTimer = null
+  }, 8000)
+}
 
 function send (obj) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj))

@@ -2056,6 +2056,28 @@
     }
     .timer-notification.visible { opacity: 1; transform: translateX(-50%); }
 
+    /* ── Proactive alert toast ───────────────────────────────────────────────── */
+    #proactive-toast {
+      position: fixed; bottom: 72px; left: 50%;
+      transform: translateX(-50%) translateY(16px);
+      background: rgba(0,4,16,0.96);
+      border: 1px solid rgba(255,170,0,0.45);
+      border-radius: 10px; padding: 10px 18px;
+      max-width: 320px; width: max-content;
+      font: 500 11px/1.5 var(--font-ui); color: var(--text);
+      letter-spacing: 0.04em;
+      box-shadow: 0 0 24px rgba(255,170,0,0.08);
+      opacity: 0; transition: all 0.3s var(--ease-out);
+      z-index: 9999; pointer-events: none;
+    }
+    #proactive-toast.visible {
+      opacity: 1; transform: translateX(-50%) translateY(0);
+    }
+    #proactive-toast-label {
+      font-size: 8px; color: var(--amber); letter-spacing: 0.15em;
+      font-weight: 700; margin-bottom: 4px;
+    }
+
     /* ── Info Card ───────────────────────────────────────────────────────────── */
     #info-card {
       position: fixed; right: 174px; top: 72px; width: 248px;
@@ -2717,6 +2739,12 @@
     <span class="wc tr"></span>
     <span class="wc bl"></span>
     <span class="wc br"></span>
+  </div>
+
+  <!-- ── Proactive alert toast ────────────────────────────────────────────── -->
+  <div id="proactive-toast">
+    <div id="proactive-toast-label">JARVIS ALERT</div>
+    <div id="proactive-toast-msg"></div>
   </div>
 
   <!-- ── Permission overlay ──────────────────────────────────────────────── -->

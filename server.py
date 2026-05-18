@@ -125,16 +125,20 @@ def broadcast(msg: dict) -> None:
         asyncio.run_coroutine_threadsafe(_broadcast(msg), _loop)
 
 
-def request_permission(message: str, timeout: float = 30.0) -> bool:
+def request_permission(message: str, timeout: float = 30.0, title: str = "") -> bool:
     """
     Ask the user for permission via the Electron UI.
     Blocks the calling thread until the user responds (or timeout).
+    Optional `title` overrides the default '⚠ ACCESS REQUEST' header.
     """
     req_id = str(uuid.uuid4())[:8]
     event  = threading.Event()
     _pending_confirms[req_id] = [event, False]
 
-    broadcast({"type": "confirm_request", "id": req_id, "message": message})
+    payload: dict = {"type": "confirm_request", "id": req_id, "message": message}
+    if title:
+        payload["title"] = title
+    broadcast(payload)
 
     granted = event.wait(timeout=timeout)
     entry   = _pending_confirms.pop(req_id, [None, False])
@@ -1476,6 +1480,10 @@ async def startup() -> None:
     if SETUP_MODE:
         print("[setup] Skipping audio + tool wiring until wizard finishes.")
         return
+
+    # Start proactive intelligence engine (calendar, email, memory checks)
+    import proactive
+    proactive.start()
 
     try:
         from voice.audio_engine import AudioEngine
