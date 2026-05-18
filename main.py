@@ -17,7 +17,7 @@ from rich.panel import Panel
 from rich.text import Text
 from rich import print as rprint
 
-from config import USER_NAME, ANTHROPIC_API_KEY, GROQ_API_KEY
+from config import USER_NAME, ANTHROPIC_API_KEY, GROQ_API_KEY, ANTHROPIC_MODEL, GROQ_MODEL
 
 console = Console()
 
@@ -38,7 +38,8 @@ def print_banner() -> None:
         )
     )
     mode = "[yellow]text mode[/yellow]" if TEXT_MODE else "[green]voice mode[/green]"
-    console.print(f"  Mode: {mode}   |   Model: claude-sonnet-4-6")
+    active_model = ANTHROPIC_MODEL if ANTHROPIC_API_KEY.startswith("sk-ant-") else GROQ_MODEL
+    console.print(f"  Mode: {mode}   |   Model: {active_model}")
     console.print("  Type [bold]exit[/bold] or press [bold]Ctrl-C[/bold] to shut down.\n")
 
 
