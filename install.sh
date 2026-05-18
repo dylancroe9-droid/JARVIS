@@ -50,8 +50,8 @@ if [ ! -f "$JARVIS_DIR/server.py" ] && [ ! -f "$JARVIS_DIR/brain/jarvis.py" ]; t
   _info "JARVIS source not found here — cloning to ~/JARVIS…"
   JARVIS_DIR="$HOME/JARVIS"
   if [ ! -d "$JARVIS_DIR" ]; then
-    git clone https://github.com/your-repo/jarvis.git "$JARVIS_DIR" 2>/dev/null \
-      || _err "Clone failed. Download JARVIS manually from github.com/your-repo/jarvis"
+    git clone https://github.com/dylancroe9-droid/JARVIS.git "$JARVIS_DIR" 2>/dev/null \
+      || _err "Clone failed. Download JARVIS manually from github.com/dylancroe9-droid/JARVIS"
   fi
 fi
 
