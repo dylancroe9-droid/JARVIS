@@ -639,6 +639,26 @@ class Jarvis:
                 _active_tools        = TOOL_DEFINITIONS
             except Exception as exc:
                 console.print(f"[yellow]Claude error ({type(exc).__name__}): {exc}[/yellow]")
+                exc_str = str(exc).lower()
+                # Auth / billing errors — tell the user exactly what's wrong
+                if any(k in exc_str for k in ("authentication", "invalid api key", "api key")):
+                    msg = (
+                        "Your Anthropic API key looks invalid. "
+                        "Check ANTHROPIC_API_KEY in ~/JARVIS/.env — "
+                        "grab a fresh one at console.anthropic.com."
+                    )
+                    self._append_assistant_text(msg)
+                    yield msg
+                    return
+                if any(k in exc_str for k in ("credit", "quota", "billing", "insufficient", "payment")):
+                    msg = (
+                        "Your Anthropic account is out of credits. "
+                        "Top up at console.anthropic.com/billing — "
+                        "or add a GROQ_API_KEY to .env as a free fallback."
+                    )
+                    self._append_assistant_text(msg)
+                    yield msg
+                    return
                 if GROQ_API_KEY:
                     console.print("[dim]Falling back to Groq[/dim]")
                     yield from self._stream_with_tools()
