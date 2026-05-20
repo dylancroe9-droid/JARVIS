@@ -59,7 +59,9 @@ pip install -r requirements.txt
 # ── Playwright browser ───────────────────────────────────────────────────────
 echo ""
 echo "  Installing Playwright Chromium browser…"
-playwright install chromium
+# Use the venv's playwright binary directly so this works even if the system
+# PATH doesn't have playwright on it yet.
+.venv/bin/playwright install chromium
 
 # ── .env file ────────────────────────────────────────────────────────────────
 if [ ! -f ".env" ]; then
