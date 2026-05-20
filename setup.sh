@@ -30,20 +30,24 @@ source .venv/bin/activate
 pip install --upgrade pip -q
 echo "  Virtual environment: .venv"
 
-# ── ffmpeg (required by Whisper) ─────────────────────────────────────────────
+# ── Homebrew system deps ─────────────────────────────────────────────────────
+if ! command -v brew &>/dev/null; then
+  echo "  Please install Homebrew first: https://brew.sh"
+  exit 1
+fi
+
 if ! command -v ffmpeg &>/dev/null; then
-  echo ""
-  echo "  ffmpeg not found — required by Whisper for audio processing."
-  if command -v brew &>/dev/null; then
-    echo "  Installing via Homebrew…"
-    brew install ffmpeg
-  else
-    echo "  Please install Homebrew first, then run: brew install ffmpeg"
-    echo "  Homebrew: https://brew.sh"
-    exit 1
-  fi
+  echo "  Installing ffmpeg…"
+  brew install ffmpeg
 fi
 echo "  ffmpeg: $(ffmpeg -version 2>&1 | head -1 | cut -d' ' -f3)"
+
+# portaudio is required by pyaudio (microphone input)
+if ! brew list portaudio &>/dev/null 2>&1; then
+  echo "  Installing portaudio (required for microphone)…"
+  brew install portaudio
+fi
+echo "  portaudio: ok"
 
 # ── Python packages ──────────────────────────────────────────────────────────
 echo ""
