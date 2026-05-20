@@ -11,6 +11,8 @@ contextBridge.exposeInMainWorld('jarvis', {
   // First-run wizard:
   relaunch:        () => ipcRenderer.send('app-relaunch'),
   openExternal:    (url) => ipcRenderer.send('open-external', url),
+  // Display mode (work / desktop)
+  setDisplayMode:  (mode) => ipcRenderer.send('set-display-mode', mode),
   // Support / observability:
   getVersion:      () => ipcRenderer.invoke('get-version'),
   exportLogs:      () => ipcRenderer.invoke('export-logs'),

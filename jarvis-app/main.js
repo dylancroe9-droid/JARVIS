@@ -182,6 +182,32 @@ ipcMain.on('cam-mode-off', () => {
   }
 })
 
+// ── Display mode — work (narrow panel) or desktop (landscape ambient) ─────────
+ipcMain.on('set-display-mode', (_e, mode) => {
+  if (!mainWindow) return
+  const { workArea } = screen.getPrimaryDisplay()
+  if (mode === 'desktop') {
+    const w = Math.min(960, workArea.width - 40)
+    const h = 520
+    mainWindow.setBounds({
+      x: workArea.x + Math.round((workArea.width  - w) / 2),
+      y: workArea.y + workArea.height - h - 24,
+      width:  w,
+      height: h,
+    }, true)
+    mainWindow.setAlwaysOnTop(false)
+  } else {
+    // work mode — restore narrow top-right panel
+    mainWindow.setBounds({
+      x:      workArea.x + workArea.width - 478,
+      y:      workArea.y + 20,
+      width:  460,
+      height: 860,
+    }, true)
+    mainWindow.setAlwaysOnTop(true, 'floating')
+  }
+})
+
 // ── App lifecycle ─────────────────────────────────────────────────────────────
 
 app.whenReady().then(async () => {

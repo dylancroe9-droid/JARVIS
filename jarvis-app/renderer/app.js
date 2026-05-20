@@ -274,6 +274,43 @@ function exitCamMode () {
 $btnCamMode?.addEventListener('click', () => camModeActive ? exitCamMode() : enterCamMode())
 $camModeExit?.addEventListener('click', exitCamMode)
 
+// ─── Display mode (work ↔ desktop) ───────────────────────────────────────────
+
+const $btnDisplayMode = document.getElementById('btn-display-mode')
+let displayMode = localStorage.getItem('jarvis-display-mode') || 'work'
+
+function setDisplayMode (mode) {
+  displayMode = mode
+  localStorage.setItem('jarvis-display-mode', mode)
+
+  if (mode === 'desktop') {
+    $app.classList.add('desktop-mode')
+    if ($btnDisplayMode) {
+      $btnDisplayMode.textContent = '◧'
+      $btnDisplayMode.title       = 'Work Mode'
+      $btnDisplayMode.classList.add('active')
+    }
+  } else {
+    $app.classList.remove('desktop-mode')
+    if ($btnDisplayMode) {
+      $btnDisplayMode.textContent = '◫'
+      $btnDisplayMode.title       = 'Desktop Mode'
+      $btnDisplayMode.classList.remove('active')
+    }
+  }
+
+  window.jarvis?.setDisplayMode(mode)
+  // Resize canvases after the window settles
+  setTimeout(() => { resizeHud?.(); resizeGestureCanvas?.() }, 350)
+}
+
+$btnDisplayMode?.addEventListener('click', () =>
+  setDisplayMode(displayMode === 'desktop' ? 'work' : 'desktop')
+)
+
+// Restore saved mode on load
+if (displayMode === 'desktop') setDisplayMode('desktop')
+
 // ─── Study mode ──────────────────────────────────────────────────────────────
 
 let studyActive     = false

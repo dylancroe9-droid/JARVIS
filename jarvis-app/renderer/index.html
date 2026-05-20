@@ -2275,6 +2275,80 @@
     }
     #hud-support a:hover { color: var(--cyan); }
 
+    /* ═══════════════════════════════════════════════════════════════════════
+       DESKTOP / STANDBY MODE
+       Wider landscape panel (960×520) centred at the bottom of the screen.
+       Arc reactor takes the left half; chat fills the right half.
+    ═══════════════════════════════════════════════════════════════════════ */
+
+    /* #app shell — collapse right sidebar, use 2-column layout */
+    #app.desktop-mode {
+      grid-template-columns: 155px 1fr;
+    }
+    #app.desktop-mode #sidebar-right { display: none; }
+
+    /* main-col becomes a 2-column grid: arc reactor | chat */
+    #app.desktop-mode #main-col {
+      display: grid;
+      grid-template-columns: 310px 1fr;
+      grid-template-rows: auto 1fr auto;
+    }
+
+    /* header spans full width */
+    #app.desktop-mode #header {
+      grid-column: 1 / -1;
+      grid-row: 1;
+    }
+
+    /* arc-reactor/cam section fills the left column, rows 2–3 */
+    #app.desktop-mode #cam-section {
+      grid-column: 1;
+      grid-row: 2 / 4;
+      height: auto !important;
+      min-height: 0;
+      border-right: 1px solid rgba(0, 212, 255, 0.08);
+    }
+
+    /* chat fills right column, row 2 (stretchy) */
+    #app.desktop-mode #chat {
+      grid-column: 2;
+      grid-row: 2;
+      overflow-y: auto;
+    }
+
+    /* input bar stays at the bottom of the right column */
+    #app.desktop-mode #input-bar {
+      grid-column: 2;
+      grid-row: 3;
+    }
+
+    /* hide status bars that clutter the landscape view */
+    #app.desktop-mode #focus-mode-banner,
+    #app.desktop-mode #status-strip,
+    #app.desktop-mode #waveform-bar,
+    #app.desktop-mode #now-playing,
+    #app.desktop-mode #study-bar,
+    #app.desktop-mode #hw-bar {
+      display: none !important;
+    }
+
+    /* mode-toggle button — active state when in desktop mode */
+    #btn-display-mode.active {
+      color: var(--cyan);
+      background: rgba(0, 212, 255, 0.08);
+      border-color: rgba(0, 212, 255, 0.28);
+    }
+
+    /* slim left sidebar in desktop mode */
+    #app.desktop-mode #sidebar-left {
+      padding: 16px 10px 14px;
+    }
+    #app.desktop-mode #sl-logo-main { font-size: 16px; letter-spacing: 0.22em; }
+    #app.desktop-mode #sl-logo-sub  { font-size: 7px; }
+    #app.desktop-mode .sl-stat-label,
+    #app.desktop-mode .sl-stat-val  { font-size: 8px; }
+    #app.desktop-mode #sl-focus-toggle { display: none; }
+
   </style>
 </head>
 <body>
@@ -2355,6 +2429,7 @@
         <div id="status-dot" class="idle"></div>
         <span id="status-label" class="idle">STANDBY</span>
       </div>
+      <button class="hdr-btn" id="btn-display-mode" title="Desktop Mode">◫</button>
       <button class="hdr-btn" id="btn-cam-mode" title="Camera Mode">⊡</button>
       <button class="hdr-btn" id="btn-settings" title="Settings">⚙</button>
       <button class="hdr-btn" id="btn-clear" title="Clear chat">⌫</button>
