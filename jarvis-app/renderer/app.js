@@ -549,6 +549,9 @@ function connect () {
       showOverlay(msg.data)
     } else if (msg.type === 'camera_capture_request') {
       captureAndSendFrame(msg.id)
+    } else if (msg.type === 'hide_window') {
+      // Voice command: "hide yourself" — only explicit ask can hide
+      setTimeout(() => window.jarvis?.hide(), 800)
     } else if (msg.type === 'shutdown') {
       // Give TTS a moment to finish the farewell, then quit entirely
       setTimeout(() => window.jarvis?.quit(), 2200)

@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer } = require('electron')
 
 contextBridge.exposeInMainWorld('jarvis', {
   close:           () => ipcRenderer.send('window-close'),
+  hide:            () => ipcRenderer.send('window-hide'),
   minimize:        () => ipcRenderer.send('window-minimize'),
   quit:            () => ipcRenderer.send('quit-app'),
   getPort:         () => ipcRenderer.invoke('get-port'),

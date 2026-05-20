@@ -354,7 +354,7 @@ _BAD_REQUEST_MSG = (
 )
 
 _FALLBACK_MODELS = [
-    "meta-llama/llama-4-scout-17b-16e-instruct",
+    # llama-4-scout removed — it outputs words without spaces (tokenizer bug)
     "llama3-groq-8b-8192-tool-use-preview",
     "llama-3.1-8b-instant",
 ]
@@ -971,7 +971,8 @@ class Jarvis:
             # Use the condensed prompt for Groq — the full prompt is ~3000 tokens
             # and burns through the free-tier token-per-minute quota before the
             # response even starts. Condensed = ~600 tokens = 5x more headroom.
-            system, history, max_tok = get_mid_prompt(), self._slim_history(self.messages[-12:]), 1024
+            # Keep only last 6 messages (down from 12) to stay well under context limit.
+            system, history, max_tok = get_mid_prompt(), self._slim_history(self.messages[-6:], max_chars=300), 1024
         elif is_fast:
             system, history, max_tok = get_fast_prompt(), self._slim_history(self.messages[-6:]), 512
         else:

@@ -506,6 +506,11 @@ _RESTART_PHRASES = (
     "reboot yourself", "restart the server",
 )
 
+_HIDE_PHRASES = (
+    "hide yourself", "hide jarvis", "go away", "go to sleep",
+    "minimize yourself", "hide the window", "close the window",
+)
+
 def process(text: str, skip_echo: bool = False) -> None:
     """Top-level guard — wraps _process_unsafe so a single tool failure
     can't hang JARVIS or kill the worker thread silently."""
@@ -598,6 +603,14 @@ def process(text: str, skip_echo: bool = False) -> None:
         msg = forget_fact(keyword) if keyword else "What should I forget? Try: 'forget my gym schedule'."
         broadcast({"type": "chunk", "text": msg})
         broadcast({"type": "done", "full_text": msg})
+        return
+
+    # ── Hide window shortcut ──────────────────────────────────────────────────
+    if any(low.startswith(p) or p in low for p in _HIDE_PHRASES):
+        msg = "Going dark. Press ⌘⇧J to bring me back."
+        broadcast({"type": "chunk", "text": msg})
+        broadcast({"type": "done", "full_text": msg})
+        broadcast({"type": "hide_window"})
         return
 
     # ── Restart shortcut ──────────────────────────────────────────────────────

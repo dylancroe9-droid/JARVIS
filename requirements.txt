@@ -8,6 +8,10 @@ SpeechRecognition>=3.10.0
 pyaudio>=0.2.14
 sounddevice>=0.4.6
 numpy>=1.24.0
+openai-whisper>=20231117
+
+# macOS system integration
+pyobjc-framework-Cocoa>=9.0
 
 # Voice — TTS (priority order: ElevenLabs → edge-tts → macOS say)
 elevenlabs>=1.0.0

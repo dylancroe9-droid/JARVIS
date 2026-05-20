@@ -118,8 +118,9 @@ function createTray () {
 
 // ── IPC from renderer ─────────────────────────────────────────────────────────
 
-ipcMain.on('window-close',    () => mainWindow?.hide())
+ipcMain.on('window-close',    () => mainWindow?.minimize())  // ✕ minimises, never hides
 ipcMain.on('window-minimize', () => mainWindow?.minimize())
+ipcMain.on('window-hide',     () => mainWindow?.hide())      // only for explicit voice command
 ipcMain.on('quit-app',        () => app.quit())
 ipcMain.handle('get-port',    () => PORT)
 ipcMain.handle('get-version', () => app.getVersion())
@@ -263,15 +264,11 @@ app.whenReady().then(async () => {
   createWindow()
   createTray()
 
-  // ⌘⇧J toggles the window from anywhere
+  // ⌘⇧J always brings JARVIS forward — never hides it
   globalShortcut.register('CommandOrControl+Shift+J', () => {
     if (!mainWindow) return createWindow()
-    if (mainWindow.isVisible() && mainWindow.isFocused()) {
-      mainWindow.hide()
-    } else {
-      mainWindow.show()
-      mainWindow.focus()
-    }
+    mainWindow.show()
+    mainWindow.focus()
   })
 
   app.on('activate', () => {
