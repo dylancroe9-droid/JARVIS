@@ -23,9 +23,15 @@ def _macos_full_name() -> str:
 ANTHROPIC_API_KEY   = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL     = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-5")  # override in .env
 
-# ── Groq (free fallback when no Anthropic key) ────────────────────────────────
+# ── Groq (cloud fallback — tool-heavy tasks and complex reasoning) ────────────
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL   = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+# ── Ollama (local brain — runs on YOUR hardware, no internet needed) ──────────
+# URL:   change to http://[mac-mini-ip]:11434 when you get the Mac mini
+# MODEL: qwen2.5:3b for 8GB Mac, qwen2.5:7b or llama3.1:8b for 16GB+
+OLLAMA_URL   = os.getenv("OLLAMA_URL",   "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
 
 # ── Spotify (optional — for playlist queuing) ─────────────────────────────────
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
@@ -56,7 +62,7 @@ TTS_VOICE = os.getenv("TTS_VOICE", "Daniel")   # macOS say voice (British)
 TTS_RATE  = int(os.getenv("TTS_RATE", "175"))  # words per minute
 
 # ── Voice — STT ───────────────────────────────────────────────────────────────
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")   # base = 3-4× faster than small; accuracy fine with tuned VAD
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 PROJECTS_DIR   = os.path.expanduser(os.getenv("PROJECTS_DIR", "~/Projects"))

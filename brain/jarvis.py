@@ -15,7 +15,7 @@ from rich.console import Console
 
 from datetime import datetime
 
-from config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL, GROQ_API_KEY, GROQ_MODEL
+from config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL, GROQ_API_KEY, GROQ_MODEL, OLLAMA_URL, OLLAMA_MODEL
 from brain.personality import get_system_prompt, get_fast_prompt, get_mid_prompt
 from brain.tools import TOOL_DEFINITIONS, get_openai_tools, get_core_tools, get_8b_tools
 
@@ -219,6 +219,51 @@ _FIRE_AND_DONE_TOOLS = {
     "convert_units",
 }
 
+# Natural acknowledgment phrases spoken BEFORE a tool runs.
+# Gives the user immediate audio feedback so JARVIS doesn't go silent for 1-3s.
+# Keys are tool names; None = no acknowledgment (instant / canned tools).
+_TOOL_ACKS: dict[str, str | None] = {
+    "get_weather":            "One sec.",
+    "get_forecast":           "Let me pull that forecast.",
+    "web_search":             "Let me look that up.",
+    "web_search_results":     "Searching now.",
+    "get_calendar_events":    "Checking your calendar.",
+    "create_calendar_event":  "Adding that to your schedule.",
+    "get_unread_emails":      "Checking your inbox.",
+    "get_recent_emails":      "Pulling up your emails.",
+    "send_email":             "Sending that.",
+    "get_news":               "Grabbing the latest.",
+    "get_daily_briefing":     "Pulling up your briefing.",
+    "deep_research":          "Let me dig into that.",
+    "add_reminder":           "Setting that reminder.",
+    "get_reminders":          "Checking your reminders.",
+    "run_command":            "On it.",
+    "read_file":              "Reading that file.",
+    "write_file":             "Writing that.",
+    "edit_file":              "Making that edit.",
+    "youtube_search":         "Searching YouTube.",
+    "open_application":       "Opening that.",
+    "get_battery_status":     "Checking battery.",
+    "translate_text":         "Translating that.",
+    "define_word":            "Looking that up.",
+    "get_wikipedia_summary":  "Let me look that up.",
+    "generate_image":         "Generating that image.",
+    "send_imessage":          "Sending that message.",
+    "get_location":           "Checking your location.",
+    "convert_units":          "Crunching that.",
+    "get_weather_forecast":   "Let me check.",
+    # Tools that already have near-instant results or canned replies → stay silent
+    "remember_fact":          None,
+    "quick_note":             None,
+    "set_timer":              None,
+    "take_screenshot":        None,
+    "play_music":             None,
+    "pause_music":            None,
+    "next_track":             None,
+    "show_overlay":           None,
+    "ar_build":               None,
+}
+
 # Computer agent: when these phrases appear, put JARVIS in autonomous screen-control mode.
 # More rounds, forced take_screenshot first, no babying.
 _COMPUTER_AGENT_PHRASES = frozenset({
@@ -367,14 +412,28 @@ class Jarvis:
         self._recent_replies: deque = deque(maxlen=5)
         self._last_blueprint_subject: str = ""  # context for follow-up requests like "pull it up"
 
-        # Primary: Claude
+        # ── Local Ollama brain (runs on YOUR hardware) ────────────────────────
+        self._local: "OpenAI | None" = None
+        try:
+            import httpx as _hx
+            r = _hx.get(f"{OLLAMA_URL}/api/tags", timeout=2.0)
+            if r.status_code == 200:
+                from openai import OpenAI as _OAI
+                self._local = _OAI(base_url=f"{OLLAMA_URL}/v1", api_key="ollama")
+                console.print(f"[green]Local brain: Ollama {OLLAMA_MODEL} ✓[/green]")
+            else:
+                console.print(f"[dim]Ollama not running — using cloud only[/dim]")
+        except Exception:
+            console.print(f"[dim]Ollama not found — using cloud only[/dim]")
+
+        # ── Primary: Claude ────────────────────────────────────────────────────
         if _USE_CLAUDE:
             import anthropic
             self._claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
             self.model = ANTHROPIC_MODEL
-            console.print(f"[dim]Brain: Claude {ANTHROPIC_MODEL}[/dim]")
+            console.print(f"[dim]Cloud brain: Claude {ANTHROPIC_MODEL}[/dim]")
 
-        # Groq: primary fallback or only brain
+        # ── Groq: cloud fallback for tool-heavy / complex tasks ────────────────
         if GROQ_API_KEY:
             from openai import OpenAI
             self.client = OpenAI(
@@ -383,7 +442,7 @@ class Jarvis:
             )
             if not _USE_CLAUDE:
                 self.model = GROQ_MODEL
-                console.print(f"[dim]Brain: Groq {GROQ_MODEL}[/dim]")
+                console.print(f"[dim]Cloud brain: Groq {GROQ_MODEL}[/dim]")
         elif not _USE_CLAUDE:
             raise RuntimeError(
                 "No API key found.\n"
@@ -400,9 +459,16 @@ class Jarvis:
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def chat(self, user_input: str) -> Generator[str, None, None]:
-        self.messages.append({"role": "user", "content": user_input})
-        if len(self.messages) > 60:
-            self.messages = self.messages[-60:]
+        # Strip injected context prefixes before storing in history —
+        # [WORK MODE — SCREEN: ...] blobs compound fast and blow up the context window.
+        import re as _re
+        _clean_input = _re.sub(
+            r'^\[(?:WORK MODE|GAMING MODE)[^\]]*\]\s*(?:Use this[^.]*\.)?\s*(?:User said:\s*)?',
+            '', user_input
+        ).strip() or user_input
+        self.messages.append({"role": "user", "content": _clean_input})
+        if len(self.messages) > 40:   # tighter cap — 60 was too many with tool results
+            self.messages = self.messages[-40:]
 
         if _USE_CLAUDE:
             # Silently extract memorable facts in background — no await, never blocks
@@ -410,12 +476,13 @@ class Jarvis:
             yield from self._claude_chat()
         else:
             _lower_input = user_input.lower()
-            # [STUDY] and [STUDY MODE] prompts are pure generation — skip tools entirely
-            # to avoid the LLM calling run_command or other tools mid-generation.
+            # [STUDY] prompts — skip tools entirely
             if _lower_input.startswith("[study]") or _lower_input.startswith("[study mode]"):
                 yield from self._plain_stream(model=GROQ_MODEL)
             elif self._is_fast_query(user_input):
-                yield from self._plain_stream(model="meta-llama/llama-4-scout-17b-16e-instruct")
+                # Simple conversational — still use 70b but with compressed context
+                # 8b-instant outputs words-without-spaces on short prompts (broken)
+                yield from self._plain_stream(model=GROQ_MODEL)
             else:
                 yield from self._stream_with_tools()
 
@@ -456,11 +523,21 @@ class Jarvis:
             notes.append("It's very early. Acknowledge the discipline quietly if it fits.")
 
         # Upcoming calendar check — non-blocking, best effort
+        # CRITICAL: only inject real calendar data. Never invent events from memory.
         try:
             from tools.calendar_tool import get_calendar_events
             cal = get_calendar_events(days=1)
-            if cal and "no events" not in cal.lower() and "unavailable" not in cal.lower():
-                notes.append(f"TODAY'S CALENDAR (proactive context): {cal[:300]}")
+            if cal and "nothing" not in cal.lower() and "unavailable" not in cal.lower():
+                notes.append(
+                    f"TODAY'S REAL CALENDAR DATA (from device): {cal[:400]}\n"
+                    f"  ⚠ NEVER invent or guess calendar events. "
+                    f"Only report what is listed above. If asked about schedule, read this exactly."
+                )
+            else:
+                notes.append(
+                    "TODAY'S CALENDAR: Nothing scheduled today (verified from device). "
+                    "Do NOT invent events."
+                )
         except Exception:
             pass
 
@@ -491,9 +568,9 @@ class Jarvis:
         if len(words) <= 5 and any(t.startswith(v) for v in command_verbs):
             return 300
 
-        # Short conversational — still needs room to be genuinely useful
+        # Short conversational — needs room for a real answer
         if len(words) <= 8:
-            return 800
+            return 500
 
         # Medium questions — give a real answer
         if len(words) <= 20:
@@ -694,6 +771,12 @@ class Jarvis:
             # Execute every tool in this round
             tool_results = []
             executed: set[str] = set()
+
+            # Speak before the first tool runs
+            first_ack = _TOOL_ACKS.get(tool_uses[0].name, "")
+            if first_ack:
+                yield first_ack + " "
+
             for tu in tool_uses:
                 executed.add(tu.name)
                 console.print(f"[dim]  ⚙  {tu.name}({_summarise(dict(tu.input))})[/dim]")
@@ -902,6 +985,9 @@ class Jarvis:
             "translate", "definition", "define", "convert", "news", "headlines",
             "do not disturb", "dnd", "flip", "random",
             "playlist", "add to", "remind", "pomodoro",
+            # Calendar / schedule — must call the tool, never hallucinate
+            "schedule", "agenda", "appointment", "meeting", "today", "event",
+            "what do i have", "what's today", "what time", "when is",
             # AR / visual
             "visual", "timeline", "diagram", "overlay", "concept", "flashcard",
             "holding", "bottle", "camera", "identify", "what is this",
@@ -947,6 +1033,35 @@ class Jarvis:
             out.append(m)
         return out
 
+    def _local_stream(self) -> Generator[str, None, None]:
+        """
+        Stream a pure-conversation response from local Ollama.
+        No tool calls — fast query path only.
+        Falls back automatically if self._local is None (caller checks before calling).
+        """
+        from brain.personality import get_fast_prompt
+        system  = get_fast_prompt() + self._get_recent_replies_note()
+        history = self._slim_history(self.messages[-8:], max_chars=500)
+
+        stream = self._local.chat.completions.create(
+            model=OLLAMA_MODEL,
+            messages=[{"role": "system", "content": system}] + history,
+            stream=True,
+            temperature=0.7,
+            max_tokens=400,
+        )
+        full: list[str] = []
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content or ""
+            if delta:
+                full.append(delta)
+                yield delta
+
+        text = "".join(full).strip()
+        if text:
+            self.messages.append({"role": "assistant", "content": text})
+            self._recent_replies.append(text[:80])
+
     def _make_stream(self, model: str, with_tools: bool = True, emergency: bool = False):
         """Build and return a streaming chat completion.
 
@@ -972,9 +1087,10 @@ class Jarvis:
             # and burns through the free-tier token-per-minute quota before the
             # response even starts. Condensed = ~600 tokens = 5x more headroom.
             # Keep only last 6 messages (down from 12) to stay well under context limit.
-            system, history, max_tok = get_mid_prompt(), self._slim_history(self.messages[-6:], max_chars=300), 1024
+            system, history, max_tok = get_mid_prompt(), self._slim_history(self.messages[-6:], max_chars=280), 900
         elif is_fast:
-            system, history, max_tok = get_fast_prompt(), self._slim_history(self.messages[-6:]), 512
+            # 8b-instant: slim context = less to process = faster first token
+            system, history, max_tok = get_fast_prompt(), self._slim_history(self.messages[-4:], max_chars=150), 400
         else:
             system, history, max_tok = get_mid_prompt(), self._slim_history(self.messages[-10:]), 768
 
@@ -1309,6 +1425,12 @@ class Jarvis:
                 "content":    full_text or None,
                 "tool_calls": tool_calls_formatted,
             })
+
+            # ── Acknowledgment: speak before the tool runs so JARVIS isn't silent ──
+            first_name = tool_calls_formatted[0]["function"]["name"]
+            ack = _TOOL_ACKS.get(first_name, "")  # "" = not in dict = no ack
+            if ack:
+                yield ack + " "
 
             for tc in tool_calls_formatted:
                 name = tc["function"]["name"]

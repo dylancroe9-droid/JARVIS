@@ -1,9 +1,26 @@
 """
 Web tools — weather, Google search, YouTube. No API keys needed.
 """
+import ssl
 import subprocess
 import urllib.request
 import urllib.parse
+
+
+def _build_ssl_ctx() -> ssl.SSLContext:
+    """Build an SSL context that works on macOS python.org builds (missing system certs)."""
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        # Last-resort: skip verification (better than a hard crash)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+
+_SSL_CTX = _build_ssl_ctx()
 
 
 _weather_cache: dict = {}   # {location_key: (timestamp, result)}
@@ -29,7 +46,7 @@ def get_weather(location: str = "") -> str:
             f"https://wttr.in/{loc}?format=j1",
             headers={"User-Agent": "curl/7.68.0"},
         )
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=8, context=_SSL_CTX) as resp:
             data = json.loads(resp.read())
 
         curr     = (data.get("current_condition") or [{}])[0]
@@ -78,7 +95,9 @@ def get_weather(location: str = "") -> str:
         return result
 
     except Exception as exc:
-        return f"Weather unavailable: {exc}"
+        import sys
+        print(f"[weather] fetch error: {exc}", file=sys.stderr)
+        return "I couldn't pull up the weather right now — the service might be temporarily unavailable. Try again in a moment."
 
 
 def get_forecast(location: str = "", days: int = 5) -> str:
@@ -93,7 +112,7 @@ def get_forecast(location: str = "", days: int = 5) -> str:
             f"https://wttr.in/{loc}?format=j1",
             headers={"User-Agent": "curl/7.68.0"},
         )
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=8, context=_SSL_CTX) as resp:
             data = json.loads(resp.read())
 
         area      = (data.get("nearest_area") or [{}])[0]
@@ -157,7 +176,9 @@ def get_forecast(location: str = "", days: int = 5) -> str:
         return "\n".join(lines)
 
     except Exception as exc:
-        return f"Forecast unavailable: {exc}"
+        import sys
+        print(f"[forecast] fetch error: {exc}", file=sys.stderr)
+        return "I couldn't pull up the forecast right now. Try again in a moment."
 
 
 def _open_in_browser(url: str) -> str:
@@ -234,7 +255,7 @@ def _youtube_scrape(query: str):
                 "Accept-Language": "en-US,en;q=0.9",
             },
         )
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=8, context=_SSL_CTX) as resp:
             html = resp.read().decode("utf-8", errors="ignore")
 
         # YouTube embeds structured data in the page source as JSON
@@ -295,7 +316,7 @@ def youtube_search(query: str) -> str:
                 + "&type=video&fields=videoId,title,author"
             )
             req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=5, context=_SSL_CTX) as resp:
                 results = json.loads(resp.read())
 
             if not (results and isinstance(results, list)):
@@ -353,7 +374,7 @@ def web_search_results(query: str, max_results: int = 5) -> str:
             + "&format=json&no_html=1&skip_disambig=1"
         )
         req = urllib.request.Request(ddg_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=6) as resp:
+        with urllib.request.urlopen(req, timeout=6, context=_SSL_CTX) as resp:
             data = json.loads(resp.read())
         if data.get("AbstractText"):
             snippets.append(f"[Direct answer] {data['AbstractText'][:500]}")
@@ -371,7 +392,7 @@ def web_search_results(query: str, max_results: int = 5) -> str:
             headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                                    "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"},
         )
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=8, context=_SSL_CTX) as resp:
             html = resp.read().decode("utf-8", errors="ignore")
 
         # Extract snippets from search result entries
@@ -408,7 +429,7 @@ def deep_research(query: str) -> str:
             headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                                    "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"},
         )
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=8, context=_SSL_CTX) as resp:
             html = resp.read().decode("utf-8", errors="ignore")
 
         # Extract URLs from results
@@ -478,7 +499,7 @@ def get_wikipedia_summary(query: str, sentences: int = 12) -> str:
             search_url,
             headers={"User-Agent": "JARVIS/1.0 (contact@jarvis.ai)"},
         )
-        with urllib.request.urlopen(req, timeout=7) as resp:
+        with urllib.request.urlopen(req, timeout=7, context=_SSL_CTX) as resp:
             search_data = _json.loads(resp.read())
 
         results = search_data.get("query", {}).get("search", [])

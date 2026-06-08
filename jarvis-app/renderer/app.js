@@ -311,6 +311,376 @@ $btnDisplayMode?.addEventListener('click', () =>
 // Restore saved mode on load
 if (displayMode === 'desktop') setDisplayMode('desktop')
 
+// ═══════════════════════════════════════════════════════════════════════════
+// AR HOLOGRAPHIC SHAPE BUILDER
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AR HOLOGRAPHIC SHAPE BUILDER
+// Full-window canvas overlay — completely rewritten for performance & visibility
+// ═══════════════════════════════════════════════════════════════════════════════
+
+let arBuildActive  = false
+let _arLabels      = true   // toggled by "hide labels" / "show labels"
+let arScene       = { shapes: [] }
+let _arCanvas     = null
+let _arCtx        = null
+let _arDirty      = true          // only redraw when scene changes
+let _arGridCache  = null          // offscreen canvas for the background grid
+let _arPulse      = 0             // 0–2π animation tick for glow pulse
+
+// ── Setup ─────────────────────────────────────────────────────────────────────
+
+function _initArCanvas () {
+  _arCanvas = document.getElementById('ar-build-canvas')
+  if (!_arCanvas) return
+  _arCtx    = _arCanvas.getContext('2d')
+  _arResize()
+  window.addEventListener('resize', _arResize)
+}
+
+const AR_PANEL_LEFT = 460   // pixels: existing UI panel width reserved on the left
+
+function _arResize () {
+  if (!_arCanvas) return
+  if (arBuildActive) {
+    _arCanvas.width  = Math.max(400, window.innerWidth - AR_PANEL_LEFT)
+    _arCanvas.height = window.innerHeight
+  } else {
+    _arCanvas.width  = window.innerWidth
+    _arCanvas.height = window.innerHeight
+  }
+  _arGridCache = null
+  _arDirty     = true
+}
+
+// Build the dot-grid into an offscreen canvas once per resize.
+// This is drawn as a single drawImage() instead of hundreds of arc() calls.
+function _arBuildGrid (w, h) {
+  const off = document.createElement('canvas')
+  off.width  = w
+  off.height = h
+  const ctx  = off.getContext('2d')
+  const step = 50
+
+  // Single path for ALL dots — one fill call instead of one per dot
+  ctx.fillStyle = 'rgba(0,212,255,0.10)'
+  ctx.beginPath()
+  for (let x = step; x < w; x += step) {
+    for (let y = step; y < h; y += step) {
+      ctx.moveTo(x + 1, y)
+      ctx.arc(x, y, 1, 0, Math.PI * 2)
+    }
+  }
+  ctx.fill()
+
+  // Crosshair
+  ctx.strokeStyle = 'rgba(0,212,255,0.08)'
+  ctx.lineWidth   = 1
+  ctx.setLineDash([4, 8])
+  ctx.beginPath(); ctx.moveTo(w/2, 0);   ctx.lineTo(w/2, h);   ctx.stroke()
+  ctx.beginPath(); ctx.moveTo(0, h/2);   ctx.lineTo(w, h/2);   ctx.stroke()
+  ctx.setLineDash([])
+
+  // Center crosshair tick marks
+  ctx.strokeStyle = 'rgba(0,212,255,0.22)'
+  ctx.lineWidth   = 1.5
+  ctx.setLineDash([])
+  const t = 12
+  ctx.beginPath()
+  ctx.moveTo(w/2 - t, h/2); ctx.lineTo(w/2 + t, h/2)
+  ctx.moveTo(w/2, h/2 - t); ctx.lineTo(w/2, h/2 + t)
+  ctx.stroke()
+
+  return off
+}
+
+// ── Mode enter / exit ─────────────────────────────────────────────────────────
+
+function enterArBuildMode () {
+  arBuildActive = true
+  _arDirty      = true
+  $app.classList.add('ar-build-mode')
+  document.body.classList.add('ar-build-mode')
+  // Expand window so both the chat panel and AR canvas are visible side-by-side
+  if (window.jarvis && window.jarvis.setDisplayMode) {
+    window.jarvis.setDisplayMode('ar-enter')
+  }
+  // Small delay lets the window resize settle before computing canvas dimensions
+  setTimeout(() => {
+    _initArCanvas()
+    if (_arCanvas) {
+      _arCanvas.style.pointerEvents = 'auto'
+      _arCanvas.style.cursor        = 'crosshair'
+      _attachArDrag(_arCanvas)
+    }
+    requestAnimationFrame(_arLoop)
+  }, 350)
+}
+
+function exitArBuildMode () {
+  arBuildActive = false
+  $app.classList.remove('ar-build-mode')
+  document.body.classList.remove('ar-build-mode')
+  if (_arCanvas) {
+    _arCanvas.style.pointerEvents = 'none'
+    _arCanvas.style.cursor        = 'default'
+  }
+  if (_arCtx && _arCanvas) _arCtx.clearRect(0, 0, _arCanvas.width, _arCanvas.height)
+  // Restore narrow work-mode panel
+  if (window.jarvis && window.jarvis.setDisplayMode) {
+    window.jarvis.setDisplayMode('ar-exit')
+  }
+}
+
+// ── AR drag support ───────────────────────────────────────────────────────────
+let _dragShape  = null
+let _dragOffset = { x: 0, y: 0 }
+
+function _arHitTest (mx, my) {
+  if (!arScene.shapes) return null
+  const W = _arCanvas.width
+  const H = _arCanvas.height
+  const cx = W / 2
+  const cy = H / 2
+  // test in reverse so topmost shape wins
+  for (let i = arScene.shapes.length - 1; i >= 0; i--) {
+    const s  = arScene.shapes[i]
+    const sx = cx + (s.x || 0)
+    const sy = cy + (s.y || 0)
+    const r  = (s.size || 100) / 2 + 10   // +10px hit padding
+    if (Math.abs(mx - sx) <= r && Math.abs(my - sy) <= r) return s
+  }
+  return null
+}
+
+function _attachArDrag (canvas) {
+  // Remove previous listeners to avoid stacking on re-init
+  canvas.removeEventListener('mousedown', canvas._arMD)
+  canvas.removeEventListener('mousemove', canvas._arMM)
+  canvas.removeEventListener('mouseup',   canvas._arMU)
+
+  canvas._arMD = (e) => {
+    const r = canvas.getBoundingClientRect()
+    const mx = e.clientX - r.left
+    const my = e.clientY - r.top
+    const hit = _arHitTest(mx, my)
+    if (hit) {
+      _dragShape  = hit
+      const cx    = canvas.width / 2
+      const cy    = canvas.height / 2
+      _dragOffset = { x: mx - (cx + (hit.x || 0)), y: my - (cy + (hit.y || 0)) }
+      canvas.style.cursor = 'grabbing'
+      e.preventDefault()
+    }
+  }
+  canvas._arMM = (e) => {
+    if (!_dragShape) return
+    const r  = canvas.getBoundingClientRect()
+    const mx = e.clientX - r.left
+    const my = e.clientY - r.top
+    const cx = canvas.width / 2
+    const cy = canvas.height / 2
+    const nx = Math.round(mx - cx - _dragOffset.x)
+    const ny = Math.round(my - cy - _dragOffset.y)
+    const dx = nx - (_dragShape.x || 0)
+    const dy = ny - (_dragShape.y || 0)
+    _dragShape.x = nx
+    _dragShape.y = ny
+    // Move all grouped shapes together
+    if (_dragShape.group_id && arScene.shapes) {
+      for (const s of arScene.shapes) {
+        if (s !== _dragShape && s.group_id === _dragShape.group_id) {
+          s.x = (s.x || 0) + dx
+          s.y = (s.y || 0) + dy
+        }
+      }
+    }
+    _arDirty = true
+    e.preventDefault()
+  }
+  canvas._arMU = () => {
+    if (_dragShape) {
+      canvas.style.cursor = 'crosshair'
+      _dragShape = null
+    }
+  }
+
+  canvas.addEventListener('mousedown', canvas._arMD)
+  canvas.addEventListener('mousemove', canvas._arMM)
+  canvas.addEventListener('mouseup',   canvas._arMU)
+}
+
+// ── Render loop — only redraws when dirty ─────────────────────────────────────
+
+function _arLoop (ts) {
+  if (!arBuildActive) return
+  _arPulse = (ts * 0.002) % (Math.PI * 2)   // ~1 cycle/3s for glow pulse
+
+  // Always redraw so the glow pulse animates
+  _arDraw()
+
+  requestAnimationFrame(_arLoop)
+}
+
+function _arDraw () {
+  const canvas = _arCanvas
+  const ctx    = _arCtx
+  if (!ctx || !canvas || !canvas.width) return
+
+  const W = canvas.width
+  const H = canvas.height
+
+  ctx.clearRect(0, 0, W, H)
+
+  // Dark overlay — makes shapes readable and gives proper holographic feel
+  ctx.fillStyle = 'rgba(0, 5, 15, 0.72)'
+  ctx.fillRect(0, 0, W, H)
+
+  // Grid — one cached drawImage call
+  if (!_arGridCache) _arGridCache = _arBuildGrid(W, H)
+  ctx.drawImage(_arGridCache, 0, 0)
+
+  // Draw all shapes
+  const cx = W / 2
+  const cy = H / 2
+  const pulse = 0.7 + 0.3 * Math.sin(_arPulse)   // 0.7–1.0 glow multiplier
+
+  ctx.save()
+  ctx.lineJoin = 'round'
+  ctx.lineCap  = 'round'
+
+  for (const shape of (arScene.shapes || [])) {
+    _arShape(ctx, shape, cx, cy, pulse)
+  }
+
+  ctx.restore()
+}
+
+// ── Shape drawing ─────────────────────────────────────────────────────────────
+
+function _arShape (ctx, shape, cx, cy, pulse) {
+  const color  = shape.color     || '#00d4ff'
+  const size   = shape.size      || 120
+  const thick  = shape.thickness || 2.5
+  const rot    = ((shape.rotation || 0) * Math.PI) / 180
+  const op     = shape.opacity ?? 1
+  const px     = cx + (shape.x || 0)
+  const py     = cy + (shape.y || 0)
+  const type   = (shape.type || 'square').toLowerCase()
+
+  ctx.save()
+  ctx.translate(px, py)
+  ctx.rotate(rot)
+
+  // ── Outer glow (wide, soft) ───────────────────────────────────────────────
+  ctx.globalAlpha = op * 0.18 * pulse
+  ctx.strokeStyle = color
+  ctx.lineWidth   = thick + 10
+  ctx.shadowColor = color
+  ctx.shadowBlur  = 0
+  _arStrokeType(ctx, type, size, shape)
+
+  // ── Main stroke (sharp, bright) ───────────────────────────────────────────
+  ctx.globalAlpha = op
+  ctx.lineWidth   = thick
+  ctx.shadowColor = color
+  ctx.shadowBlur  = 12
+  _arStrokeType(ctx, type, size, shape)
+
+  // ── Inner highlight (white core) ──────────────────────────────────────────
+  ctx.globalAlpha = op * 0.45
+  ctx.strokeStyle = '#ffffff'
+  ctx.lineWidth   = Math.max(1, thick - 1)
+  ctx.shadowBlur  = 0
+  _arStrokeType(ctx, type, size, shape)
+
+  ctx.restore()
+
+  // ── Type label (hidden when _arLabels is false) ───────────────────────────
+  if (_arLabels) {
+    ctx.save()
+    ctx.translate(px, py)
+    ctx.globalAlpha = 0.65
+    ctx.fillStyle   = color
+    ctx.shadowColor = color
+    ctx.shadowBlur  = 6
+    ctx.font        = `bold 11px "SF Mono", Menlo, monospace`
+    ctx.textAlign   = 'center'
+    ctx.fillText(type.toUpperCase(), 0, size / 2 + 20)
+    if (shape.label) {
+      ctx.globalAlpha = 0.5
+      ctx.font        = `9px "SF Mono", Menlo, monospace`
+      ctx.fillText(shape.label.toUpperCase(), 0, size / 2 + 33)
+    }
+    ctx.restore()
+  }
+}
+
+function _arStrokeType (ctx, type, size, shape) {
+  if (type === 'square' || type === 'rectangle') {
+    const w = shape.width  || size
+    const h = shape.height || size
+    ctx.strokeRect(-w/2, -h/2, w, h)
+
+  } else if (type === 'circle' || type === 'sphere') {
+    ctx.beginPath()
+    ctx.arc(0, 0, size/2, 0, Math.PI * 2)
+    ctx.stroke()
+    if (type === 'sphere') {
+      ctx.save(); ctx.globalAlpha *= 0.4
+      ctx.beginPath(); ctx.ellipse(0, 0, size/2, size/4, 0, 0, Math.PI*2); ctx.stroke()
+      ctx.beginPath(); ctx.ellipse(0, 0, size/4, size/2, 0, 0, Math.PI*2); ctx.stroke()
+      ctx.restore()
+    }
+
+  } else if (type === 'triangle') {
+    _arPolygon(ctx, size/2, 3, -Math.PI/2)
+
+  } else if (type === 'hexagon') {
+    _arPolygon(ctx, size/2, 6, 0)
+
+  } else if (type === 'pentagon') {
+    _arPolygon(ctx, size/2, 5, -Math.PI/2)
+
+  } else if (type === 'cube') {
+    const s  = size / 2
+    const d  = size * 0.30
+    ctx.strokeRect(-s, -s, size, size)           // front face
+    ctx.save(); ctx.globalAlpha *= 0.5
+    ctx.strokeRect(-s+d, -s-d, size, size)       // back face
+    ctx.restore()
+    // connecting edges
+    const corners = [[-s,-s],[s,-s],[s,s],[-s,s]]
+    for (const [fx, fy] of corners) {
+      ctx.beginPath(); ctx.moveTo(fx, fy); ctx.lineTo(fx+d, fy-d); ctx.stroke()
+    }
+
+  } else if (type === 'line') {
+    const len = shape.length || size
+    ctx.beginPath(); ctx.moveTo(-len/2, 0); ctx.lineTo(len/2, 0); ctx.stroke()
+  }
+}
+
+function _arPolygon (ctx, r, sides, startAngle = 0) {
+  ctx.beginPath()
+  for (let i = 0; i < sides; i++) {
+    const a = startAngle + (2 * Math.PI * i) / sides
+    i === 0
+      ? ctx.moveTo(r * Math.cos(a), r * Math.sin(a))
+      : ctx.lineTo(r * Math.cos(a), r * Math.sin(a))
+  }
+  ctx.closePath()
+  ctx.stroke()
+}
+
+// ── Called from WebSocket message handler ─────────────────────────────────────
+
+function handleArSceneUpdate (scene) {
+  arScene  = scene
+  _arDirty = true
+}
+
 // ─── Study mode ──────────────────────────────────────────────────────────────
 
 let studyActive     = false
@@ -597,7 +967,85 @@ function connect () {
     // ── Info card ─────────────────────────────────────────────────────────────
     } else if (msg.type === 'info_card') {
       showInfoCard(msg)
+    } else if (msg.type === 'ar_scene_update') {
+      handleArSceneUpdate(msg.scene)
+    } else if (msg.type === 'ar_mode_enter') {
+      enterArBuildMode()
+    } else if (msg.type === 'ar_mode_exit') {
+      exitArBuildMode()
+    } else if (msg.type === 'gaming_mode_enter') {
+      document.body.classList.add('gaming-mode')
+      $app.classList.add('gaming-mode')
+      if (window.jarvis && window.jarvis.setDisplayMode) {
+        window.jarvis.setDisplayMode('gaming')
+      }
+      _gmAttach()
+    } else if (msg.type === 'gaming_mode_exit') {
+      document.body.classList.remove('gaming-mode')
+      $app.classList.remove('gaming-mode')
+      if (window.jarvis && window.jarvis.setDisplayMode) {
+        window.jarvis.setDisplayMode('gaming-exit')
+      }
+    } else if (msg.type === 'ar_labels') {
+      _arLabels = msg.visible
+      _arDirty  = true
+    } else if (msg.type === 'system_health') {
+      _applySystemHealth(msg.status)
     }
+  }
+}
+
+// ── Real system health display ────────────────────────────────────────────────
+// Called when the backend broadcasts probed component status.
+
+function _applySystemHealth (status) {
+  function _set (id, value, labels) {
+    const el = document.getElementById(id)
+    if (!el) return
+    // value: true = good, false = error, null = unknown/checking
+    if (value === true) {
+      el.textContent = labels[0] || 'ONLINE'
+      el.className   = 'sl-stat-val ok'
+    } else if (value === false) {
+      el.textContent = labels[1] || 'ERROR'
+      el.className   = 'sl-stat-val off'
+    } else {
+      el.textContent = 'CHECKING'
+      el.className   = 'sl-stat-val dim'
+    }
+  }
+
+  _set('sl-val-voice',    status.voice,       ['ONLINE',  'OFFLINE'])
+  _set('sl-val-brain',    status.ai_api,      ['ONLINE',  'DEGRADED'])
+  _set('sl-val-local-ai', status.local_ai,    ['ONLINE',  'OFFLINE'])
+  _set('sl-val-weather',  status.weather_api, ['ONLINE',  'OFFLINE'])
+  _set('sl-val-vision',   status.camera,      ['ACTIVE',  'OFFLINE'])
+
+  // Update HUD AI ENGINE panel to reflect actual model in use
+  const hudBrainVal = document.getElementById('hud-brain-val')
+  const hudBrainSub = document.getElementById('hud-brain-sub')
+  if (hudBrainVal) {
+    if (status.local_ai && status.ai_api) {
+      hudBrainVal.textContent = 'LOCAL + GROQ'
+      if (hudBrainSub) hudBrainSub.textContent = 'OLLAMA + LLAMA 3.3'
+    } else if (status.ai_api) {
+      hudBrainVal.textContent = 'GROQ'
+      if (hudBrainSub) hudBrainSub.textContent = 'LLAMA 3.3 70B'
+    } else if (status.local_ai) {
+      hudBrainVal.textContent = 'LOCAL'
+      if (hudBrainSub) hudBrainSub.textContent = 'OLLAMA ONLY'
+    } else {
+      hudBrainVal.textContent = 'OFFLINE'
+      if (hudBrainSub) hudBrainSub.textContent = 'NO AI AVAILABLE'
+    }
+  }
+
+  // Mirror in the CORE STATUS hud panel (desktop mode)
+  const hudLink = document.getElementById('hud-link-val')
+  if (hudLink) {
+    const allGood = status.ai_api !== false && status.tts !== false
+    hudLink.textContent  = allGood ? 'ONLINE' : 'DEGRADED'
+    hudLink.style.color  = allGood ? 'var(--green)' : 'var(--warn, #ff8833)'
   }
 }
 
@@ -728,7 +1176,12 @@ function applyState (state) {
   $label.className = state
   $label.textContent = s.label
   $strip.textContent = s.strip
-  $app.className   = state
+  // Preserve special mode classes that must survive state transitions
+  // (ar-build-mode keeps the AR label + canvas CSS; cam-mode keeps the camera panel)
+  const _preserved = []
+  if (arBuildActive)  _preserved.push('ar-build-mode')
+  if (camModeActive)  _preserved.push('cam-mode')
+  $app.className = _preserved.length ? state + ' ' + _preserved.join(' ') : state
   hudTargetColor   = s.hud
 
   // Sync left sidebar status indicator
@@ -759,6 +1212,13 @@ function applyState (state) {
   // Drive side panel activity bars — active while JARVIS is doing work
   if (window._setSidePanelActive) {
     window._setSidePanelActive(state === 'thinking' || state === 'speaking' || state === 'studying')
+  }
+
+  // Update gaming HUD dot
+  const $gmDot = document.getElementById('gm-dot')
+  if ($gmDot) {
+    $gmDot.className = ''
+    if (state && state !== 'idle') $gmDot.classList.add(state)
   }
 }
 
@@ -1532,9 +1992,9 @@ function _buildTimelineLayout (items, theme, N) {
 
 // ─── Chip layout — floating labeled chips in a loose grid ────────────────────
 
-function _buildChipLayout (items, theme, N) {
-  const camW = $camSection.clientWidth  || 460
-  const camH = $camSection.clientHeight || 355
+function _buildChipLayout (items, theme, N, forceW, forceH) {
+  const camW = forceW || $camSection.clientWidth  || 460
+  const camH = forceH || $camSection.clientHeight || 355
   const cols   = N <= 3 ? N : N <= 6 ? 3 : 4
   const rows   = Math.ceil(N / cols)
   const chipW  = Math.min(120, Math.floor((camW * 0.82) / cols) - 10)
@@ -1571,6 +2031,56 @@ function _buildChipLayout (items, theme, N) {
     arPanels.push(chip)
     arPanelData.push({ x, y, w: chipW, h: 34, item, idx: i, accentHex, norm: 0 })
   })
+}
+
+// ─── Show overlay — renders timeline/concepts/flashcards into $arLayer ────────
+
+function showOverlay (data) {
+  if (!data || !data.items || !data.items.length) return
+
+  clearOverlay(false)   // wipe any previous overlay instantly
+
+  arOverlay   = data
+  arPanels    = []
+  arPanelData = []
+  selectedIdx = -1
+
+  const theme = OVERLAY_THEMES[data.theme] || OVERLAY_THEMES.cyan
+  const N     = data.items.length
+
+  // ── Title banner ──────────────────────────────────────────────────────────
+  if (data.title) {
+    const banner = document.createElement('div')
+    banner.className = 'ar-title-banner'
+    banner.style.cssText = [
+      `color: ${theme.text}`,
+      `background: rgba(0,3,14,0.75)`,
+      `border: 1px solid ${theme.text}55`,
+      `text-shadow: 0 0 12px ${theme.text}`,
+      `top: 14px`,
+    ].join(';')
+    banner.textContent = data.title.toUpperCase()
+    $arLayer.appendChild(banner)
+  }
+
+  // ── Close hint ────────────────────────────────────────────────────────────
+  const closeHint = document.createElement('div')
+  closeHint.className = 'ar-gesture-hint'
+  closeHint.style.cssText = `bottom: 14px; color: ${theme.text}44; font-size: 7.5px; letter-spacing: 0.14em;`
+  closeHint.textContent = 'CLICK A CARD TO HEAR IT   •   SAY "CLOSE IT" TO DISMISS'
+  $arLayer.appendChild(closeHint)
+
+  // ── Layout ────────────────────────────────────────────────────────────────
+  if (data.overlay_type === 'timeline') {
+    _buildTimelineLayout(data.items, theme, N)
+  } else {
+    // concepts / flashcards / comparison / mindmap — chip grid
+    // Overlay is now fixed/full-screen so use window dimensions
+    _buildChipLayout(data.items, theme, N, window.innerWidth, window.innerHeight)
+  }
+
+  // ── Activate ──────────────────────────────────────────────────────────────
+  $arLayer.classList.add('active')
 }
 
 // ─── Clear overlay ───────────────────────────────────────────────────────────
@@ -2740,4 +3250,21 @@ function hideComputerAgentHUD () {
   }
   tick()
 })()
+
+// ── Gaming HUD input wiring ───────────────────────────────────────────────────
+
+function _gmAttach () {
+  const inp = document.getElementById('gm-input')
+  if (!inp || inp._gmBound) return
+  inp._gmBound = true
+  inp.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && inp.value.trim()) {
+      const txt = inp.value.trim()
+      inp.value = ''
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'message', text: txt }))
+      }
+    }
+  })
+}
 

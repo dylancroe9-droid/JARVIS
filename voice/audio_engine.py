@@ -27,11 +27,18 @@ console = Console()
 SAMPLE_RATE  = 16_000
 BLOCK_SIZE   = 512            # 32 ms per block — fast VAD / barge-in response
 
-VAD_RMS      = 380            # int16 RMS: above this = speech (raised to reduce ambient pickup)
+# WebRTC VAD replaces raw RMS as the primary speech detector.
+# It's a ML model specifically trained to distinguish human speech from noise,
+# music, fan hum, phone audio, etc. — far more accurate than RMS alone.
+# RMS is still used as an energy floor (ignore near-silence) and for barge-in.
+WEBRTC_AGGRESSIVENESS = 2     # 0=permissive … 3=aggressive noise rejection; 2 is the sweet spot
+VAD_RMS_FLOOR = 80            # absolute silence floor — skip WebRTC below this (saves CPU)
+VAD_RMS      = 210            # fallback RMS threshold if WebRTC unavailable
+VAD_ONSET    = 2              # 2 consecutive speech blocks (~64ms) before flagging speech start
 SILENCE_SECS = 0.5            # wake detection: flush after 0.5s silence
 SILENCE_BLKS = int(SILENCE_SECS * SAMPLE_RATE / BLOCK_SIZE)
 
-CMD_SILENCE_SECS = 1.3        # command/conversation: wait 1.3s before flushing — long enough for mid-sentence pauses
+CMD_SILENCE_SECS = 0.65       # 0.65s silence — fast response without cutting off normal speech
 CMD_SILENCE_BLKS = int(CMD_SILENCE_SECS * SAMPLE_RATE / BLOCK_SIZE)
 
 MAX_WAKE_SECS   = 7
@@ -46,10 +53,12 @@ CMD_TIMEOUT_BLKS = int(CMD_TIMEOUT_SECS * SAMPLE_RATE / BLOCK_SIZE)
 CONVERSE_TIMEOUT_SECS = 2     # seconds of silence before reverting to wake-word mode
 CONVERSE_TIMEOUT_BLKS = int(CONVERSE_TIMEOUT_SECS * SAMPLE_RATE / BLOCK_SIZE)
 
-BARGE_RMS    = 1000           # int16 RMS for barge-in — high enough that JARVIS's own TTS doesn't self-trigger
-BARGE_FRAMES = 6              # consecutive loud blocks required (~192ms of sustained speech)
+BARGE_RMS_MIN  = 1400         # floor: raised so phone-call bleed through speaker won't fire barge-in
+BARGE_RMS_MAX  = 2200         # ceiling: raised to match
+BARGE_MEASURE  = 28           # blocks to sample ambient/speaker level (~896ms — long enough to capture TTS bleed)
+BARGE_FRAMES   = 25           # ~800ms of continuous loud speech needed — prevents any accidental barge-in
 
-MIN_AUDIO    = int(0.35 * SAMPLE_RATE)   # skip STT if audio < 350 ms
+MIN_AUDIO    = int(0.20 * SAMPLE_RATE)   # skip STT if audio < 200 ms (was 350 — was dropping short commands)
 
 def _load_wake_words() -> list[str]:
     """Comma-separated env override → fall back to defaults."""
@@ -123,18 +132,21 @@ class AudioEngine:
         self,
         on_transcription: Callable[[str, str], None],
         on_barge_in:      Callable[[], None],
+        on_speech_end:    Optional[Callable[[], None]] = None,
     ) -> None:
         """
         on_transcription(kind, text):
             kind = "wake"    — full utterance that triggered wake word
-                               caller should call check_wake_word(text)
             kind = "command" — the command text to execute
-
         on_barge_in():
-            called when sustained loud speech is detected in BARGE_IN state
+            called when sustained loud speech detected in BARGE_IN state
+        on_speech_end():
+            called the moment speech ends and audio is queued for STT —
+            used to play an instant acknowledgment sound before Whisper runs
         """
         self._on_transcription = on_transcription
         self._on_barge_in      = on_barge_in
+        self._on_speech_end    = on_speech_end
 
         self._state: str      = self.IDLE
         self._frames: list    = []
@@ -142,6 +154,27 @@ class AudioEngine:
         self._silence_count   = 0
         self._block_count     = 0
         self._loud_count      = 0
+        self._onset_count     = 0   # consecutive speech blocks — must hit VAD_ONSET before speech flagged
+
+        # WebRTC VAD — loaded once, reused every block
+        self._webrtc_vad = None
+        try:
+            import webrtcvad as _wvad
+            self._webrtc_vad = _wvad.Vad(WEBRTC_AGGRESSIVENESS)
+        except Exception:
+            pass  # falls back to RMS-only
+
+        # Voice profile — load on init, used to verify speaker is Dylan
+        try:
+            from voice.voice_profile import load_profile
+            load_profile()
+        except Exception:
+            pass
+
+        # Barge-in dynamic threshold
+        self._barge_measure   = 0      # frames sampled so far
+        self._barge_rms_sum   = 0.0    # running sum during measurement
+        self._barge_threshold = BARGE_RMS_MIN  # computed after measurement
 
         self._audio_q: queue.Queue = queue.Queue()
         self._sr       = None
@@ -223,6 +256,43 @@ class AudioEngine:
         self._silence_count   = 0
         self._block_count     = 0
         self._loud_count      = 0
+        self._onset_count     = 0
+
+    def _is_speech(self, chunk: np.ndarray, rms: float) -> bool:
+        """
+        Returns True if this audio block contains human speech FROM the enrolled user.
+
+        Pipeline:
+          1. Energy floor — reject absolute silence instantly
+          2. WebRTC VAD — ML model rejects noise/music/fan hum/phone bleed
+          3. Voice profile check — compares speaker embedding to Dylan's voiceprint
+             (only runs when a profile is enrolled; skips if none saved)
+        """
+        if rms < VAD_RMS_FLOOR:
+            return False
+
+        # Step 1: WebRTC VAD — is this speech at all?
+        is_speech = False
+        if self._webrtc_vad is not None:
+            try:
+                frame = chunk[:480].astype(np.int16).tobytes()
+                is_speech = self._webrtc_vad.is_speech(frame, SAMPLE_RATE)
+            except Exception:
+                is_speech = rms > VAD_RMS
+        else:
+            is_speech = rms > VAD_RMS
+
+        if not is_speech:
+            return False
+
+        # Step 2: Voice profile check — is this speech from Dylan?
+        # Runs only if a profile is enrolled. Adds ~20ms but only reaches here
+        # after WebRTC already confirmed speech, so false positives are rare.
+        try:
+            from voice.voice_profile import is_owner
+            return is_owner(chunk)
+        except Exception:
+            return True   # profile check failed → accept (don't drop real commands)
 
     def start_detecting(self) -> None:
         """Passive wake word scanning."""
@@ -244,8 +314,13 @@ class AudioEngine:
         self._state = self.CONVERSING
 
     def start_barge_in(self) -> None:
-        """Watch mic energy only — used while JARVIS is speaking."""
+        """Watch mic energy only — used while JARVIS is speaking.
+        First BARGE_MEASURE frames are used to sample the ambient/speaker-bleed
+        level so the threshold auto-adjusts above it."""
         self._reset()
+        self._barge_measure   = 0
+        self._barge_rms_sum   = 0.0
+        self._barge_threshold = BARGE_RMS_MIN
         self._state = self.BARGE_IN
 
     def start_study(self) -> None:
@@ -287,18 +362,24 @@ class AudioEngine:
         rms   = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2)))
         state = self._state          # single CPython read — no lock needed
 
+        speech = self._is_speech(chunk, rms)   # WebRTC VAD (or RMS fallback)
+
         # ── DETECTING: accumulate speech, flush to STT on silence ────────────
         if state == self.DETECTING:
             self._block_count += 1
             self._frames.append(chunk)
 
-            if rms > VAD_RMS:
-                self._speech_started = True
-                self._silence_count  = 0
-            elif self._speech_started:
-                self._silence_count += 1
-                if self._silence_count >= SILENCE_BLKS:
-                    self._flush("wake")
+            if speech:
+                self._onset_count += 1
+                if self._onset_count >= VAD_ONSET:
+                    self._speech_started = True
+                self._silence_count = 0
+            else:
+                self._onset_count = max(0, self._onset_count - 1)
+                if self._speech_started:
+                    self._silence_count += 1
+                    if self._silence_count >= SILENCE_BLKS:
+                        self._flush("wake")
 
             # Rolling pre-roll: keep last 0.4 s when silent (for context)
             if not self._speech_started and len(self._frames) > MAX_WAKE_BLKS:
@@ -314,14 +395,18 @@ class AudioEngine:
             self._block_count += 1
             self._frames.append(chunk)
 
-            if rms > VAD_RMS:
-                self._speech_started = True
-                self._silence_count  = 0
-            elif self._speech_started:
-                self._silence_count += 1
-                if self._silence_count >= CMD_SILENCE_BLKS:
-                    self._flush("command")
-                    self._state = self.DETECTING
+            if speech:
+                self._onset_count += 1
+                if self._onset_count >= VAD_ONSET:
+                    self._speech_started = True
+                self._silence_count = 0
+            else:
+                self._onset_count = max(0, self._onset_count - 1)
+                if self._speech_started:
+                    self._silence_count += 1
+                    if self._silence_count >= CMD_SILENCE_BLKS:
+                        self._flush("command")
+                        self._state = self.DETECTING
 
             # No speech heard — give up after CMD_TIMEOUT_SECS
             if not self._speech_started and self._block_count > CMD_TIMEOUT_BLKS:
@@ -341,20 +426,23 @@ class AudioEngine:
             self._block_count += 1
             self._frames.append(chunk)
 
-            if rms > VAD_RMS:
-                self._speech_started = True
-                self._silence_count  = 0
-            elif self._speech_started:
-                self._silence_count += 1
-                if self._silence_count >= CMD_SILENCE_BLKS:
-                    self._flush("command")
-                    self._state = self.CONVERSING   # always stay conversational
+            if speech:
+                self._onset_count += 1
+                if self._onset_count >= VAD_ONSET:
+                    self._speech_started = True
+                self._silence_count = 0
+            else:
+                self._onset_count = max(0, self._onset_count - 1)
+                if self._speech_started:
+                    self._silence_count += 1
+                    if self._silence_count >= CMD_SILENCE_BLKS:
+                        self._flush("command")
+                        self._state = self.CONVERSING
 
-            # Reset block count periodically (no-speech idle) — but STAY in CONVERSING
-            # Never revert to DETECTING: wake word is permanently disabled.
+            # Reset block count periodically (no-speech idle) — stay in CONVERSING
             if not self._speech_started and self._block_count > CONVERSE_TIMEOUT_BLKS:
                 self._reset()
-                self._state = self.CONVERSING   # stay here — always-on mode
+                self._state = self.CONVERSING
 
             # Hard cap
             if self._block_count > MAX_CMD_BLKS:
@@ -367,7 +455,7 @@ class AudioEngine:
         elif state == self.STUDY:
             self._block_count += 1
             self._frames.append(chunk)
-            if rms > VAD_RMS:
+            if speech:
                 self._speech_started = True
                 self._silence_count = 0
             elif self._speech_started:
@@ -382,14 +470,25 @@ class AudioEngine:
                     self._reset()
                 self._state = self.STUDY
 
-        # ── BARGE_IN: energy threshold only ──────────────────────────────────
+        # ── BARGE_IN: dynamic threshold ───────────────────────────────────────
         elif state == self.BARGE_IN:
-            if rms > BARGE_RMS:
+            # Phase 1 — measure ambient/speaker-bleed level for BARGE_MEASURE frames
+            if self._barge_measure < BARGE_MEASURE:
+                self._barge_rms_sum += rms
+                self._barge_measure += 1
+                if self._barge_measure == BARGE_MEASURE:
+                    avg = self._barge_rms_sum / BARGE_MEASURE
+                    # Threshold = 2× the measured ambient (speaker bleed), clamped
+                    self._barge_threshold = min(BARGE_RMS_MAX, max(BARGE_RMS_MIN, avg * 2.2))
+                    console.print(f"[dim]barge-in threshold set: {self._barge_threshold:.0f} (ambient {avg:.0f})[/dim]")
+                return  # don't fire during measurement window
+
+            # Phase 2 — detect sustained voice above threshold
+            if rms > self._barge_threshold:
                 self._loud_count += 1
                 if self._loud_count >= BARGE_FRAMES:
                     self._loud_count = 0
                     self._state      = self.DETECTING
-                    # Fire callback in its own thread — never block the callback
                     threading.Thread(
                         target=self._on_barge_in,
                         daemon=True,
@@ -403,19 +502,26 @@ class AudioEngine:
         if self._frames and self._speech_started:
             audio = np.concatenate(self._frames)
             if len(audio) >= MIN_AUDIO:
+                # Fire ack callback immediately — before Whisper even starts.
+                # User hears acknowledgment sound ~instant, not after the 1-2s LLM delay.
+                if self._on_speech_end and kind == "command":
+                    threading.Thread(
+                        target=self._on_speech_end, daemon=True, name="ack"
+                    ).start()
                 self._audio_q.put_nowait((kind, audio))
         self._reset()
 
     # ── STT thread ────────────────────────────────────────────────────────────
 
     def _load_whisper(self) -> None:
-        """Load Whisper model in background so first transcription is fast."""
+        """Load Whisper models. Two-tier: tiny for short audio (<2s), base for longer."""
         try:
             import whisper as _whisper
             from config import WHISPER_MODEL
-            model_name = WHISPER_MODEL if WHISPER_MODEL in ("tiny", "base", "small") else "base"
-            self._whisper = _whisper.load_model(model_name)
-            console.print(f"[green]✓ Whisper {model_name} loaded — high-accuracy STT active[/green]")
+            model_name = WHISPER_MODEL if WHISPER_MODEL in ("tiny", "base", "small", "medium") else "base"
+            self._whisper      = _whisper.load_model(model_name)   # primary (base)
+            self._whisper_tiny = _whisper.load_model("tiny")        # fast path for short clips
+            console.print(f"[green]✓ Whisper {model_name} + tiny loaded — two-tier STT active[/green]")
         except Exception as exc:
             # Whisper failures fall into a few buckets; give the user something
             # actionable instead of just dumping the traceback.
@@ -433,27 +539,31 @@ class AudioEngine:
 
     def _transcribe(self, audio_np: np.ndarray) -> str:
         """
-        Transcribe audio using Whisper (preferred) or Google STT (fallback).
-        Whisper is dramatically more accurate for natural speech, names,
-        subject-specific terms (AP Gov, AP Chemistry, etc.).
+        Two-tier Whisper transcription:
+          - Short audio (≤ 2s): use tiny model (~150ms) — fast path for quick commands
+          - Longer audio (> 2s): use base model (~400ms) — more accurate for sentences
+        Falls back to Google STT if both Whisper models are unavailable.
         """
         from voice.latency import profiler
         profiler.mark("stt_start")
+
         # ── Whisper path ──────────────────────────────────────────────────────
         if getattr(self, "_whisper", None) is not None:
             try:
                 import whisper as _whisper
-                # Whisper needs float32 normalised to [-1, 1] at 16kHz
                 audio_f32 = audio_np.astype(np.float32) / 32768.0
-                result = self._whisper.transcribe(
+                # Pick model based on clip length
+                is_short  = len(audio_np) <= SAMPLE_RATE * 2   # ≤ 2 seconds
+                model     = getattr(self, "_whisper_tiny", None) if is_short else None
+                if model is None:
+                    model = self._whisper
+                result = model.transcribe(
                     audio_f32,
                     language="en",
                     fp16=False,
                     condition_on_previous_text=False,
                 )
-                # Skip if Whisper is highly confident this isn't speech
-                # (ambient noise, music, AC, etc.) — critical for always-on mode
-                if result.get("no_speech_prob", 0) > 0.72:
+                if result.get("no_speech_prob", 0) > 0.85:
                     profiler.mark("stt_end")
                     return ""
                 text = result.get("text", "").strip()

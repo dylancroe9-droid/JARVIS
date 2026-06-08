@@ -1001,9 +1001,9 @@
 
     /* ─── AR Overlay Layer ──────────────────────────────────────────────────── */
     #ar-overlay-layer {
-      position: absolute;
+      position: fixed;   /* fixed so it works regardless of column width or cam-section size */
       inset: 0;
-      z-index: 12;
+      z-index: 500;
       pointer-events: none;
       opacity: 0;
       transition: opacity 0.4s ease;
@@ -1012,7 +1012,8 @@
     }
     #ar-overlay-layer.active {
       opacity: 1;
-      background: rgba(0, 3, 14, 0.88);
+      pointer-events: auto;
+      background: rgba(0, 3, 14, 0.82);
     }
 
     /* Gesture / gaze feedback canvas */
@@ -1191,6 +1192,138 @@
     }
     #gesture-status.visible { display: block; }
     #gesture-status.active  { color: rgba(0,255,140,0.7); }
+
+    /* ═══════════════════════════════════════════════════════════════════════
+       AR HOLOGRAPHIC BUILD MODE
+    ═══════════════════════════════════════════════════════════════════════ */
+
+    /* ── AR canvas: full-window overlay, always on top ── */
+    #ar-build-canvas {
+      position: fixed;
+      top: 0; right: 0; bottom: 0;
+      left: 0;           /* overridden in AR mode */
+      width: 100vw;      /* overridden in AR mode */
+      height: 100vh;
+      z-index: 9000;
+      display: none;
+      pointer-events: none;
+      background: transparent;
+    }
+    #app.ar-build-mode #ar-build-canvas,
+    body.ar-build-mode #ar-build-canvas {
+      display: block;
+      left: 460px;
+      width: calc(100vw - 460px);
+    }
+
+    /* AR mode label — top-centre of the window */
+    #ar-mode-label {
+      position: fixed;
+      top: 8px; left: 50%;
+      transform: translateX(-50%);
+      font-size: 9px;
+      letter-spacing: 0.22em;
+      color: rgba(0, 212, 255, 0.7);
+      text-transform: uppercase;
+      font-family: var(--font-mono);
+      display: none;
+      z-index: 9001;
+      pointer-events: none;
+      background: rgba(0,4,14,0.5);
+      padding: 3px 10px;
+      border-radius: 3px;
+      border: 1px solid rgba(0,212,255,0.2);
+    }
+    #app.ar-build-mode #ar-mode-label { display: block; }
+
+    /* AR mode: keep the left panel fully visible and readable */
+    body.ar-build-mode #app {
+      width: 460px;      /* keep the app shell at its normal width */
+      height: 100vh;
+      /* Single column — chat takes the full panel width */
+      grid-template-columns: 1fr;
+    }
+    /* Hide both sidebars — replaced by full-width chat in AR mode */
+    body.ar-build-mode #sidebar-left  { display: none !important; }
+    body.ar-build-mode #sidebar-right { display: none !important; }
+    /* Hide cam/arc-reactor section so chat fills the column */
+    body.ar-build-mode #cam-section   { display: none !important; }
+    /* Main column fills the full 460px */
+    body.ar-build-mode #main-col { grid-column: 1; }
+    /* Chat fills remaining space and scrolls */
+    body.ar-build-mode #chat {
+      flex: 1;
+      overflow-y: auto;
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════════
+       GAMING / WORK MODE — tiny strip HUD
+    ═══════════════════════════════════════════════════════════════════════ */
+
+    /* Hide the full JARVIS app when in gaming mode */
+    body.gaming-mode #app { display: none !important; }
+
+    /* ── Gaming HUD: tiny single-row strip ── */
+    #gaming-hud {
+      display: none;
+      position: fixed;
+      inset: 0;
+      align-items: center;
+      gap: 8px;
+      padding: 0 12px;
+      background: rgba(0, 6, 18, 0.82);
+      -webkit-backdrop-filter: none !important;
+      backdrop-filter: none !important;
+      border: 1px solid rgba(0, 175, 220, 0.40);
+      border-radius: 9px;
+      font-family: 'SF Mono', 'Menlo', monospace;
+      overflow: hidden;
+    }
+    body.gaming-mode #gaming-hud { display: flex; }
+
+    #gm-dot {
+      font-size: 7px;
+      color: rgba(0, 170, 210, 0.55);
+      flex-shrink: 0;
+      transition: color 0.3s, text-shadow 0.3s;
+      line-height: 1;
+    }
+    #gm-dot.thinking { color: rgba(255, 160, 0, 0.80); }
+    #gm-dot.speaking {
+      color: rgba(0, 195, 235, 0.95);
+      text-shadow: 0 0 6px rgba(0, 195, 235, 0.6);
+      animation: gm-pulse 1.1s ease-in-out infinite;
+    }
+    #gm-dot.listening { color: rgba(0, 220, 110, 0.85); }
+
+    @keyframes gm-pulse {
+      0%,100% { opacity: 0.80; }
+      50%      { opacity: 1.0;  }
+    }
+
+    #gm-title {
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 0.20em;
+      color: rgba(0, 185, 225, 0.65);
+      flex-shrink: 0;
+    }
+
+    #gm-input {
+      flex: 1;
+      min-width: 0;
+      background: transparent;
+      border: none;
+      border-left: 1px solid rgba(0, 175, 220, 0.18);
+      padding: 0 0 0 10px;
+      color: rgba(160, 220, 245, 0.80);
+      font-family: inherit;
+      font-size: 9px;
+      outline: none;
+      caret-color: rgba(0, 195, 235, 0.9);
+    }
+    #gm-input::placeholder { color: rgba(0, 160, 200, 0.28); }
+    #gm-input:focus { color: rgba(190, 235, 255, 0.95); }
 
     /* ─── Permission overlay ────────────────────────────────────────────────── */
     #confirm-overlay {
@@ -2379,15 +2512,23 @@
 
     <div class="sl-stat-row">
       <span class="sl-stat-label">VOICE</span>
-      <span class="sl-stat-val ok" id="sl-val-voice">ONLINE</span>
+      <span class="sl-stat-val" id="sl-val-voice">CHECKING</span>
+    </div>
+    <div class="sl-stat-row">
+      <span class="sl-stat-label">AI ENGINE</span>
+      <span class="sl-stat-val" id="sl-val-brain">CHECKING</span>
+    </div>
+    <div class="sl-stat-row">
+      <span class="sl-stat-label">LOCAL AI</span>
+      <span class="sl-stat-val" id="sl-val-local-ai">CHECKING</span>
+    </div>
+    <div class="sl-stat-row">
+      <span class="sl-stat-label">WEATHER</span>
+      <span class="sl-stat-val" id="sl-val-weather">CHECKING</span>
     </div>
     <div class="sl-stat-row">
       <span class="sl-stat-label">VISION</span>
-      <span class="sl-stat-val" id="sl-val-vision">ACTIVE</span>
-    </div>
-    <div class="sl-stat-row">
-      <span class="sl-stat-label">AI BRAIN</span>
-      <span class="sl-stat-val ok" id="sl-val-brain">CLAUDE</span>
+      <span class="sl-stat-val" id="sl-val-vision">CHECKING</span>
     </div>
     <div class="sl-stat-row">
       <span class="sl-stat-label">UPTIME</span>
@@ -2465,6 +2606,7 @@
     <!-- Gesture status indicator -->
     <div id="gesture-status">◎ GESTURE</div>
     <div id="cam-grid"></div>
+    <!-- AR canvas is now a fixed full-window overlay (see below, outside cam-section) -->
     <!-- Exit camera mode chip (only shown in cam mode) -->
     <div id="cam-mode-exit">✕ EXIT CAM MODE</div>
 
@@ -2613,8 +2755,8 @@
           <div class="hud-panel-badge">v4.5</div>
         </div>
         <div class="hud-panel-body">
-          <div class="hud-panel-value sm">CLAUDE</div>
-          <div class="hud-panel-sub">ANTHROPIC SONNET</div>
+          <div class="hud-panel-value sm" id="hud-brain-val">GROQ</div>
+          <div class="hud-panel-sub" id="hud-brain-sub">LLAMA 3.3 70B</div>
           <div class="hud-bars" style="margin-top:6px">
             <div class="hud-bar-row">
               <div class="hud-bar-label">CTX</div>
@@ -2871,6 +3013,15 @@
 </div>
 <!-- Gaze cursor canvas — full-window fixed overlay, above everything -->
 <canvas id="gesture-canvas"></canvas>
+  <!-- ── Gaming / Work Mode HUD — tiny always-on-top strip ─────────────────────── -->
+  <div id="gaming-hud">
+    <span id="gm-dot">●</span>
+    <span id="gm-title">JARVIS</span>
+    <input id="gm-input" type="text" placeholder="type…" autocomplete="off" spellcheck="false" />
+  </div>
+<!-- AR Shape Builder — full-window fixed overlay, shown only in ar-build-mode -->
+<canvas id="ar-build-canvas"></canvas>
+<div id="ar-mode-label">◈ AR BUILD MODE — say a shape to begin</div>
 <!-- Three.js — exposed as window.THREE for 3D rendering -->
 <script type="module">
   import * as T from '../node_modules/three/build/three.module.js'

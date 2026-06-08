@@ -486,12 +486,19 @@ end tell''')
 def set_volume(level: int) -> str:
     try:
         level = max(0, min(100, int(level)))
+        # Set macOS system output volume
         r = subprocess.run(
             ["osascript", "-e", f"set volume output volume {level}"],
             capture_output=True, text=True, timeout=5,
         )
         if r.returncode != 0:
             return f"Couldn't set volume: {r.stderr.strip()}"
+        # Also set Apple Music's internal volume slider (separate from system vol)
+        subprocess.run(
+            ["osascript", "-e",
+             f'tell application "Music" to if it is running then set sound volume to {level}'],
+            capture_output=True, timeout=5,
+        )
         return f"Volume at {level}%."
     except Exception as exc:
         return f"Couldn't set volume: {exc}"
@@ -501,6 +508,11 @@ def mute_volume() -> str:
     try:
         subprocess.run(["osascript", "-e", "set volume with output muted"],
                        capture_output=True, timeout=5)
+        subprocess.run(
+            ["osascript", "-e",
+             'tell application "Music" to if it is running then set sound volume to 0'],
+            capture_output=True, timeout=5,
+        )
         return "Muted."
     except Exception as exc:
         return f"Couldn't mute: {exc}"
@@ -510,6 +522,11 @@ def unmute_volume() -> str:
     try:
         subprocess.run(["osascript", "-e", "set volume without output muted"],
                        capture_output=True, timeout=5)
+        subprocess.run(
+            ["osascript", "-e",
+             'tell application "Music" to if it is running then set sound volume to 80'],
+            capture_output=True, timeout=5,
+        )
         return "Unmuted."
     except Exception as exc:
         return f"Couldn't unmute: {exc}"

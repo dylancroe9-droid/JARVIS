@@ -334,10 +334,12 @@ class ToolsExecutor:
                 from tools.playlist_tool import play_playlist
             except ImportError as exc:
                 return f"Playlist tool unavailable: {exc}"
-            return play_playlist(
+            result = play_playlist(
                 name=args["name"],
                 shuffle=args.get("shuffle", True),
             )
+            self.media_opened = True  # suspend mic during playlist playback
+            return result
 
         elif name == "add_to_playlist":
             try:
@@ -410,16 +412,28 @@ class ToolsExecutor:
                 from tools.music_tools import play_music
             except ImportError as exc:
                 return f"Music tool unavailable: {exc}"
-            # play_music handles all timing/polling internally and returns
-            # the now-playing string when successful — no extra sleep needed.
-            return play_music(query=args.get("query", ""))
+            result = play_music(query=args.get("query", ""))
+            # Music plays through speakers — mic would pick up lyrics as commands.
+            # Set media_opened so _resume_audio() switches to detecting mode
+            # (requires "Jarvis" wake word while music plays).
+            self.media_opened = True
+            return result
 
         elif name == "pause_music":
             try:
                 from tools.music_tools import pause_music
             except ImportError as exc:
                 return f"Music tool unavailable: {exc}"
-            return pause_music()
+            result = pause_music()
+            # Music stopped — clear media lock and immediately wake the mic
+            try:
+                import server as _srv
+                _srv._media_mode_until = 0.0
+                # Mic was suspended during music; bring it back now
+                _srv._resume_audio()
+            except Exception:
+                pass
+            return result
 
         elif name == "next_track":
             try:
@@ -907,6 +921,28 @@ class ToolsExecutor:
                 return "No homework loop is currently running."
             return stop_loop()
 
+        # ── AR Shape Builder ──────────────────────────────────────────────
+        elif name == "ar_build":
+            try:
+                from tools.ar_builder_tool import apply_operations, get_scene
+            except ImportError as exc:
+                return f"AR builder unavailable: {exc}"
+            ops    = args.get("ops", [])
+            result = apply_operations(ops)
+            scene  = get_scene()
+            if self.broadcast_callback:
+                # Auto-enter AR mode if the LLM calls ar_build() without the user
+                # explicitly saying "build mode" first — canvas wouldn't be visible otherwise.
+                try:
+                    from brain.personality import is_ar_mode, set_ar_mode
+                    if not is_ar_mode():
+                        set_ar_mode(True)
+                        self.broadcast_callback({"type": "ar_mode_enter"})
+                except Exception:
+                    pass
+                self.broadcast_callback({"type": "ar_scene_update", "scene": scene})
+            return result
+
         # ── AR Visual Overlays ─────────────────────────────────────────────
         elif name == "show_overlay":
             data = {
@@ -927,8 +963,7 @@ class ToolsExecutor:
                     f"click any spec on the right panel for details."
                 )
             return (
-                f"Here's your {title}. {count} cards — look at any one and "
-                f"pinch your fingers to select it."
+                f"Here's your {title}. Click any card to hear it."
             )
 
         else:

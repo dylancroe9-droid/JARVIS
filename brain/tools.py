@@ -41,6 +41,8 @@ _CORE_TOOL_NAMES = {
     "create_spreadsheet", "manage_files",
     # Homework auto-answer loop
     "start_homework_loop", "stop_homework_loop",
+    # AR holographic builder
+    "ar_build",
 }
 
 # 8b model (llama-3.1-8b-instant): SMALL tool set to avoid Groq 413 payload-too-large errors.
@@ -744,5 +746,58 @@ TOOL_DEFINITIONS = [
          "type": "object",
          "properties": {},
          "required": []
+     }},
+
+    # ── AR Holographic Shape Builder ──────────────────────────────────────────
+    {"name": "ar_build",
+     "description": (
+         "Build or modify shapes in the holographic AR display. "
+         "Use when the user asks to create, add, move, resize, recolor, or clear shapes. "
+         "Supports: square, circle, triangle, rectangle, hexagon, pentagon, cube, sphere, line. "
+         "Coordinate system: (0,0)=center, negative Y=higher on screen, positive Y=lower. "
+         "'On top of' shape A → set B.y = A.y - A.size/2 - B.size/2 - 10. "
+         "'Twice the size' → size * 2. Always reference existing shape IDs from scene context."
+     ),
+     "input_schema": {
+         "type": "object",
+         "required": ["ops"],
+         "properties": {
+             "ops": {
+                 "type": "array",
+                 "description": "List of operations to apply in order",
+                 "items": {
+                     "type": "object",
+                     "required": ["action"],
+                     "properties": {
+                         "action": {
+                             "type": "string",
+                             "enum": ["add", "modify", "remove", "clear"],
+                             "description": "add=new shape, modify=change existing by id, remove=delete by id, clear=wipe all"
+                         },
+                         "id": {"type": "string", "description": "Shape id for modify/remove"},
+                         "shape": {
+                             "type": "object",
+                             "description": "Shape data (for add or modify)",
+                             "properties": {
+                                 "id":        {"type": "string", "description": "Optional — auto-assigned if omitted on add"},
+                                 "type":      {"type": "string", "enum": ["square","circle","triangle","rectangle","hexagon","pentagon","cube","sphere","line"]},
+                                 "size":      {"type": "number", "description": "Edge/diameter in pixels. Default 100."},
+                                 "width":     {"type": "number", "description": "Width override for rectangles"},
+                                 "height":    {"type": "number", "description": "Height override for rectangles"},
+                                 "x":         {"type": "number", "description": "Horizontal offset from canvas center. Default 0."},
+                                 "y":         {"type": "number", "description": "Vertical offset from canvas center. Negative = up. Default 0."},
+                                 "z":         {"type": "number", "description": "Depth (for future 3D). Default 0."},
+                                 "color":     {"type": "string", "description": "Hex color. Default #00d4ff (cyan)."},
+                                 "rotation":  {"type": "number", "description": "Degrees clockwise. Default 0."},
+                                 "opacity":   {"type": "number", "description": "0–1. Default 1."},
+                                 "thickness": {"type": "number", "description": "Line/border thickness px. Default 2."},
+                                 "label":     {"type": "string", "description": "Optional text label shown below shape."},
+                                 "length":    {"type": "number", "description": "Length for line type."}
+                             }
+                         }
+                     }
+                 }
+             }
+         }
      }},
 ]

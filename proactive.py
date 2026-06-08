@@ -56,8 +56,8 @@ class ProactiveEngine:
     # ── Main loop ──────────────────────────────────────────────────────────────
 
     def _loop(self) -> None:
-        # Let the server fully boot before first check
-        self._stop.wait(45)
+        # Let the server fully boot before first check (5 min wait)
+        self._stop.wait(300)
         while not self._stop.is_set():
             try:
                 self._check_upcoming_meetings()
@@ -201,14 +201,11 @@ class ProactiveEngine:
             )
 
             if approved:
-                result = create_calendar_event(
+                create_calendar_event(
                     title=title,
                     start=when_str if when_str else "today",
                 )
-                broadcast({"type": "proactive", "text": f"✓ Added: {title}"})
-                # Also echo into chat so it feels natural
-                broadcast({"type": "chunk",    "text": result})
-                broadcast({"type": "done",     "full_text": result})
+                broadcast({"type": "proactive", "text": f"✓ Added '{title}' to your calendar."})
             else:
                 broadcast({"type": "proactive", "text": f"Skipped '{title}'."})
 

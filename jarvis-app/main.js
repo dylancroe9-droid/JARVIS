@@ -197,6 +197,51 @@ ipcMain.on('set-display-mode', (_e, mode) => {
       height: h,
     }, true)
     mainWindow.setAlwaysOnTop(false)
+  } else if (mode === 'ar-enter') {
+    // AR split mode — expand to full workArea so canvas has space to the right of the 460px panel
+    const h = Math.min(workArea.height, Math.max(mainWindow.getBounds().height, 860))
+    mainWindow.setBounds({
+      x:      workArea.x,
+      y:      workArea.y,
+      width:  workArea.width,
+      height: h,
+    }, true)
+    mainWindow.setAlwaysOnTop(true, 'floating')
+  } else if (mode === 'ar-exit') {
+    // Restore to work mode after AR
+    mainWindow.setBounds({
+      x:      workArea.x + workArea.width - 478,
+      y:      workArea.y + 20,
+      width:  460,
+      height: 860,
+    }, true)
+    mainWindow.setAlwaysOnTop(true, 'floating')
+  } else if (mode === 'gaming') {
+    // Clear minimum size constraints so the window can shrink below minWidth/minHeight
+    mainWindow.setMinimumSize(0, 0)
+    mainWindow.setResizable(false)
+    mainWindow.setBounds({
+      x:      workArea.x + workArea.width - 360,
+      y:      workArea.y + 14,
+      width:  340,
+      height: 46,
+    }, false)
+    try { mainWindow.setVibrancy(null) } catch (_) {}
+    try { mainWindow.setBackgroundColor('#00000000') } catch (_) {}
+    mainWindow.setAlwaysOnTop(true, 'floating')
+    mainWindow.setOpacity(0.94)
+  } else if (mode === 'gaming-exit') {
+    mainWindow.setResizable(true)
+    mainWindow.setMinimumSize(380, 600)
+    try { mainWindow.setVibrancy('under-window') } catch (_) {}
+    mainWindow.setOpacity(1.0)
+    mainWindow.setBounds({
+      x:      workArea.x + workArea.width - 478,
+      y:      workArea.y + 20,
+      width:  460,
+      height: 860,
+    }, true)
+    mainWindow.setAlwaysOnTop(true, 'floating')
   } else {
     // work mode — restore narrow top-right panel
     mainWindow.setBounds({

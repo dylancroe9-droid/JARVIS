@@ -30,14 +30,17 @@ from rich.console import Console
 
 console = Console()
 
-# Sentence-boundary split — also splits at ' — ' (em-dash) so long JARVIS
-# quips get chopped into shorter synthesis chunks (faster per-chunk TTS).
+# Sentence-boundary split — only hard sentence endings.
+# Em-dashes intentionally NOT split — they create natural in-sentence rhythm
+# and splitting on them produces dozens of tiny chunks with audible gaps.
 _SENTENCE_END = re.compile(
     r'(?<!\bMr)(?<!\bMs)(?<!\bMrs)(?<!\bDr)(?<!\bSt)(?<!\bvs)'
-    r'(?<=[.!?])\s+'    # sentence-ending punctuation
-    r'|'
-    r' — '              # em-dash pause (JARVIS loves these; keep splitting fast)
+    r'(?<=[.!?])\s+'    # sentence-ending punctuation only
 )
+
+# Minimum chunk size before sending to TTS.
+# Short sentences get bundled together to reduce TTS calls → fewer gaps.
+_MIN_CHUNK = 90
 
 _tmpfile_seq = itertools.count()
 
@@ -85,10 +88,12 @@ def _find_say_voice() -> str:
 _eleven_client = _find_eleven_client()
 
 _ELEVEN_VOICE      = os.getenv("ELEVEN_VOICE", "onwK4e9ZLuTAKqWW03F9")
-_ELEVEN_MODEL      = "eleven_turbo_v2_5"
+_ELEVEN_MODEL      = "eleven_turbo_v2_5"   # turbo = fastest model, lowest latency
 _ELEVEN_STABILITY  = 0.45
 _ELEVEN_SIMILARITY = 0.80
-_ELEVEN_STYLE      = 0.35
+_ELEVEN_STYLE      = 0.20                  # lower style = more consistent, less robotic
+_ELEVEN_SAMPLERATE = 16_000                # pcm_16000 — lowest latency format
+_ELEVEN_LATENCY    = 4                     # optimize_streaming_latency 0-4, 4=fastest
 
 _USE_EDGE   = not _eleven_client and _edge_tts_available()
 _EDGE_VOICE = "en-GB-RyanNeural"
@@ -175,16 +180,18 @@ class Speaker:
                 return None
 
             # ── Strip leading silence from the mp3 (edge-tts adds ~100ms dead air) ──
-            # Uses ffmpeg silenceremove filter — drops up to 0.5s of leading silence
-            # that's below -45 dB. Saves into a new tmp file, keeps original as fallback.
+            # Fast fixed-seek: skip the first 85ms with -ss before -i and stream-copy
+            # the rest. This is ~10x faster than the silenceremove adaptive filter
+            # because it doesn't analyse the entire audio — just jumps to a frame boundary.
             if _HAS_FFMPEG:
                 stripped = _mktmp()
                 try:
                     result = subprocess.run(
                         [
                             "ffmpeg", "-y", "-loglevel", "error",
+                            "-ss", "0.085",   # skip first 85ms (leading silence)
                             "-i", path,
-                            "-af", "silenceremove=start_periods=1:start_silence=0.04:start_threshold=-45dB",
+                            "-c", "copy",     # stream copy — no re-encode, near-instant
                             stripped,
                         ],
                         capture_output=True, timeout=5
@@ -310,52 +317,165 @@ class Speaker:
                 return
         self._speak_say(text)
 
-    # ── Streaming (pipelined) ─────────────────────────────────────────────────
+    # ── ElevenLabs PCM streaming ──────────────────────────────────────────────
 
-    def stream_speak(self, text_gen: Generator[str, None, None]) -> str:
+    def _stream_speak_eleven(self, text_gen: Generator[str, None, None]) -> str:
         """
-        Consume text_gen token-by-token. Speak each sentence as it completes.
+        True streaming TTS via ElevenLabs PCM output + sounddevice playback.
 
         Pipeline:
-          Producer  → sentence_q  → Synthesizer (network) → audio_q  → Player
-          (tokens)                   (runs async in bg)              (afplay)
+          Producer  → sentence_q  → Synthesizer (ElevenLabs PCM stream) → pcm_q → Player
+          (tokens)                   starts playing as bytes arrive                (sounddevice)
 
-        Sentence N+1 is being synthesized while sentence N is playing, so the
-        gap between sentences is max(0, synth_time − playback_time) instead of
-        the full synth_time.
-
-        Returns the full text. Stops immediately if stop() is called.
+        Key wins over edge-tts:
+          • pcm_16000 format — raw bytes, no container, no file I/O
+          • optimize_streaming_latency=4 — ElevenLabs prioritises first-byte speed
+          • sounddevice OutputStream — plays chunks as they land, no afplay startup lag
+          • Human voice quality instead of Microsoft TTS
         """
-        self.resume()
+        import numpy as np
+        import sounddevice as _sd
+        from voice.latency import profiler
+        from elevenlabs import VoiceSettings
 
-        sentence_q: queue.Queue = queue.Queue()
-        # maxsize=5: synthesizer stays ≤5 sentences ahead of the player.
-        # Larger buffer means next sentence is almost always ready before current
-        # sentence finishes playing — eliminates the inter-sentence gap.
-        audio_q: queue.Queue = queue.Queue(maxsize=5)
         collected: list[str] = []
+        sentence_q: queue.Queue = queue.Queue()
+        pcm_q: queue.Queue      = queue.Queue(maxsize=4)
 
-        # ── Producer ──────────────────────────────────────────────────────────
+        # ── Producer: tokenise LLM stream → sentence chunks ──────────────────
         def producer() -> None:
-            buf = ""
+            buf = ""; pending = ""
             for chunk in text_gen:
-                if self._stop_flag.is_set():
-                    break
+                if self._stop_flag.is_set(): break
                 buf += chunk
                 collected.append(chunk)
                 while True:
                     m = _SENTENCE_END.search(buf)
-                    if not m:
-                        break
-                    sentence = buf[: m.start() + 1].strip()
+                    if not m: break
+                    sentence = buf[:m.start()+1].strip()
                     buf = buf[m.end():]
-                    if sentence:
-                        sentence_q.put(sentence)
-            if buf.strip() and not self._stop_flag.is_set():
-                sentence_q.put(buf.strip())
-            sentence_q.put(None)  # sentinel
+                    if not sentence: continue
+                    candidate = (pending + " " + sentence).strip() if pending else sentence
+                    if len(candidate) >= _MIN_CHUNK:
+                        sentence_q.put(candidate); pending = ""
+                    else:
+                        pending = candidate
+            tail = (pending + " " + buf).strip() if pending else buf.strip()
+            if tail and not self._stop_flag.is_set():
+                sentence_q.put(tail)
+            sentence_q.put(None)
 
-        # ── Synthesizer ───────────────────────────────────────────────────────
+        # ── Synthesizer: sentence → ElevenLabs PCM bytes ─────────────────────
+        _first_synth = [True]
+
+        def synthesizer() -> None:
+            while True:
+                try:
+                    sentence = sentence_q.get(timeout=0.5)
+                except queue.Empty:
+                    if self._stop_flag.is_set(): pcm_q.put(None); return
+                    continue
+                if sentence is None or self._stop_flag.is_set():
+                    pcm_q.put(None); return
+                if _first_synth[0]:
+                    profiler.mark("tts_first_synth_start")
+                try:
+                    pcm_bytes = b""
+                    for chunk in _eleven_client.text_to_speech.stream(
+                        voice_id   = _ELEVEN_VOICE,
+                        text       = sentence,
+                        model_id   = _ELEVEN_MODEL,
+                        output_format = f"pcm_{_ELEVEN_SAMPLERATE}",
+                        optimize_streaming_latency = _ELEVEN_LATENCY,
+                        voice_settings = VoiceSettings(
+                            stability        = _ELEVEN_STABILITY,
+                            similarity_boost = _ELEVEN_SIMILARITY,
+                            style            = _ELEVEN_STYLE,
+                            use_speaker_boost= True,
+                        ),
+                    ):
+                        if self._stop_flag.is_set(): break
+                        if chunk: pcm_bytes += chunk
+                    if pcm_bytes and not self._stop_flag.is_set():
+                        pcm_q.put(pcm_bytes)
+                except Exception as exc:
+                    console.print(f"[dim]ElevenLabs PCM error: {exc}[/dim]")
+                    pcm_q.put(None); return
+                if _first_synth[0]:
+                    profiler.mark("tts_first_synth_end")
+                    _first_synth[0] = False
+
+        threading.Thread(target=producer,    daemon=True, name="tts-producer").start()
+        threading.Thread(target=synthesizer, daemon=True, name="tts-synth").start()
+
+        # ── Player: PCM bytes → sounddevice output ────────────────────────────
+        _first_play = [True]
+        while True:
+            try:
+                item = pcm_q.get(timeout=0.15)
+            except queue.Empty:
+                if self._stop_flag.is_set(): break
+                continue
+            if item is None or self._stop_flag.is_set(): break
+            if _first_play[0]:
+                profiler.mark("tts_first_play")
+                _first_play[0] = False
+            try:
+                arr = np.frombuffer(item, dtype=np.int16)
+                with self._lock:
+                    if not self._stop_flag.is_set():
+                        _sd.play(arr, samplerate=_ELEVEN_SAMPLERATE, blocking=False)
+                # Poll until done or interrupted
+                import time as _time
+                while _sd.get_stream().active:
+                    if self._stop_flag.is_set():
+                        _sd.stop(); break
+                    _time.sleep(0.015)
+            except Exception as exc:
+                console.print(f"[dim]ElevenLabs playback error: {exc}[/dim]")
+
+        return "".join(collected)
+
+    # ── Streaming (pipelined) — edge-tts / say fallback ───────────────────────
+
+    def stream_speak(self, text_gen: Generator[str, None, None]) -> str:
+        """
+        Route to ElevenLabs PCM streaming if available, else edge-tts sentence pipeline.
+        ElevenLabs path: human voice, PCM streaming, no files, starts playing faster.
+        edge-tts path: free, good quality fallback.
+        """
+        self.resume()
+
+        if _eleven_client:
+            return self._stream_speak_eleven(text_gen)
+
+        # ── edge-tts / say fallback ───────────────────────────────────────────
+        sentence_q: queue.Queue = queue.Queue()
+        audio_q: queue.Queue    = queue.Queue(maxsize=5)
+        collected: list[str]    = []
+
+        def producer() -> None:
+            buf = ""; pending = ""
+            for chunk in text_gen:
+                if self._stop_flag.is_set(): break
+                buf += chunk
+                collected.append(chunk)
+                while True:
+                    m = _SENTENCE_END.search(buf)
+                    if not m: break
+                    sentence = buf[:m.start()+1].strip()
+                    buf = buf[m.end():]
+                    if not sentence: continue
+                    candidate = (pending + " " + sentence).strip() if pending else sentence
+                    if len(candidate) >= _MIN_CHUNK:
+                        sentence_q.put(candidate); pending = ""
+                    else:
+                        pending = candidate
+            tail = (pending + " " + buf).strip() if pending else buf.strip()
+            if tail and not self._stop_flag.is_set():
+                sentence_q.put(tail)
+            sentence_q.put(None)
+
         from voice.latency import profiler
         _first_synth = [True]
 
@@ -364,21 +484,12 @@ class Speaker:
                 try:
                     sentence = sentence_q.get(timeout=0.5)
                 except queue.Empty:
-                    if self._stop_flag.is_set():
-                        audio_q.put(None)
-                        return
+                    if self._stop_flag.is_set(): audio_q.put(None); return
                     continue
-
                 if sentence is None or self._stop_flag.is_set():
-                    audio_q.put(None)
-                    return
-
-                if _first_synth[0]:
-                    profiler.mark("tts_first_synth_start")
-                if _eleven_client:
-                    path = self._synthesize_eleven(sentence)
-                    audio_q.put(("file", path) if path else ("say", sentence))
-                elif _USE_EDGE:
+                    audio_q.put(None); return
+                if _first_synth[0]: profiler.mark("tts_first_synth_start")
+                if _USE_EDGE:
                     path = self._synthesize_edge(sentence)
                     audio_q.put(("file", path) if path else ("say", sentence))
                 else:
@@ -390,29 +501,19 @@ class Speaker:
         threading.Thread(target=producer,    daemon=True, name="tts-producer").start()
         threading.Thread(target=synthesizer, daemon=True, name="tts-synth").start()
 
-        # ── Player ────────────────────────────────────────────────────────────
         _first_play = [True]
         while True:
             try:
                 item = audio_q.get(timeout=0.1)
             except queue.Empty:
-                if self._stop_flag.is_set():
-                    break
+                if self._stop_flag.is_set(): break
                 continue
-
-            if item is None:
-                break
-            if self._stop_flag.is_set():
-                break
-
+            if item is None or self._stop_flag.is_set(): break
             if _first_play[0]:
                 profiler.mark("tts_first_play")
                 _first_play[0] = False
-
             kind, data = item
-            if kind == "file":
-                self._play_file(data)
-            else:
-                self._speak_say(data)
+            if kind == "file": self._play_file(data)
+            else:              self._speak_say(data)
 
         return "".join(collected)
