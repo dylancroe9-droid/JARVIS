@@ -9,7 +9,6 @@ specific areas to focus on.
 from __future__ import annotations
 
 import subprocess
-import time
 import urllib.parse
 from typing import Optional
 

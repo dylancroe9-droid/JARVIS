@@ -14,7 +14,6 @@ from __future__ import annotations
 import base64
 import os
 import time
-from typing import Optional
 
 # Lazy playwright import — not loaded until the first browser call
 _pw_instance = None
@@ -44,16 +43,30 @@ def _get_page():
         )
 
     _pw_instance = sync_playwright().start()
-    _browser_context = _pw_instance.chromium.launch_persistent_context(
-        user_data_dir=PROFILE_DIR,
-        headless=False,
-        viewport={"width": 1280, "height": 900},
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--no-first-run",
-        ],
-        ignore_https_errors=False,
-    )
+    try:
+        _browser_context = _pw_instance.chromium.launch_persistent_context(
+            user_data_dir=PROFILE_DIR,
+            headless=False,
+            viewport={"width": 1280, "height": 900},
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-first-run",
+            ],
+            ignore_https_errors=False,
+        )
+    except Exception:
+        # Launch failed (commonly: the persistent profile is locked by a
+        # lingering Chromium). Stop the driver we just started so we don't
+        # leak a node process every retry, and reset globals so the next
+        # call starts clean.
+        try:
+            _pw_instance.stop()
+        except Exception:
+            pass
+        _pw_instance = None
+        _browser_context = None
+        _page = None
+        raise
 
     if _browser_context.pages:
         _page = _browser_context.pages[0]
@@ -92,9 +105,9 @@ def browser_navigate(url: str, wait_for: str = "networkidle") -> str:
     except Exception as e:
         err = str(e)
         if "net::ERR_NAME_NOT_RESOLVED" in err or "net::ERR_CONNECTION_REFUSED" in err:
-            return f"Couldn't reach that URL — make sure the address is correct and you're online."
+            return "Couldn't reach that URL — make sure the address is correct and you're online."
         if "Timeout" in err or "timeout" in err:
-            return f"Page took too long to load. Try again, or the site may be down."
+            return "Page took too long to load. Try again, or the site may be down."
         return f"Navigation failed: {err}"
 
 
@@ -169,7 +182,7 @@ def browser_click(target: str) -> str:
         locator.click(timeout=8_000)
         time.sleep(0.5)
         return f"Clicked: {target}"
-    except Exception as e:
+    except Exception:
         return f"Couldn't find anything to click for '{target}' — the element may not exist or the page hasn't loaded yet."
 
 
@@ -188,7 +201,7 @@ def browser_type(selector: str, text: str, clear_first: bool = True) -> str:
             locator.type(text, timeout=8_000)
 
         return f"Typed into '{selector}'"
-    except Exception as e:
+    except Exception:
         return f"Couldn't type into '{selector}' — the field may not exist or isn't editable."
 
 
@@ -198,7 +211,7 @@ def browser_select_option(selector: str, value: str) -> str:
     try:
         page.locator(selector).first.select_option(value, timeout=8_000)
         return f"Selected '{value}' in '{selector}'"
-    except Exception as e:
+    except Exception:
         return f"Couldn't select that option — the dropdown may not exist or '{value}' isn't available."
 
 
@@ -236,14 +249,19 @@ def browser_press_key(key: str) -> str:
         page.keyboard.press(key)
         time.sleep(0.2)
         return f"Pressed key: {key}"
-    except Exception as e:
+    except Exception:
         return f"Couldn't press '{key}' — make sure the browser is open and focused."
 
 
 def browser_go_back() -> str:
-    page = _get_page()
-    page.go_back(wait_until="networkidle", timeout=10_000)
-    return f"Navigated back to: {page.url}"
+    # Wrapped like the other browser ops — a go_back timeout (or no history)
+    # raises, and an unguarded raise would propagate out of the tool.
+    try:
+        page = _get_page()
+        page.go_back(wait_until="networkidle", timeout=10_000)
+        return f"Navigated back to: {page.url}"
+    except Exception:
+        return "Couldn't go back — there may be no page to go back to."
 
 
 def browser_get_url() -> str:

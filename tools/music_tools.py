@@ -88,11 +88,19 @@ def _clean_query(query: str) -> str:
     """
     Strip filler words so 'play some house music' → 'house'.
     This makes genre searches (library + iTunes) much more accurate.
+
+    Uses WORD-BOUNDARY matching, not substring replace — otherwise 'some'
+    inside 'awesome' turned 'awesome mix' into 'awe mix', and 'wholesome' into
+    'whole'. Boundaries also let multi-word fillers ('play some') match cleanly.
     """
+    import re
     q = query.lower().strip()
     for word in _STRIP_WORDS:
-        q = q.replace(word, " ")
-    return q.strip()
+        w = word.strip()
+        if not w:
+            continue
+        q = re.sub(r"\b" + re.escape(w) + r"\b", " ", q)
+    return re.sub(r"\s+", " ", q).strip()
 
 
 def _is_genre_query(clean_q: str) -> bool:
@@ -306,11 +314,13 @@ end tell
                 return np if "Now playing:" in np else f"Playing {query} from library."
 
     # ── Strategy 2: iTunes catalog → specific track deep link ────────────────
-    # Do NOT call stop here — stop clears the queue so play resumes nothing.
-    # Let Music stay in whatever state it's in; opening the URL will navigate it.
-
+    # CRITICAL: stop the player BEFORE navigating. Otherwise the previously
+    # paused track resumes when we issue `play` (Dylan reported: asked for
+    # "Wagon Wheel", JARVIS navigated correctly but unpaused the old song).
     catalog_url = _itunes_track_url(clean or query)
     if catalog_url:
+        # Stop current track so the queued/paused item can't resume.
+        _run('tell application "Music" to stop')
         # Use AppleScript open location — more tightly integrated than subprocess open.
         # This tells Music.app directly to handle the URL rather than routing via macOS.
         _run(f'''
@@ -404,6 +414,19 @@ def _play_spotify(query: str = "") -> str:
 
 def pause_music() -> str:
     try:
+        # Pause the app that is ACTUALLY playing, not merely open. Previously
+        # this paused whichever app was running first — so if Spotify was open
+        # (paused) in the background while Apple Music played, it "paused"
+        # Spotify (a no-op) and Music kept going.
+        if _spotify_running() and _is_actually_playing("Spotify"):
+            _run('tell application "Spotify" to pause')
+            return "Paused."
+        if _music_running() and _is_actually_playing("Music"):
+            _run('tell application "Music" to pause')
+            return "Paused."
+        # Nothing is actively playing — but if an app is open and paused,
+        # a redundant pause is harmless; fall back to that so "pause" still
+        # feels responsive rather than saying "nothing is playing".
         if _spotify_running():
             _run('tell application "Spotify" to pause')
             return "Paused."
@@ -415,14 +438,24 @@ def pause_music() -> str:
         return f"Couldn't pause: {exc}"
 
 
+def _is_actually_playing(app: str) -> bool:
+    """
+    True only when the app is RUNNING and PLAYING (not just open & paused).
+    Prevents stray skip/prev calls from unpausing a queued song the user
+    never asked to resume.
+    """
+    out = _run(f'tell application "{app}" to if it is running then return (player state as string)')
+    return out.strip().lower() == "playing"
+
+
 def next_track() -> str:
     try:
-        if _spotify_running():
+        if _spotify_running() and _is_actually_playing("Spotify"):
             result = _run('tell application "Spotify" to next track')
             if result.startswith("__error__"):
                 return f"Spotify didn't respond: {result}"
             return "Skipped."
-        if _music_running():
+        if _music_running() and _is_actually_playing("Music"):
             result = _run('tell application "Music" to next track')
             if result.startswith("__error__"):
                 return f"Apple Music didn't respond: {result}"
@@ -434,12 +467,12 @@ def next_track() -> str:
 
 def previous_track() -> str:
     try:
-        if _spotify_running():
+        if _spotify_running() and _is_actually_playing("Spotify"):
             result = _run('tell application "Spotify" to previous track')
             if result.startswith("__error__"):
                 return f"Spotify didn't respond: {result}"
             return "Back one."
-        if _music_running():
+        if _music_running() and _is_actually_playing("Music"):
             result = _run('tell application "Music" to previous track')
             if result.startswith("__error__"):
                 return f"Apple Music didn't respond: {result}"
@@ -451,7 +484,9 @@ def previous_track() -> str:
 
 def get_now_playing() -> str:
     try:
-        if _spotify_running():
+        # Report the app that is ACTUALLY playing first, so we don't announce
+        # Spotify's paused track while Apple Music is the one making sound.
+        if _spotify_running() and _is_actually_playing("Spotify"):
             result = _run('''
 tell application "Spotify"
     set t to name of current track
@@ -462,20 +497,18 @@ end tell''')
                 return "Spotify is open but couldn't get track info."
             return f"Now playing: {result}" if result else "Spotify is open but nothing is playing."
 
-        if _music_running():
+        if _music_running() and _is_actually_playing("Music"):
             result = _run('''
 tell application "Music"
-    if player state is playing then
-        set t to name of current track
-        set a to artist of current track
-        return t & " — " & a
-    end if
-    return ""
+    set t to name of current track
+    set a to artist of current track
+    return t & " — " & a
 end tell''')
             if result.startswith("__error__"):
                 return "Apple Music is open but couldn't get track info."
             return f"Now playing: {result}" if result else "Apple Music is open but nothing is playing."
 
+        # Neither is actively playing — nothing is making sound.
         return "Nothing is playing."
     except Exception as exc:
         return f"Couldn't get now playing: {exc}"
@@ -483,9 +516,57 @@ end tell''')
 
 # ── Volume ────────────────────────────────────────────────────────────────────
 
+# ── Ducking (lower music so JARVIS can hear the user over it) ─────────────────
+# When music plays through the same speakers as the mic, Whisper transcribes
+# the music instead of the user. Ducking Apple Music's internal volume down
+# while the user is talking to JARVIS (then restoring it) is how Siri/Alexa
+# solve this. We only touch Apple Music's OWN volume slider, not system
+# volume, so the rest of the machine is unaffected.
+_ducked_from: "int | None" = None      # saved pre-duck volume, or None if not ducked
+_DUCK_LEVEL = 22                       # how low to drop music while listening
+
+
+def duck_music(level: int = _DUCK_LEVEL) -> None:
+    """Lower Apple Music's volume so JARVIS can hear over it. Idempotent —
+    remembers the original volume the first time so unduck can restore it."""
+    global _ducked_from
+    try:
+        if not _music_running():
+            return
+        if _ducked_from is None:
+            cur = _run('tell application "Music" to get sound volume')
+            try:
+                _ducked_from = int(float(cur))
+            except (TypeError, ValueError):
+                _ducked_from = 80          # sane default if we can't read it
+        # Only duck if the music is currently louder than the duck level
+        if _ducked_from > level:
+            _run(f'tell application "Music" to set sound volume to {level}')
+    except Exception:
+        pass
+
+
+def unduck_music() -> None:
+    """Restore Apple Music's volume to what it was before ducking."""
+    global _ducked_from
+    try:
+        if _ducked_from is None:
+            return
+        restore = _ducked_from
+        _ducked_from = None
+        if _music_running():
+            _run(f'tell application "Music" to set sound volume to {restore}')
+    except Exception:
+        _ducked_from = None
+
+
 def set_volume(level: int) -> str:
     try:
         level = max(0, min(100, int(level)))
+        # A manual volume change cancels any active duck so we don't later
+        # "restore" over the user's intended level.
+        global _ducked_from
+        _ducked_from = None
         # Set macOS system output volume
         r = subprocess.run(
             ["osascript", "-e", f"set volume output volume {level}"],

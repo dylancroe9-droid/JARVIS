@@ -82,23 +82,32 @@ def type_text(text: str) -> str:
         import pyautogui as pg
         pg.FAILSAFE = False
 
-        # Save current clipboard
-        old = subprocess.check_output(["pbpaste"]).decode("utf-8", errors="replace")
+        # Save current clipboard so we can restore it after the paste
+        try:
+            old = subprocess.check_output(["pbpaste"]).decode("utf-8", errors="replace")
+        except Exception:
+            old = ""
 
-        # Load new text into clipboard
-        p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-        p.communicate(text.encode("utf-8"))
-        time.sleep(0.05)
+        # try/finally guarantees the clipboard restore runs even if pyautogui
+        # raises (previous code lost the user's clipboard data on any hotkey
+        # failure between the load and the restore).
+        try:
+            # Load new text into clipboard
+            p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+            p.communicate(text.encode("utf-8"))
+            time.sleep(0.05)
 
-        # Paste
-        pg.hotkey("command", "v")
-        time.sleep(0.15)
-
-        # Restore old clipboard
-        p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-        p.communicate(old.encode("utf-8"))
-
-        return "Typed text."
+            # Paste
+            pg.hotkey("command", "v")
+            time.sleep(0.15)
+            return "Typed text."
+        finally:
+            # Restore old clipboard — best effort, never raises out of finally
+            try:
+                p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+                p.communicate(old.encode("utf-8"))
+            except Exception:
+                pass
     except ImportError:
         # Fallback: AppleScript (ASCII only)
         escaped = text.replace("\\", "\\\\").replace('"', '\\"')

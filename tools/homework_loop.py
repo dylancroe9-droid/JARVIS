@@ -28,6 +28,12 @@ _loop_thread:    Optional[threading.Thread] = None
 _loop_active:    bool = False
 _loop_lock:      threading.Lock = threading.Lock()
 _broadcast_fn:   Optional[Callable] = None   # set by server.py
+# Generation token: bumped on every start AND stop. Each _run_loop captures
+# the generation it was born into and exits the moment the global generation
+# moves past it. This prevents two failure modes on a quick stop→start:
+#   (a) an old, slow loop iteration re-running after a restart (double-clicks)
+#   (b) an exiting old loop clearing the flag a newer loop just set
+_loop_generation: int = 0
 
 
 SCREENSHOT_PATH = "/tmp/jarvis_hw_loop.jpg"
@@ -61,14 +67,16 @@ If the screen doesn't show a quiz or homework form at all:
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def start_loop(broadcast_fn: Callable) -> str:
-    global _loop_active, _loop_thread, _broadcast_fn
+    global _loop_active, _loop_thread, _broadcast_fn, _loop_generation
     with _loop_lock:
         if _loop_active:
             return "Auto-answer loop is already running. Say 'stop' to end it."
+        _loop_generation += 1
+        my_gen = _loop_generation
         _loop_active = True
         _broadcast_fn = broadcast_fn
         _loop_thread = threading.Thread(
-            target=_run_loop,
+            target=_run_loop, args=(my_gen,),
             daemon=True,
             name="hw-auto-answer",
         )
@@ -77,25 +85,32 @@ def start_loop(broadcast_fn: Callable) -> str:
 
 
 def stop_loop() -> str:
-    global _loop_active
-    _loop_active = False
+    global _loop_active, _loop_generation
+    with _loop_lock:
+        # Bump the generation so any running loop sees it's been superseded
+        # and exits on its next check — even if it's mid-iteration right now.
+        _loop_generation += 1
+        _loop_active = False
     return "Auto-answer stopped."
 
 
 def is_running() -> bool:
-    return _loop_active
+    with _loop_lock:
+        return _loop_active
 
 
 # ── Core loop ─────────────────────────────────────────────────────────────────
 
-def _run_loop() -> None:
+def _run_loop(my_gen: int) -> None:
     global _loop_active
     q_num = 0
     consecutive_failures = 0
 
     _send_status("running", question=0, text="Starting — scanning screen…")
 
-    while _loop_active:
+    # Exit as soon as EITHER the active flag drops OR a newer run/stop has
+    # bumped the generation past ours (this run has been superseded).
+    while _loop_active and my_gen == _loop_generation:
         try:
             # ── 1. Screenshot ────────────────────────────────────────────────
             b64 = _capture_screen()
@@ -118,6 +133,14 @@ def _run_loop() -> None:
                 continue
 
             consecutive_failures = 0
+
+            # A "stop" (or a newer run) may have arrived during the ~5-25s
+            # capture+vision window above. Re-check BEFORE acting so we never
+            # fire one more click after the user said stop — or click a stale
+            # run's coordinates into a freshly-started run's session. The top-of-
+            # loop check alone can't catch a stop that lands mid-iteration.
+            if not _loop_active or my_gen != _loop_generation:
+                break
 
             # ── 3. Act on the instruction ────────────────────────────────────
             action = instruction.get("action")
@@ -169,7 +192,12 @@ def _run_loop() -> None:
             _send_status("error", text=f"Loop error: {exc}")
             time.sleep(2)
 
-    _loop_active = False
+    # Only clear the shared flag if THIS run is still the current generation.
+    # If a newer run has started (generation moved on), we must NOT touch
+    # _loop_active — that belongs to the new run now.
+    with _loop_lock:
+        if my_gen == _loop_generation:
+            _loop_active = False
     _send_status("stopped", text="Auto-answer loop ended.")
 
 
@@ -205,7 +233,9 @@ def _ask_vision(b64: str) -> Optional[dict]:
         if ANTHROPIC_API_KEY.startswith("sk-ant-"):
             try:
                 import anthropic
-                client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+                # timeout so a stalled vision call can't block the daemon
+                # thread (and delay a 'stop') for the ~600s SDK default.
+                client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=25)
                 resp = client.messages.create(
                     model="claude-opus-4-5",
                     max_tokens=300,
@@ -232,7 +262,8 @@ def _ask_vision(b64: str) -> Optional[dict]:
         if raw is None and GROQ_API_KEY:
             try:
                 from openai import OpenAI
-                client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
+                client = OpenAI(api_key=GROQ_API_KEY,
+                                base_url="https://api.groq.com/openai/v1", timeout=25)
                 resp = client.chat.completions.create(
                     model="meta-llama/llama-4-scout-17b-16e-instruct",
                     max_tokens=300,
@@ -254,11 +285,18 @@ def _ask_vision(b64: str) -> Optional[dict]:
         if not raw:
             return None
 
-        # Extract JSON from response (model sometimes wraps it in markdown)
-        m = re.search(r'\{.*?\}', raw, re.DOTALL)
+        # Extract JSON from response (model sometimes wraps it in markdown).
+        # Use a GREEDY match from the first { to the last } — the non-greedy
+        # version stopped at the first } and truncated any answer/question
+        # text that itself contained a brace, breaking json.loads and dropping
+        # the instruction.
+        m = re.search(r'\{.*\}', raw, re.DOTALL)
         if not m:
             return None
-        return json.loads(m.group())
+        try:
+            return json.loads(m.group())
+        except json.JSONDecodeError:
+            return None
 
     except Exception as exc:
         print(f"[hw-loop] _ask_vision error: {exc}")

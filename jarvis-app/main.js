@@ -155,10 +155,25 @@ ipcMain.on('open-external', (_e, url) => {
 })
 ipcMain.on('app-relaunch', () => {
   // Kill the Python server before relaunch so the new process can bind 8765.
-  if (pyProcess) { try { pyProcess.kill('SIGTERM') } catch (_) {} }
-  app.relaunch()
-  app.exit(0)
+  // Previous code only sent SIGTERM and immediately called app.exit, which
+  // left a zombie Python process if SIGTERM hung (Whisper warm-up, mic
+  // closing, etc.). Try SIGTERM first, escalate to SIGKILL after 1.5s.
+  killPythonServerForcefully(() => { app.relaunch(); app.exit(0) })
 })
+
+function killPythonServerForcefully (done) {
+  if (!pyProcess) { done(); return }
+  let killed = false
+  try { pyProcess.kill('SIGTERM') } catch (_) {}
+  const onExit = () => { killed = true; done() }
+  pyProcess.once('exit', onExit)
+  setTimeout(() => {
+    if (killed) return
+    try { pyProcess.kill('SIGKILL') } catch (_) {}
+    // Give SIGKILL a tick to actually terminate, then proceed regardless
+    setTimeout(() => { if (!killed) done() }, 200)
+  }, 1500)
+}
 
 // ── Camera mode — resize window to fill screen / restore ──────────────────────
 let _normalBounds = null
@@ -327,7 +342,19 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
 })
 
-app.on('before-quit', () => {
+app.on('before-quit', (e) => {
   globalShortcut.unregisterAll()
-  if (pyProcess) pyProcess.kill('SIGTERM')
+  if (pyProcess) {
+    // Same SIGTERM → SIGKILL escalation as app-relaunch — but for the
+    // normal quit path we just send SIGTERM and trust the OS to reap
+    // (SIGKILL would interrupt the quit handler).
+    try { pyProcess.kill('SIGTERM') } catch (_) {}
+    setTimeout(() => {
+      try {
+        if (pyProcess && pyProcess.exitCode === null) {
+          pyProcess.kill('SIGKILL')
+        }
+      } catch (_) {}
+    }, 1500)
+  }
 })

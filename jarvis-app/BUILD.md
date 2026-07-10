@@ -48,8 +48,8 @@ You need an active **Apple Developer Program** membership ($99/yr) and a
 ## What the build contains
 
 - The Electron app (renderer, preload, main.js)
-- Python source from the repo: `brain/`, `voice/`, `tools/`, `ui/`,
-  `server.py`, `app.py`, `chat.py`, `config.py`, `requirements.txt`,
+- Python source from the repo: `brain/`, `voice/`, `tools/`,
+  `server.py`, `chat.py`, `config.py`, `requirements.txt`,
   `setup.sh`, `.env.example`
 - **Not bundled**: `.venv/` (user installs at first launch via setup.sh),
   `.env`, `memory.txt`, `.setup_done`, `node_modules/`, the previous `dist/`,

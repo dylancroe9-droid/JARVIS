@@ -43,6 +43,10 @@ _CORE_TOOL_NAMES = {
     "start_homework_loop", "stop_homework_loop",
     # AR holographic builder
     "ar_build",
+    # Self-inspection — read own code, logs, history
+    "read_my_code", "search_my_code", "list_my_files",
+    "read_my_logs", "read_my_history",
+    "get_last_diagnostic_findings",
 }
 
 # 8b model (llama-3.1-8b-instant): SMALL tool set to avoid Groq 413 payload-too-large errors.
@@ -63,12 +67,19 @@ _8B_TOOL_NAMES = {
 # Minimal tools for the last-ditch retry when 8b tool JSON fails.
 # Fewer tools = simpler JSON = higher success rate.
 # Covers the most common voice commands that must NEVER fall through.
+# NOTE: show_overlay is DELIBERATELY excluded — its schema is ~1,450 tokens
+# (half the whole minimal payload) and, combined with the system prompt, it
+# pushed the 8b request over Groq's 6,000 TPM limit (the 413 errors). The
+# emergency path is for basic commands; overlays are handled by the bigger
+# models. read_camera is likewise dropped to keep the payload lean.
 _MINIMAL_TOOL_NAMES = {
     "play_music", "open_application", "web_search", "youtube_search",
     "take_screenshot", "remember_fact", "get_weather", "get_forecast",
-    "show_overlay", "read_camera",
     # Task management — must be in minimal set or "remind me" falls through to quick_note
     "quick_note", "add_reminder", "get_reminders", "set_timer",
+    # Music controls — required because tool_choice can force these by name.
+    # Missing them caused Groq 400 errors that triggered runaway TTS fallback.
+    "pause_music", "next_track", "previous_track",
 }
 
 
@@ -89,8 +100,20 @@ def get_minimal_tools() -> list:
 
 TOOL_DEFINITIONS = [
     # ── Calendar ────────────────────────────────────────────────────────
-    {"name": "get_calendar_events", "description": "Get upcoming calendar events.",
+    {"name": "get_calendar_events", "description": "Get upcoming calendar events from Apple Calendar via EventKit. Only sees calendars Dylan has synced to Apple Calendar.app. If he uses Google Calendar or Outlook without syncing, this returns 'nothing scheduled' even when events exist — in that case call read_calendar_visually instead.",
      "input_schema": {"type": "object", "properties": {"days": {"type": "integer", "default": 7}}, "required": []}},
+
+    {"name": "read_calendar_visually",
+     "description": (
+         "Open Apple Calendar.app, take a screenshot, and use vision to read whatever events "
+         "are actually displayed. Use this when get_calendar_events returns nothing but Dylan "
+         "insists he has events, OR for any 'what's coming up / what's my next event' question. "
+         "Sees all calendars displayed (Google, Outlook, iCloud, school portals) — anything "
+         "the user can see in Calendar.app, JARVIS can read."
+     ),
+     "input_schema": {"type": "object", "properties": {
+         "question": {"type": "string", "description": "Optional specific question about the calendar — defaults to 'list every event you can see this week'."}
+     }, "required": []}},
 
     {"name": "create_calendar_event",
      "description": (
@@ -800,4 +823,76 @@ TOOL_DEFINITIONS = [
              }
          }
      }},
+
+    # ── Self-inspection ───────────────────────────────────────────────────
+    # These tools let JARVIS investigate his OWN code, logs, and state when
+    # something isn't working. Use them when Dylan asks "why did you do X",
+    # "what does your Y look like", "look at your own code", or when you
+    # need to explain a failure honestly instead of guessing. NOT for
+    # generic file ops on Dylan's machine — use read_file / grep_code for
+    # files outside the JARVIS project directory.
+
+    {"name": "read_my_code",
+     "description": (
+         "Read a JARVIS source file by its path relative to the JARVIS project root "
+         "(e.g. 'server.py', 'tools/diagnostics.py', 'brain/jarvis.py'). "
+         "Use this when investigating your OWN behavior. "
+         "Secrets (.env), binaries, and __pycache__ are blocked."
+     ),
+     "input_schema": {"type": "object", "properties": {
+         "path": {"type": "string", "description": "Path relative to JARVIS root, e.g. 'brain/jarvis.py'"},
+     }, "required": ["path"]}},
+
+    {"name": "search_my_code",
+     "description": (
+         "Regex search across JARVIS's own source. Use to find where a function is "
+         "defined, where a phrase is matched, or where a config lives. Returns "
+         "matching lines in 'path:line: snippet' format."
+     ),
+     "input_schema": {"type": "object", "properties": {
+         "pattern":     {"type": "string", "description": "Regex pattern, e.g. '_MUSIC_SKIP_WORDS'"},
+         "file_glob":   {"type": "string", "default": "**/*.py", "description": "Glob to limit files, e.g. 'brain/*.py' or '**/*.js'"},
+         "max_results": {"type": "integer", "default": 30},
+     }, "required": ["pattern"]}},
+
+    {"name": "list_my_files",
+     "description": (
+         "List files in a JARVIS directory (e.g. '.', 'tools', 'brain', "
+         "'jarvis-app/renderer'). Use to navigate your own codebase."
+     ),
+     "input_schema": {"type": "object", "properties": {
+         "path": {"type": "string", "default": ".", "description": "Directory relative to JARVIS root"},
+     }, "required": []}},
+
+    {"name": "read_my_logs",
+     "description": (
+         "Tail your own captured server log to see what actually happened recently "
+         "— music gates, brain calls, errors, broadcasts. Use this when Dylan asks "
+         "'why did you do X just now' so you answer from real evidence, not guesses."
+     ),
+     "input_schema": {"type": "object", "properties": {
+         "lines": {"type": "integer", "default": 100, "description": "How many trailing lines to return (max 500)"},
+     }, "required": []}},
+
+    {"name": "read_my_history",
+     "description": (
+         "Read your own recent conversation history with Dylan. Use this when "
+         "answering 'why did you say X' or 'what did we just talk about' so you "
+         "ground the answer in what actually happened."
+     ),
+     "input_schema": {"type": "object", "properties": {
+         "max_turns": {"type": "integer", "default": 20, "description": "How many recent turns to read (default 20)"},
+     }, "required": []}},
+
+    {"name": "get_last_diagnostic_findings",
+     "description": (
+         "Get the auto-investigation results from the most recent diagnostic. "
+         "When the diagnostic detected failures, this returns the related log "
+         "lines and source-file pointers that were captured automatically. "
+         "Use when Dylan asks 'why did X fail', 'what's wrong with X', or "
+         "'explain that failure' after he just ran a system check."
+     ),
+     "input_schema": {"type": "object", "properties": {
+         "check_name": {"type": "string", "description": "Optional — specific check (e.g. 'cloud_brain', 'screen_watcher'). Omit to get all findings."},
+     }, "required": []}},
 ]

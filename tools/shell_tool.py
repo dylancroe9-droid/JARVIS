@@ -4,7 +4,6 @@ Shell command execution with output capture and safety guardrails.
 
 import os
 import subprocess
-import shlex
 from pathlib import Path
 from typing import Optional
 

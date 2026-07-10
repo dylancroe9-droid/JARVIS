@@ -6,6 +6,7 @@
   <title>JARVIS</title>
   <!-- MediaPipe — local installs, no CDN dependency -->
   <script src="../node_modules/@mediapipe/hands/hands.js"></script>
+  <script src="../node_modules/@mediapipe/face_mesh/face_mesh.js"></script>
   <link rel="stylesheet" href="setup-wizard.css" />
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -1309,21 +1310,47 @@
       flex-shrink: 0;
     }
 
+    /* Active-mode badge (WATCH / GAMING / WORK) in the corner strip */
+    #gm-mode {
+      font-size: 8px;
+      font-weight: 800;
+      letter-spacing: 0.16em;
+      padding: 1px 5px;
+      border-radius: 3px;
+      flex-shrink: 0;
+      color: rgba(3, 20, 30, 0.95);
+      background: rgba(0, 185, 225, 0.75);
+      text-transform: uppercase;
+    }
+    #gm-mode[hidden] { display: none; }
+    #gm-mode.mode-watch  { background: rgba(140, 120, 255, 0.85); }
+    #gm-mode.mode-gaming { background: rgba(120, 235, 150, 0.85); }
+    #gm-mode.mode-work   { background: rgba(0, 185, 225, 0.80); }
+
     #gm-input {
       flex: 1;
       min-width: 0;
-      background: transparent;
-      border: none;
-      border-left: 1px solid rgba(0, 175, 220, 0.18);
-      padding: 0 0 0 10px;
-      color: rgba(160, 220, 245, 0.80);
+      background: rgba(0, 25, 40, 0.5);
+      border: 1px solid rgba(0, 175, 220, 0.45);
+      border-radius: 4px;
+      padding: 6px 10px;
+      margin: 0 4px;
+      color: rgba(220, 240, 255, 0.95);
       font-family: inherit;
-      font-size: 9px;
+      font-size: 12px;
       outline: none;
-      caret-color: rgba(0, 195, 235, 0.9);
+      caret-color: rgba(0, 195, 235, 1);
+      cursor: text;
     }
-    #gm-input::placeholder { color: rgba(0, 160, 200, 0.28); }
-    #gm-input:focus { color: rgba(190, 235, 255, 0.95); }
+    #gm-input::placeholder { color: rgba(120, 200, 230, 0.55); }
+    #gm-input:focus {
+      color: #fff;
+      background: rgba(0, 35, 55, 0.7);
+      border-color: rgba(0, 212, 255, 0.85);
+      box-shadow: 0 0 10px rgba(0, 212, 255, 0.25);
+    }
+    /* Whole gaming HUD reads as clickable so users hit the input area easily */
+    body.gaming-mode #gaming-hud { cursor: text; }
 
     /* ─── Permission overlay ────────────────────────────────────────────────── */
     #confirm-overlay {
@@ -2482,6 +2509,656 @@
     #app.desktop-mode .sl-stat-val  { font-size: 8px; }
     #app.desktop-mode #sl-focus-toggle { display: none; }
 
+    /* ─── HUB v2 — sphere-centric look ─────────────────────────────────── */
+    /* Hidden by default. Activated by adding `hub-v2` to <body>. */
+    #hub-v2-layer {
+      position: fixed; inset: 0;
+      pointer-events: none;
+      opacity: 0; visibility: hidden;
+      transition: opacity 0.6s ease, visibility 0s linear 0.6s;
+      z-index: 9000;
+    }
+    body.hub-v2 #hub-v2-layer {
+      opacity: 1; visibility: visible;
+      transition: opacity 0.6s ease, visibility 0s linear;
+    }
+    /* Dim the v1 chrome aggressively so the v2 sphere dominates. */
+    body.hub-v2 #app > #sidebar-left,
+    body.hub-v2 #app > #sidebar-right,
+    body.hub-v2 #app #header,
+    body.hub-v2 #app #status-strip,
+    body.hub-v2 #app #waveform-bar,
+    body.hub-v2 #app #cam-section,
+    body.hub-v2 #app #focus-mode-banner {
+      display: none !important;
+    }
+    /* The legacy slim now-playing in v1 stays as-is. The rich draggable
+       player below (#music-player) is what shows in v2. */
+    body.hub-v2 #app #now-playing { display: none !important; }
+
+    /* ─── Rich draggable music player (v2 only) ──────────────────────── */
+    #music-player {
+      position: fixed;
+      top: 100px;
+      left: 36px;
+      width: 320px;
+      background: rgba(0, 0, 0, 0.88);
+      border: 1px solid rgba(0, 212, 255, 0.45);
+      border-radius: 10px;
+      backdrop-filter: blur(10px);
+      box-shadow: 0 6px 30px rgba(0, 0, 0, 0.6), 0 0 30px rgba(0, 212, 255, 0.12);
+      z-index: 9200;
+      display: none;
+      color: #fff;
+      font-family: -apple-system, "SF Pro Display", sans-serif;
+      user-select: none;
+      overflow: hidden;
+    }
+    body.hub-v2 #music-player.visible { display: block; }
+    #mp-drag {
+      height: 18px;
+      cursor: grab;
+      background: linear-gradient(180deg, rgba(0,212,255,0.08), transparent);
+      border-bottom: 1px solid rgba(0, 212, 255, 0.15);
+    }
+    #mp-drag:active { cursor: grabbing; }
+    #mp-body { padding: 14px; }
+    #mp-art {
+      width: 100%; aspect-ratio: 1 / 1;
+      background: #111;
+      border-radius: 6px;
+      object-fit: cover;
+      display: block;
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
+    }
+    #mp-title {
+      margin-top: 12px;
+      font-size: 14px;
+      font-weight: 600;
+      line-height: 1.3;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #mp-artist {
+      margin-top: 2px;
+      font-size: 12px;
+      color: rgba(255, 255, 255, 0.65);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    /* Scrubber */
+    #mp-scrub {
+      margin-top: 12px;
+      height: 4px;
+      background: rgba(255, 255, 255, 0.18);
+      border-radius: 2px;
+      cursor: pointer;
+      position: relative;
+    }
+    #mp-scrub-fill {
+      position: absolute; inset: 0 auto 0 0;
+      width: 0%; background: var(--cyan);
+      border-radius: 2px;
+      box-shadow: 0 0 6px var(--cyan);
+    }
+    #mp-times {
+      display: flex; justify-content: space-between;
+      margin-top: 5px;
+      font-size: 10px; color: rgba(255, 255, 255, 0.55);
+      font-variant-numeric: tabular-nums;
+    }
+    /* Controls */
+    #mp-controls {
+      display: flex; justify-content: center; align-items: center;
+      gap: 18px; margin-top: 14px;
+    }
+    .mp-btn {
+      width: 36px; height: 36px;
+      border: none; background: transparent;
+      color: #fff; cursor: pointer;
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      transition: background 0.15s ease, transform 0.1s ease;
+    }
+    .mp-btn:hover  { background: rgba(255, 255, 255, 0.08); }
+    .mp-btn:active { transform: scale(0.92); }
+    .mp-btn.play {
+      width: 44px; height: 44px;
+      background: var(--cyan);
+      color: #000;
+      box-shadow: 0 0 14px rgba(0, 212, 255, 0.35);
+    }
+    .mp-btn.play:hover { background: #5ee2ff; }
+    .mp-btn svg { width: 16px; height: 16px; fill: currentColor; }
+    .mp-btn.play svg { width: 18px; height: 18px; }
+    /* v2 background: opaque pure black so the desktop doesn't bleed through */
+    body.hub-v2 {
+      background: #000 !important;
+    }
+    body.hub-v2 #app {
+      background: #000 !important;
+      display: block !important;
+      grid-template-columns: none !important;
+    }
+    /* Chat panel: pin to bottom, full width, slim. Input below it. */
+    body.hub-v2 #app #chat {
+      position: fixed;
+      left: 24px;
+      right: 24px;
+      bottom: 88px;
+      max-height: 18vh;
+      background: rgba(0, 0, 0, 0.85);
+      border: 1px solid rgba(0, 212, 255, 0.35);
+      border-radius: 6px;
+      padding: 10px 14px;
+      backdrop-filter: blur(6px);
+      z-index: 9100;
+    }
+    body.hub-v2 #app #input-bar {
+      position: fixed;
+      left: 24px;
+      right: 24px;
+      bottom: 24px;
+      background: rgba(0, 0, 0, 0.9);
+      border: 1px solid rgba(0, 212, 255, 0.5);
+      border-radius: 6px;
+      z-index: 9100;
+    }
+    /* Status line sits above the chat so they don't overlap. */
+    body.hub-v2 #hv2-status {
+      transform: translate(-50%, 200px);
+    }
+
+    #hub-v2-sphere {
+      position: absolute; inset: 0; width: 100%; height: 100%;
+      pointer-events: none;
+    }
+
+    /* Corner brackets */
+    .hv2-frame {
+      position: absolute; pointer-events: none; width: 60px; height: 60px;
+      border: 1px solid rgba(0, 212, 255, 0.55);
+    }
+    .hv2-frame.tl { top: 24px; left: 24px; border-right: 0; border-bottom: 0; }
+    .hv2-frame.tr { top: 24px; right: 24px; border-left: 0; border-bottom: 0; }
+    .hv2-frame.bl { bottom: 24px; left: 24px; border-right: 0; border-top: 0; }
+    .hv2-frame.br { bottom: 24px; right: 24px; border-left: 0; border-top: 0; }
+
+    /* Decorative rings */
+    .hv2-ring {
+      position: absolute; top: 50%; left: 50%;
+      border: 1px solid rgba(0, 212, 255, 0.18); border-radius: 50%;
+      pointer-events: none;
+    }
+    .hv2-ring.r1 { width: 640px; height: 640px; transform: translate(-50%, -50%); }
+    .hv2-ring.r2 { width: 760px; height: 760px; transform: translate(-50%, -50%); border-style: dashed; }
+
+    /* Top header */
+    #hv2-header {
+      position: absolute; top: 36px; left: 50%; transform: translateX(-50%);
+      text-align: center; letter-spacing: 8px; font-size: 13px;
+      color: var(--cyan); text-shadow: 0 0 10px var(--cyan);
+      pointer-events: none;
+    }
+    #hv2-header .hv2-sub {
+      margin-top: 6px; letter-spacing: 4px; font-size: 10px; opacity: 0.7;
+    }
+    .hv2-pill {
+      display: inline-block; padding: 1px 8px; margin: 0 4px;
+      border: 1px solid rgba(0, 212, 255, 0.55); border-radius: 999px; opacity: 0.85;
+    }
+    .hv2-pill.hv2-online { color: #2effb6; border-color: rgba(46,255,182,0.6); }
+
+    /* Status line */
+    #hv2-status {
+      position: absolute; top: 50%; left: 50%;
+      transform: translate(-50%, 240px);
+      letter-spacing: 6px; font-size: 11px; opacity: 0.55;
+      color: var(--cyan); pointer-events: none;
+    }
+
+    /* ── Diagnostic overlay ───────────────────────────────────────────── */
+    #diag-overlay {
+      position: absolute; inset: 0;
+      pointer-events: none;
+      transition: opacity 0.35s ease;
+      font-family: 'Rajdhani', 'JetBrains Mono', monospace;
+      color: var(--cyan);
+      z-index: 50;
+    }
+    #diag-overlay.diag-hidden { opacity: 0; pointer-events: none; }
+    #diag-overlay.diag-visible { opacity: 1; }
+
+    #diag-title {
+      position: absolute; top: 18%; left: 50%;
+      transform: translateX(-50%);
+      letter-spacing: 10px; font-size: 14px;
+      color: var(--cyan);
+      text-shadow: 0 0 12px rgba(0, 220, 255, 0.5);
+    }
+    #diag-close {
+      position: absolute; top: 16%; right: 4%;
+      width: 32px; height: 32px;
+      display: none;
+      background: rgba(0, 30, 50, 0.6);
+      color: var(--cyan); border: 1px solid rgba(0, 220, 255, 0.35);
+      border-radius: 50%;
+      font-size: 14px; font-family: inherit;
+      cursor: pointer; pointer-events: auto;
+      transition: all 0.2s ease;
+    }
+    #diag-close:hover {
+      background: rgba(0, 60, 90, 0.85);
+      box-shadow: 0 0 12px rgba(0, 220, 255, 0.5);
+    }
+    #diag-dismiss-hint {
+      margin-top: 8px;
+      font-size: 9px; letter-spacing: 2px;
+      opacity: 0.5; color: var(--cyan);
+      text-transform: uppercase;
+    }
+    #diag-ring {
+      position: absolute; top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      width: 460px; height: 460px;
+      pointer-events: none;
+    }
+    #diag-percent {
+      position: absolute; top: 50%; left: 50%;
+      transform: translate(-50%, 240px);
+      font-size: 36px; font-weight: 600;
+      letter-spacing: 4px;
+      color: var(--cyan);
+      text-shadow: 0 0 18px rgba(0, 220, 255, 0.65);
+    }
+    #diag-progress-label {
+      position: absolute; top: 50%; left: 50%;
+      transform: translate(-50%, 290px);
+      font-size: 11px; letter-spacing: 3px;
+      opacity: 0.7; color: var(--cyan);
+      text-transform: uppercase;
+    }
+
+    /* Right-side scrolling check list — wide enough to read impact text without wrapping */
+    #diag-checks-wrap {
+      position: absolute; top: 22%; right: 3%;
+      width: 380px; max-height: 64vh;
+      overflow-y: auto;
+      mask-image: linear-gradient(to bottom, transparent 0%, black 4%, black 96%, transparent 100%);
+      scrollbar-width: thin;
+      scrollbar-color: rgba(0, 220, 255, 0.4) transparent;
+      pointer-events: auto;     /* allow user to scroll the list */
+    }
+    #diag-checks-wrap::-webkit-scrollbar { width: 6px; }
+    #diag-checks-wrap::-webkit-scrollbar-thumb {
+      background: rgba(0, 220, 255, 0.4); border-radius: 3px;
+    }
+    #diag-checks-wrap::-webkit-scrollbar-track { background: transparent; }
+    #diag-checks { display: flex; flex-direction: column; gap: 6px; }
+    .diag-row {
+      display: flex; align-items: flex-start;
+      gap: 10px;
+      padding: 6px 10px;
+      border: 1px solid rgba(0, 220, 255, 0.15);
+      border-radius: 3px;
+      background: rgba(0, 30, 50, 0.35);
+      font-size: 11px;
+      letter-spacing: 1px;
+      opacity: 0;
+      animation: diag-fade-in 0.25s ease forwards;
+    }
+    @keyframes diag-fade-in {
+      from { opacity: 0; transform: translateX(8px); }
+      to   { opacity: 1; transform: translateX(0); }
+    }
+    .diag-mark {
+      flex: 0 0 14px; font-weight: 700; text-align: center;
+      line-height: 14px;
+    }
+    .diag-row.status-running .diag-mark {
+      color: var(--cyan);
+      animation: diag-spin 1s linear infinite;
+    }
+    @keyframes diag-spin {
+      from { transform: rotate(0deg); }
+      to   { transform: rotate(360deg); }
+    }
+    .diag-row.status-pass  { border-color: rgba(0, 255, 140, 0.25); }
+    .diag-row.status-pass  .diag-mark { color: #00ff8c; }
+    .diag-row.status-fixed { border-color: rgba(255, 200, 0, 0.30); }
+    .diag-row.status-fixed .diag-mark { color: #ffc800; }
+    .diag-row.status-fail  { border-color: rgba(255, 80, 80, 0.40); background: rgba(60, 0, 0, 0.35); }
+    .diag-row.status-fail  .diag-mark { color: #ff5050; }
+    .diag-row.status-fixing {
+      border-color: rgba(255, 200, 0, 0.55);
+      background: rgba(60, 40, 0, 0.45);
+      animation: diag-pulse 1.1s ease-in-out infinite;
+    }
+    .diag-row.status-fixing .diag-mark { color: #ffc800; }
+    @keyframes diag-pulse {
+      0%, 100% { box-shadow: 0 0 0 rgba(255, 200, 0, 0); }
+      50%      { box-shadow: 0 0 14px rgba(255, 200, 0, 0.4); }
+    }
+
+    .diag-text { flex: 1; min-width: 0; }
+    .diag-label { color: rgba(255, 255, 255, 0.85); }
+    .diag-impact {
+      margin-top: 3px; font-size: 10px;
+      color: rgba(255, 180, 180, 0.85);
+      line-height: 1.35; letter-spacing: 0.5px;
+    }
+    .diag-fix {
+      margin-top: 2px; font-size: 10px;
+      color: rgba(255, 200, 0, 0.85);
+      letter-spacing: 0.5px;
+    }
+
+    /* Investigation panel — appears under failed rows */
+    .diag-investigation {
+      margin-top: 6px; padding: 8px 10px;
+      border-top: 1px dashed rgba(0, 220, 255, 0.20);
+      font-size: 10px; letter-spacing: 0.5px;
+      color: rgba(220, 240, 255, 0.85);
+    }
+    .diag-investigate-head {
+      display: flex; align-items: center; gap: 8px;
+      font-weight: 600; color: var(--cyan);
+      letter-spacing: 2px; font-size: 10px;
+    }
+    .diag-investigate-head.done { color: #ffc800; }
+    .diag-investigate-spinner {
+      animation: diag-spin 1.1s linear infinite;
+      display: inline-block;
+    }
+    .diag-investigate-summary {
+      margin-top: 4px; opacity: 0.85;
+    }
+    .diag-investigate-section { margin-top: 6px; }
+    .diag-investigate-label {
+      color: rgba(0, 220, 255, 0.75);
+      letter-spacing: 1.5px; font-size: 9px;
+      text-transform: uppercase;
+      margin-bottom: 3px;
+    }
+    .diag-investigate-logs {
+      max-height: 120px; overflow-y: auto;
+      background: rgba(0, 20, 35, 0.5);
+      border: 1px solid rgba(0, 220, 255, 0.10);
+      border-radius: 2px; padding: 4px 6px;
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .diag-investigate-log {
+      font-size: 9px; line-height: 1.4;
+      color: rgba(255, 220, 180, 0.85);
+      white-space: pre-wrap;
+      margin-bottom: 2px;
+    }
+    .diag-investigate-srcs code {
+      background: rgba(0, 40, 60, 0.45);
+      padding: 1px 5px; border-radius: 2px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 9px;
+      color: rgba(200, 240, 255, 0.95);
+    }
+    .diag-investigate-hint {
+      margin-top: 6px; font-size: 9px;
+      opacity: 0.55; font-style: italic;
+    }
+
+    /* ── Deep-scan loading bar ─────────────────────────────────────── */
+    #deepscan-bar {
+      position: fixed; left: 0; right: 0; bottom: 0;
+      height: 28px;
+      background: rgba(0, 16, 28, 0.85);
+      border-top: 1px solid rgba(0, 220, 255, 0.18);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      font-family: 'Rajdhani', 'JetBrains Mono', monospace;
+      color: var(--cyan);
+      transition: opacity 0.3s ease, transform 0.3s ease;
+      z-index: 100;
+      pointer-events: none;
+    }
+    #deepscan-bar.dsb-hidden {
+      opacity: 0;
+      transform: translateY(28px);
+    }
+    #deepscan-bar.dsb-visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+    #dsb-fill {
+      position: absolute; top: 0; left: 0; bottom: 0;
+      width: 0%;
+      background: linear-gradient(90deg,
+                                  rgba(0, 220, 255, 0.25),
+                                  rgba(0, 220, 255, 0.5));
+      box-shadow: 0 0 12px rgba(0, 220, 255, 0.6);
+      transition: width 0.18s ease-out;
+    }
+    #dsb-text {
+      position: relative;
+      display: flex; align-items: center; gap: 14px;
+      padding: 0 16px;
+      height: 100%;
+      font-size: 10px;
+      letter-spacing: 2px;
+    }
+    #dsb-label {
+      font-weight: 600;
+      color: var(--cyan);
+      text-shadow: 0 0 8px rgba(0, 220, 255, 0.5);
+      flex: 0 0 auto;
+    }
+    #dsb-counter {
+      color: rgba(255, 255, 255, 0.85);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      flex: 0 0 auto;
+    }
+    #dsb-file {
+      flex: 0 1 200px;
+      color: rgba(200, 230, 248, 0.55);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      letter-spacing: 0.5px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    /* Live findings ticker — shows the last finding as it streamed in.
+       This is what makes the scan feel REAL: you can watch actual issues
+       scroll past instead of just a number climbing. */
+    #dsb-ticker {
+      flex: 1; min-width: 0;
+      color: rgba(255, 220, 180, 0.78);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      letter-spacing: 0.3px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      transition: opacity 0.15s ease;
+    }
+    #dsb-ticker.flash { opacity: 0.4; }
+    #dsb-ticker .sev-high   { color: #ff7878; font-weight: 600; }
+    #dsb-ticker .sev-medium { color: #ffc850; font-weight: 600; }
+    #dsb-ticker .sev-low    { color: rgba(150, 220, 180, 0.85); }
+
+    /* Issue count broken out by severity so the user can see the
+       category mix at a glance (most "issues" are LOW). */
+    #dsb-issues {
+      display: flex; gap: 10px;
+      flex: 0 0 auto;
+      font-weight: 600;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+    }
+    #dsb-issues .ds-h { color: #ff7878; }
+    #dsb-issues .ds-m { color: #ffc850; }
+    #dsb-issues .ds-l { color: rgba(150, 220, 180, 0.85); }
+    #dsb-issues .ds-zero { opacity: 0.3; }
+
+    /* ── Deep-scan results modal ───────────────────────────────────── */
+    #deepscan-modal {
+      position: fixed; inset: 0;
+      background: rgba(0, 8, 18, 0.78);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      display: flex; align-items: center; justify-content: center;
+      z-index: 200;
+      transition: opacity 0.25s ease;
+      font-family: 'Rajdhani', 'JetBrains Mono', monospace;
+    }
+    #deepscan-modal.dsm-hidden {
+      opacity: 0; pointer-events: none;
+    }
+    #deepscan-modal.dsm-visible {
+      opacity: 1; pointer-events: auto;
+    }
+    #dsm-card {
+      width: 78%; max-width: 1100px;
+      height: 80vh;
+      background: rgba(0, 18, 30, 0.96);
+      border: 1px solid rgba(0, 220, 255, 0.28);
+      border-radius: 4px;
+      box-shadow: 0 0 40px rgba(0, 220, 255, 0.25);
+      display: flex; flex-direction: column;
+      padding: 24px 28px;
+      position: relative;
+      color: var(--cyan);
+    }
+    #dsm-close {
+      position: absolute; top: 12px; right: 12px;
+      width: 30px; height: 30px;
+      background: transparent;
+      color: var(--cyan);
+      border: 1px solid rgba(0, 220, 255, 0.30);
+      border-radius: 50%;
+      font-size: 13px; cursor: pointer;
+      transition: all 0.2s ease;
+    }
+    #dsm-close:hover {
+      background: rgba(0, 60, 90, 0.7);
+      box-shadow: 0 0 12px rgba(0, 220, 255, 0.5);
+    }
+    #dsm-header { margin-bottom: 18px; }
+    #dsm-title {
+      font-size: 14px; letter-spacing: 8px;
+      color: var(--cyan);
+      text-shadow: 0 0 12px rgba(0, 220, 255, 0.5);
+      margin-bottom: 8px;
+    }
+    #dsm-summary {
+      font-size: 11px; letter-spacing: 2px;
+      color: rgba(200, 230, 248, 0.75);
+    }
+    #dsm-summary .sev-high   { color: #ff5050; font-weight: 600; }
+    #dsm-summary .sev-medium { color: #ffc800; font-weight: 600; }
+    #dsm-summary .sev-low    { color: rgba(120, 220, 200, 0.8); }
+
+    #dsm-filter {
+      display: flex; gap: 8px;
+      margin-bottom: 14px;
+      border-bottom: 1px solid rgba(0, 220, 255, 0.12);
+      padding-bottom: 12px;
+    }
+    .dsm-tab {
+      padding: 6px 14px;
+      background: rgba(0, 24, 40, 0.6);
+      color: rgba(200, 230, 248, 0.55);
+      border: 1px solid rgba(0, 220, 255, 0.12);
+      border-radius: 3px;
+      font-family: inherit; font-size: 10px;
+      letter-spacing: 2px; font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .dsm-tab:hover { color: rgba(200, 230, 248, 0.9); }
+    .dsm-tab.active {
+      background: rgba(0, 60, 90, 0.55);
+      color: var(--cyan);
+      border-color: rgba(0, 220, 255, 0.5);
+      box-shadow: 0 0 10px rgba(0, 220, 255, 0.25);
+    }
+    .dsm-tab.dsm-tab-high.active   { border-color: rgba(255, 80, 80, 0.6); color: #ff7878; }
+    .dsm-tab.dsm-tab-medium.active { border-color: rgba(255, 200, 0, 0.6); color: #ffc800; }
+    .dsm-tab.dsm-tab-low.active    { border-color: rgba(120, 220, 200, 0.6); color: #78dcc8; }
+
+    #dsm-list {
+      flex: 1;
+      overflow-y: auto;
+      display: flex; flex-direction: column; gap: 6px;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(0, 220, 255, 0.4) transparent;
+    }
+    #dsm-list::-webkit-scrollbar { width: 6px; }
+    #dsm-list::-webkit-scrollbar-thumb {
+      background: rgba(0, 220, 255, 0.4); border-radius: 3px;
+    }
+    .dsm-row {
+      display: grid;
+      grid-template-columns: 60px 1fr auto;
+      gap: 14px;
+      padding: 8px 12px;
+      border: 1px solid rgba(0, 220, 255, 0.10);
+      border-radius: 3px;
+      background: rgba(0, 22, 36, 0.5);
+      align-items: start;
+    }
+    .dsm-row.dsm-high   { border-left: 3px solid #ff5050; background: rgba(50, 0, 0, 0.28); }
+    .dsm-row.dsm-medium { border-left: 3px solid #ffc800; background: rgba(50, 35, 0, 0.22); }
+    .dsm-row.dsm-low    { border-left: 3px solid rgba(120, 220, 200, 0.55); }
+
+    .dsm-sev {
+      font-size: 9px; letter-spacing: 1.5px;
+      font-weight: 700;
+      padding-top: 3px;
+    }
+    .dsm-row.dsm-high   .dsm-sev { color: #ff5050; }
+    .dsm-row.dsm-medium .dsm-sev { color: #ffc800; }
+    .dsm-row.dsm-low    .dsm-sev { color: rgba(120, 220, 200, 0.85); }
+
+    .dsm-body { min-width: 0; }
+    .dsm-msg {
+      font-size: 11px;
+      color: rgba(255, 255, 255, 0.92);
+      line-height: 1.4;
+      margin-bottom: 4px;
+    }
+    .dsm-meta {
+      font-size: 9px; letter-spacing: 0.5px;
+      color: rgba(200, 230, 248, 0.55);
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .dsm-meta code {
+      background: rgba(0, 40, 60, 0.4);
+      padding: 1px 5px; border-radius: 2px;
+      color: rgba(180, 230, 255, 0.85);
+    }
+    .dsm-cat {
+      font-size: 9px; letter-spacing: 1.5px;
+      color: rgba(200, 230, 248, 0.5);
+      font-weight: 600;
+      padding-top: 3px;
+      text-transform: uppercase;
+    }
+
+    /* Bottom summary line */
+    #diag-summary {
+      position: absolute; bottom: 12%; left: 50%;
+      transform: translateX(-50%);
+      font-size: 13px; letter-spacing: 4px;
+      opacity: 0; transition: opacity 0.4s ease;
+      text-align: center; min-width: 60%;
+    }
+    #diag-summary.show { opacity: 1; }
+    #diag-summary .ok   { color: #00ff8c; }
+    #diag-summary .warn { color: #ffc800; }
+    #diag-summary .err  { color: #ff5050; }
+
   </style>
 </head>
 <body>
@@ -2489,6 +3166,92 @@
 <div id="setup-wizard"></div>
 <!-- Settings panel — driven by settings.js. Hidden until user clicks ⚙. -->
 <div id="settings-panel"></div>
+
+<!-- ── HUB v2 OVERLAY ───────────────────────────────────────────────────────
+     Activates when body.hub-v2 is set. Replaces the busy v1 chrome with a
+     clean, sphere-centric look. v1 panels are dimmed in CSS below. -->
+<div id="hub-v2-layer">
+  <canvas id="hub-v2-sphere"></canvas>
+  <div class="hv2-frame tl"></div>
+  <div class="hv2-frame tr"></div>
+  <div class="hv2-frame bl"></div>
+  <div class="hv2-frame br"></div>
+  <div class="hv2-ring r1"></div>
+  <div class="hv2-ring r2"></div>
+  <div id="hv2-header">
+    J . A . R . V . I . S
+    <div class="hv2-sub">
+      <span class="hv2-pill">NEURAL OPERATING SYSTEM</span>
+      <span class="hv2-pill">v4.1</span>
+      <span class="hv2-pill" id="hv2-clock">--:--:--</span>
+      <span class="hv2-pill hv2-online">ONLINE</span>
+    </div>
+  </div>
+  <div id="hv2-status">STANDING BY</div>
+
+  <!-- ── Diagnostic overlay — appears during /run diagnostics ─────────── -->
+  <div id="diag-overlay" class="diag-hidden">
+    <div id="diag-title">FULL SYSTEM DIAGNOSTICS</div>
+    <button id="diag-close" type="button" aria-label="Close diagnostics">✕</button>
+    <canvas id="diag-ring"></canvas>
+    <div id="diag-percent">0%</div>
+    <div id="diag-progress-label">Initializing…</div>
+    <div id="diag-checks-wrap">
+      <div id="diag-checks"></div>
+    </div>
+    <div id="diag-summary"></div>
+  </div>
+</div>
+
+<!-- ── Deep scan loading bar — pinned to bottom of screen, always visible
+     while a scan is running. Auto-hides 4s after the scan completes.
+     The ticker shows the actual finding text as each one streams in so
+     the user can see real evidence the scanner is doing real work. -->
+<div id="deepscan-bar" class="dsb-hidden">
+  <div id="dsb-fill"></div>
+  <div id="dsb-text">
+    <span id="dsb-label">DEEP SCAN</span>
+    <span id="dsb-counter">0 / 0</span>
+    <span id="dsb-file">—</span>
+    <span id="dsb-ticker">scanning…</span>
+    <span id="dsb-issues">
+      <span class="ds-h ds-zero">0H</span>
+      <span class="ds-m ds-zero">0M</span>
+      <span class="ds-l ds-zero">0L</span>
+    </span>
+  </div>
+</div>
+
+<!-- ── Deep scan results modal — opened by "show me the scan results". -->
+<div id="deepscan-modal" class="dsm-hidden">
+  <div id="dsm-card">
+    <button id="dsm-close" type="button" aria-label="Close">✕</button>
+    <div id="dsm-header">
+      <div id="dsm-title">DEEP SCAN RESULTS</div>
+      <div id="dsm-summary"></div>
+    </div>
+    <div id="dsm-filter">
+      <button class="dsm-tab active" data-sev="all">ALL</button>
+      <button class="dsm-tab dsm-tab-high"   data-sev="high">HIGH</button>
+      <button class="dsm-tab dsm-tab-medium" data-sev="medium">MEDIUM</button>
+      <button class="dsm-tab dsm-tab-low"    data-sev="low">LOW</button>
+    </div>
+    <div id="dsm-list"></div>
+  </div>
+</div>
+
+<!-- ── Music Player widget — info-only, only visible while playing ──── -->
+<div id="music-player">
+  <div id="mp-drag"></div>
+  <div id="mp-body">
+    <img id="mp-art" alt="" />
+    <div id="mp-title">—</div>
+    <div id="mp-artist">—</div>
+    <div id="mp-scrub"><div id="mp-scrub-fill"></div></div>
+    <div id="mp-times"><span id="mp-pos">0:00</span><span id="mp-dur">0:00</span></div>
+  </div>
+</div>
+
 <div id="app">
 
   <!-- ── Left Sidebar ───────────────────────────────────────────────────── -->
@@ -3017,6 +3780,7 @@
   <div id="gaming-hud">
     <span id="gm-dot">●</span>
     <span id="gm-title">JARVIS</span>
+    <span id="gm-mode" hidden></span>
     <input id="gm-input" type="text" placeholder="type…" autocomplete="off" spellcheck="false" />
   </div>
 <!-- AR Shape Builder — full-window fixed overlay, shown only in ar-build-mode -->

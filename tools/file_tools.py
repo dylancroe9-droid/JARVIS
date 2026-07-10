@@ -4,8 +4,6 @@ File system tools: read, write, list, search, and scaffold projects.
 
 import glob as glob_module
 import os
-import shutil
-import stat
 from pathlib import Path
 from typing import Optional
 
@@ -55,7 +53,6 @@ def read_file(path: str) -> str:
 def write_file(path: str, content: str, append: bool = False) -> str:
     full = _resolve(path)
     from tools.permissions import request
-    action_word = "append to" if append else "write to"
     if not request(f"Write to {full}?"):
         return "Permission denied."
     os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
@@ -232,8 +229,20 @@ def create_project(
         f.write(_GITIGNORE.get(project_type, _GITIGNORE["general"]))
     created.append(".gitignore")
 
-    # Init git
-    os.system(f"git -C {project_dir!r} init -q 2>/dev/null")
+    # Init git — list-form subprocess so the shell never gets to interpret
+    # `project_dir`. The previous `os.system(f"git -C {project_dir!r}…")`
+    # used `!r` to repr-quote but still went through a shell, leaving room
+    # for surprises with quirky characters in the path.
+    import subprocess as _sp
+    try:
+        _sp.run(
+            ["git", "-C", project_dir, "init", "-q"],
+            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, timeout=10,
+        )
+    except Exception as exc:
+        # Non-fatal — project files were created; git init failure is
+        # surfaced in the message below but doesn't break the function.
+        print(f"[create_project] git init failed: {exc}", flush=True)
 
     lines = [
         f"Project '{name}' created at {project_dir}",
@@ -313,7 +322,6 @@ def create_spreadsheet(
 
         out_path = dest_dir / f"{name_no_ext}.xlsx"
         wb.save(str(out_path))
-        ext = ".xlsx"
     except ImportError:
         # openpyxl not available — write CSV
         import csv
@@ -322,7 +330,6 @@ def create_spreadsheet(
             writer = csv.writer(f)
             writer.writerow(headers)
             writer.writerows(rows)
-        ext = ".csv"
 
     if open_after:
         subprocess.Popen(["open", str(out_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -360,7 +367,6 @@ def manage_files(
     confirm: if True, list files before deleting (set to True always — model decides)
     """
     import time as _time
-    import fnmatch
 
     dir_path = Path(directory).expanduser()
     if not dir_path.exists():

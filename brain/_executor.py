@@ -14,6 +14,17 @@ console = Console()
 class ToolsExecutor:
     """Dispatches tool calls by name and returns string results."""
 
+    # ── Self-inspect rate limiting ──────────────────────────────────────────
+    # Hard cap on how many self-inspect tool calls one conversational turn
+    # can make. Prevents a runaway loop where JARVIS keeps grepping his own
+    # code without converging on an answer. brain/jarvis.py calls
+    # reset_self_inspect_counter() at the start of each turn.
+    _SELF_INSPECT_TOOL_NAMES = {
+        "read_my_code", "search_my_code", "list_my_files",
+        "read_my_logs", "read_my_history", "get_last_diagnostic_findings",
+    }
+    SELF_INSPECT_PER_TURN_CAP = 6
+
     def __init__(self):
         # Set by server.py so show_overlay can broadcast to the Electron frontend
         self.broadcast_callback = None
@@ -23,7 +34,32 @@ class ToolsExecutor:
         self.computer_agent_callback = None
         # Set to True when a media action runs (YouTube, open_url, open_application).
         # server.py checks this and uses detecting mode so video audio isn't captured.
+        # Reads/writes happen from multiple threads — use `consume_media_opened`
+        # for the atomic test-and-clear that server.py needs (see below).
+        import threading as _threading
+        self._media_lock = _threading.Lock()
         self.media_opened = False
+        # Per-turn counter for self-inspect tool calls
+        self._self_inspect_count = 0
+
+    def consume_media_opened(self) -> bool:
+        """
+        Atomic test-and-clear for `media_opened`. server.py was previously
+        doing `if exec.media_opened: exec.media_opened = False` — a classic
+        TOCTOU. If a tool thread sets the flag between the read and the
+        write, we lose the new media event. This method holds an internal
+        lock so the read and clear can't be interleaved.
+
+        Returns the value the flag had at the moment it was cleared.
+        """
+        with self._media_lock:
+            was_opened = self.media_opened
+            self.media_opened = False
+        return was_opened
+
+    def reset_self_inspect_counter(self) -> None:
+        """Called at the start of each conversational turn from brain/jarvis.py."""
+        self._self_inspect_count = 0
 
     def _ca(self, action: str, detail: str = "") -> None:
         """Broadcast a computer-agent action event to the HUD (best-effort)."""
@@ -34,6 +70,20 @@ class ToolsExecutor:
                 pass
 
     def execute(self, name: str, args: dict) -> str:
+        # Audit + rate-limit self-inspect calls so JARVIS can't grep himself
+        # into an infinite loop. Both branches print to stdout so the audit
+        # trail flows into /tmp/jarvis_server.log via start.sh's tee.
+        if name in self._SELF_INSPECT_TOOL_NAMES:
+            self._self_inspect_count += 1
+            if self._self_inspect_count > self.SELF_INSPECT_PER_TURN_CAP:
+                print(f"[self-inspect-cap] DENIED {name} — cap of "
+                      f"{self.SELF_INSPECT_PER_TURN_CAP}/turn reached", flush=True)
+                return (f"__self_inspect_cap__: I've already inspected my own "
+                        f"state {self._self_inspect_count - 1} times this turn — "
+                        f"answer with what you have instead of another lookup.")
+            print(f"[self-inspect] #{self._self_inspect_count} {name}("
+                  f"{', '.join(f'{k}={v!r}' for k, v in args.items())[:200]})",
+                  flush=True)
         try:
             return self._dispatch(name, args)
         except Exception as exc:
@@ -46,6 +96,13 @@ class ToolsExecutor:
             except ImportError as exc:
                 return f"Calendar tool unavailable: {exc}"
             return get_calendar_events(days=args.get("days", 7))
+
+        elif name == "read_calendar_visually":
+            try:
+                from tools.calendar_tool import read_calendar_visually
+            except ImportError as exc:
+                return f"Visual calendar reader unavailable: {exc}"
+            return read_calendar_visually(question=args.get("question", ""))
 
         elif name == "create_calendar_event":
             try:
@@ -130,7 +187,7 @@ class ToolsExecutor:
                 return f"edit_file error: {exc}"
 
         elif name == "grep_code":
-            import subprocess, shlex
+            import subprocess
             pattern   = args["pattern"]
             path      = args.get("path", JARVIS_DIR)
             max_lines = int(args.get("max_lines", 40))
@@ -159,6 +216,76 @@ class ToolsExecutor:
                 path=args.get("path"),
                 show_hidden=args.get("show_hidden", False),
             )
+
+        # ── Self-inspection — read own code, logs, history ───────────────
+        elif name == "read_my_code":
+            try:
+                from tools.self_inspect import read_jarvis_file
+            except ImportError as exc:
+                return f"Self-inspect unavailable: {exc}"
+            return read_jarvis_file(path=args.get("path", ""))
+
+        elif name == "search_my_code":
+            try:
+                from tools.self_inspect import grep_jarvis
+            except ImportError as exc:
+                return f"Self-inspect unavailable: {exc}"
+            return grep_jarvis(
+                pattern=args.get("pattern", ""),
+                file_glob=args.get("file_glob", "**/*.py"),
+                max_results=int(args.get("max_results", 30)),
+            )
+
+        elif name == "list_my_files":
+            try:
+                from tools.self_inspect import list_jarvis_dir
+            except ImportError as exc:
+                return f"Self-inspect unavailable: {exc}"
+            return list_jarvis_dir(path=args.get("path", "."))
+
+        elif name == "read_my_logs":
+            try:
+                from tools.self_inspect import read_jarvis_log
+            except ImportError as exc:
+                return f"Self-inspect unavailable: {exc}"
+            return read_jarvis_log(lines=int(args.get("lines", 100)))
+
+        elif name == "read_my_history":
+            try:
+                from tools.self_inspect import read_jarvis_history
+            except ImportError as exc:
+                return f"Self-inspect unavailable: {exc}"
+            return read_jarvis_history(max_turns=int(args.get("max_turns", 20)))
+
+        elif name == "get_last_diagnostic_findings":
+            try:
+                from tools.diagnostics import get_last_investigations
+            except ImportError as exc:
+                return f"Diagnostics unavailable: {exc}"
+            findings = get_last_investigations()
+            if not findings:
+                return ("No recent diagnostic findings — either no diagnostic "
+                        "has been run yet this session, or every check passed.")
+            target = args.get("check_name", "").strip()
+            if target:
+                if target not in findings:
+                    return f"No findings recorded for check '{target}'. Available: {list(findings.keys())}"
+                f = findings[target]
+                out = [f"# Investigation: {f['label']} ({f['check']})", f"Summary: {f['summary']}"]
+                if f['log_matches']:
+                    out.append("Related log lines:")
+                    out.extend(f"  {ln}" for ln in f['log_matches'])
+                if f['source_files']:
+                    out.append("Relevant source files (use read_my_code):")
+                    out.extend(f"  {p}" for p in f['source_files'])
+                return "\n".join(out)
+            # All findings — compact summary so the brain can decide where to dig
+            out = [f"# {len(findings)} diagnostic finding(s) from the last run:"]
+            for name_, f in findings.items():
+                out.append(f"- {f['label']} ({name_}): {f['summary']}  "
+                           f"[{len(f['log_matches'])} log line(s), "
+                           f"{len(f['source_files'])} source file(s)]")
+            return "\n".join(out)
 
         elif name == "search_files":
             try:
@@ -878,8 +1005,11 @@ class ToolsExecutor:
                         }],
                     )
                     return resp.content[0].text
-            except Exception:
-                pass
+            except Exception as _claude_exc:
+                # Fall back to Groq vision — but log WHY Claude failed so a
+                # real problem (bad key, network, quota) isn't invisible.
+                print(f"[vision] Claude vision failed, falling back to Groq: "
+                      f"{type(_claude_exc).__name__}: {_claude_exc}", flush=True)
 
             # Groq vision fallback
             try:
@@ -938,8 +1068,11 @@ class ToolsExecutor:
                     if not is_ar_mode():
                         set_ar_mode(True)
                         self.broadcast_callback({"type": "ar_mode_enter"})
-                except Exception:
-                    pass
+                except Exception as _ar_exc:
+                    # Best-effort auto-enter — the scene still broadcasts below.
+                    # Log so a persistent failure to enter AR mode is visible.
+                    print(f"[ar] auto-enter failed (scene still shown): "
+                          f"{type(_ar_exc).__name__}: {_ar_exc}", flush=True)
                 self.broadcast_callback({"type": "ar_scene_update", "scene": scene})
             return result
 

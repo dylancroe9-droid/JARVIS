@@ -8,14 +8,13 @@ Run with: python main.py         (voice mode)
 import sys
 import os
 import signal
+from typing import Optional
 
 # ── ensure the JARVIS directory is on the path ──────────────────────────────
 sys.path.insert(0, os.path.dirname(__file__))
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.text import Text
-from rich import print as rprint
 
 from config import USER_NAME, ANTHROPIC_API_KEY, GROQ_API_KEY, ANTHROPIC_MODEL, GROQ_MODEL
 
@@ -170,7 +169,8 @@ def _get_input(listener) -> "Optional[str]":
     )
 
     # Allow typed input too — check if user typed something before Enter
-    import select, termios, tty
+    import termios
+    import tty
 
     # Non-blocking stdin peek
     try:
@@ -228,7 +228,7 @@ def _speak_response(gen, speaker, prefix: str = "") -> None:
 
     if speaker:
         # stream_speak handles printing via the generator wrapper
-        full_text = speaker.stream_speak(_printing_gen(gen))
+        speaker.stream_speak(_printing_gen(gen))
         # The generator already printed chunks; add a trailing newline
     else:
         # Text mode: just print chunks

@@ -40,7 +40,33 @@ _SENTENCE_END = re.compile(
 
 # Minimum chunk size before sending to TTS.
 # Short sentences get bundled together to reduce TTS calls → fewer gaps.
-_MIN_CHUNK = 90
+# Each TTS call = one afplay invocation with ~100-150ms startup. Bigger chunks =
+# fewer audible pauses between sentences.
+_MIN_CHUNK = 200
+
+# Abbreviations that ElevenLabs treats as sentence ends because of the period —
+# convert them so TTS doesn't pause mid-phrase.
+# "Mr. Roe" specifically → "sir" — sounds more natural in spoken delivery
+# than "Mister Roe" (which still has a tiny pause between words). Matches
+# Paul Bettany's movie-JARVIS register.
+_TTS_PREPROCESS = [
+    (re.compile(r"\bMr\.?\s+Roe\b", re.IGNORECASE), "sir"),  # specific case first
+    (re.compile(r"\bMr\.\s+"),   "Mister "),
+    (re.compile(r"\bMrs\.\s+"),  "Missus "),
+    (re.compile(r"\bMs\.\s+"),   "Miss "),
+    (re.compile(r"\bDr\.\s+"),   "Doctor "),
+    (re.compile(r"\bSt\.\s+"),   "Saint "),
+    (re.compile(r"\bvs\.\s+"),   "versus "),
+    (re.compile(r"\bProf\.\s+"), "Professor "),
+    (re.compile(r"\be\.g\.,?\s+"), "for example, "),
+    (re.compile(r"\bi\.e\.,?\s+"), "that is, "),
+]
+
+def _preprocess_for_tts(text: str) -> str:
+    """Expand honorifics and abbreviations so TTS doesn't add awkward pauses."""
+    for pat, repl in _TTS_PREPROCESS:
+        text = pat.sub(repl, text)
+    return text
 
 _tmpfile_seq = itertools.count()
 
@@ -87,12 +113,16 @@ def _find_say_voice() -> str:
 
 _eleven_client = _find_eleven_client()
 
-_ELEVEN_VOICE      = os.getenv("ELEVEN_VOICE", "onwK4e9ZLuTAKqWW03F9")
+_ELEVEN_VOICE      = os.getenv("ELEVEN_VOICE", "JBFqnCBsd6RMkjVDRZzb")   # default: George (British, warm captivating storyteller — closest to movie JARVIS)
 _ELEVEN_MODEL      = "eleven_turbo_v2_5"   # turbo = fastest model, lowest latency
-_ELEVEN_STABILITY  = 0.45
-_ELEVEN_SIMILARITY = 0.80
-_ELEVEN_STYLE      = 0.20                  # lower style = more consistent, less robotic
-_ELEVEN_SAMPLERATE = 16_000                # pcm_16000 — lowest latency format
+# Tuned for calm, even delivery (was "aggressive" — too much punch/emphasis):
+# - stability ↑↑ to 0.78 = much more uniform pitch, no sharp emphasis
+# - similarity ↓ to 0.70 = looser to training reference = softer delivery
+# - style ↓ to 0.00      = zero performative inflection, flat-calm
+_ELEVEN_STABILITY  = 0.78
+_ELEVEN_SIMILARITY = 0.70
+_ELEVEN_STYLE      = 0.00
+_ELEVEN_SAMPLERATE = 22_050                # pcm_22050 — better quality than 16k, still low-latency
 _ELEVEN_LATENCY    = 4                     # optimize_streaming_latency 0-4, 4=fastest
 
 _USE_EDGE   = not _eleven_client and _edge_tts_available()
@@ -110,7 +140,7 @@ _SAY_VOICE = _find_say_voice()
 _SAY_RATE  = 155
 
 if _eleven_client:
-    console.print("[dim]TTS: ElevenLabs (Daniel)[/dim]")
+    console.print(f"[dim]TTS: ElevenLabs (voice={_ELEVEN_VOICE[:8]}…)[/dim]")
 elif _USE_EDGE:
     console.print(f"[dim]TTS: edge-tts ({_EDGE_VOICE})[/dim]")
 else:
@@ -161,6 +191,7 @@ class Speaker:
         import edge_tts
         if self._stop_flag.is_set():
             return None
+        text = _preprocess_for_tts(text)
         path = _mktmp()
         try:
             async def _gen() -> None:
@@ -175,8 +206,7 @@ class Speaker:
                 asyncio.run(_gen())
 
             if self._stop_flag.is_set():
-                try: os.unlink(path)
-                except Exception: pass
+                self._unlink(path)
                 return None
 
             # ── Strip leading silence from the mp3 (edge-tts adds ~100ms dead air) ──
@@ -197,27 +227,47 @@ class Speaker:
                         capture_output=True, timeout=5
                     )
                     if result.returncode == 0 and os.path.getsize(stripped) > 512:
-                        os.unlink(path)
+                        self._unlink(path)
                         return stripped
-                    else:
-                        try: os.unlink(stripped)
-                        except Exception: pass
+                    # ffmpeg "succeeded" but produced garbage (e.g. truncated
+                    # input) — drop the stripped file, keep the original.
+                    self._unlink(stripped)
                 except Exception:
-                    try: os.unlink(stripped)
-                    except Exception: pass
+                    self._unlink(stripped)
 
+            # One last stop-flag check — if the user interrupted mid-ffmpeg
+            # we don't want to return the path and have the caller queue it.
+            if self._stop_flag.is_set():
+                self._unlink(path)
+                return None
             return path
         except Exception as exc:
             console.print(f"[dim]edge-tts error: {exc}[/dim]")
-            try: os.unlink(path)
-            except Exception: pass
+            self._unlink(path)
             return None
 
     def _synthesize_eleven(self, text: str) -> Optional[str]:
-        """Synthesize via ElevenLabs → mp3 tmpfile. Returns path or None."""
+        """
+        Synthesize via ElevenLabs → mp3 tmpfile. Returns path on success or
+        None if the synthesis failed, was interrupted, or returned empty
+        audio. Caller can fall back to another TTS path on None.
+
+        Why the size check: ElevenLabs occasionally returns an OK status
+        with zero bytes (or only a few bytes of header) under quota / rate
+        limit / model glitch. Returning the path of an effectively-empty
+        file makes the caller queue silence; the downstream player would
+        then silently bail. Validating here surfaces the failure cleanly
+        and ensures every tmpfile we create is either valid OR deleted.
+        """
         if self._stop_flag.is_set() or not _eleven_client:
             return None
+        text = _preprocess_for_tts(text)
         path = _mktmp()
+        # MP3 with a real audio frame is at least a few hundred bytes; a
+        # 200-byte threshold catches "we got just a header" / "we got
+        # nothing" without false-rejecting genuinely short utterances.
+        _MIN_MP3_BYTES = 200
+        bytes_written = 0
         try:
             from elevenlabs import VoiceSettings
             audio_gen = _eleven_client.text_to_speech.convert(
@@ -236,14 +286,39 @@ class Speaker:
                 for chunk in audio_gen:
                     if chunk:
                         f.write(chunk)
-            return path if not self._stop_flag.is_set() else None
+                        bytes_written += len(chunk)
+            # If we were stopped mid-synth, throw away whatever we got
+            if self._stop_flag.is_set():
+                self._unlink(path)
+                return None
+            # Empty / near-empty MP3 — surface as failure so the caller
+            # can fall back to edge-tts or macOS say, instead of queueing
+            # a tmpfile the player will silently discard.
+            try:
+                actual_size = os.path.getsize(path)
+            except OSError:
+                actual_size = bytes_written
+            if actual_size < _MIN_MP3_BYTES:
+                console.print(
+                    f"[yellow]ElevenLabs returned {actual_size}b "
+                    f"— treating as failure, falling back[/yellow]"
+                )
+                self._unlink(path)
+                return None
+            return path
         except Exception as exc:
             console.print(f"[dim]ElevenLabs error: {exc}[/dim]")
-            try:
-                os.unlink(path)
-            except Exception:
-                pass
+            self._unlink(path)
             return None
+
+    @staticmethod
+    def _unlink(path: str) -> None:
+        """Best-effort tmpfile cleanup — never raises."""
+        try:
+            if path and os.path.exists(path):
+                os.unlink(path)
+        except Exception:
+            pass
 
     # ── Playback ──────────────────────────────────────────────────────────────
 
@@ -255,20 +330,39 @@ class Speaker:
             except Exception:
                 pass
             return
+        # Local reference to the Popen — avoids a race with speaker.stop()
+        # which sets self._play_proc = None while .communicate() is blocking
+        # and then `.returncode` blows up on NoneType.
+        proc = None
         try:
+            file_size = os.path.getsize(path) if os.path.exists(path) else 0
+            if file_size < 200:
+                console.print(f"[yellow]play: MP3 too small ({file_size}b) — synthesis failed?[/yellow]")
+                return
             with self._lock:
                 if not self._stop_flag.is_set():
-                    self._play_proc = subprocess.Popen(
+                    proc = subprocess.Popen(
                         ["afplay", path],
                         stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
                     )
-            if self._play_proc:
-                self._play_proc.wait()
+                    self._play_proc = proc
+            if proc is None:
+                return
+            try:
+                _, stderr_bytes = proc.communicate()
+            except Exception:
+                stderr_bytes = b""
+            rc = proc.returncode
+            # rc == -15 = SIGTERM (we killed it — barge-in, etc) — not an error
+            if rc not in (0, None, -15) or (stderr_bytes and b"error" in stderr_bytes.lower()):
+                err = (stderr_bytes or b"").decode(errors="ignore").strip()
+                console.print(f"[yellow]afplay rc={rc} ({file_size}b): {err}[/yellow]")
             with self._lock:
-                self._play_proc = None
-        except Exception:
-            pass
+                if self._play_proc is proc:
+                    self._play_proc = None
+        except Exception as exc:
+            console.print(f"[yellow]play exception: {type(exc).__name__}: {exc}[/yellow]")
         finally:
             try:
                 os.unlink(path)
@@ -284,20 +378,37 @@ class Speaker:
             .replace(" — ", " [[slnc 130]] ")
             .replace(" - ",  " [[slnc 100]] ")
         )
+        # Local Popen reference — mirrors the fix in _play_file. Without
+        # this, stop() can set self._play_proc = None while we're blocked
+        # in .wait() below, and then `self._play_proc.wait()` blows up on
+        # NoneType. By holding our own reference, .wait() always has a
+        # valid target even if stop() terminates the process out from
+        # under us.
+        proc = None
         try:
             with self._lock:
-                self._play_proc = subprocess.Popen(
+                proc = subprocess.Popen(
                     ["say", "-v", _SAY_VOICE, "-r", str(_SAY_RATE), enhanced],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-            self._play_proc.wait()
-            with self._lock:
-                self._play_proc = None
+                self._play_proc = proc
+            try:
+                proc.wait()
+            except Exception as wait_exc:
+                # `say` was killed or process file vanished — surface but
+                # don't crash the TTS pipeline.
+                console.print(
+                    f"[dim]say wait interrupted: {wait_exc}[/dim]"
+                )
         except Exception as exc:
             console.print(f"[yellow]macOS say failed: {exc}[/yellow]")
+        finally:
+            # Only clear if we're still the active process; another caller
+            # may have replaced self._play_proc with a fresh Popen already.
             with self._lock:
-                self._play_proc = None
+                if self._play_proc is proc:
+                    self._play_proc = None
 
     # ── Public speak (single piece, blocking) ─────────────────────────────────
 
@@ -317,34 +428,35 @@ class Speaker:
                 return
         self._speak_say(text)
 
-    # ── ElevenLabs PCM streaming ──────────────────────────────────────────────
+    # ── ElevenLabs streaming via MP3 + afplay ─────────────────────────────────
 
     def _stream_speak_eleven(self, text_gen: Generator[str, None, None]) -> str:
         """
-        True streaming TTS via ElevenLabs PCM output + sounddevice playback.
+        Streaming TTS via ElevenLabs MP3 synthesis + macOS afplay playback.
 
-        Pipeline:
-          Producer  → sentence_q  → Synthesizer (ElevenLabs PCM stream) → pcm_q → Player
-          (tokens)                   starts playing as bytes arrive                (sounddevice)
+        Pipeline (same as the edge-tts path):
+          Producer  → sentence_q  → Synthesizer (ElevenLabs MP3) → audio_q → Player (afplay)
+          (tokens)                                                            sentence by sentence
 
-        Key wins over edge-tts:
-          • pcm_16000 format — raw bytes, no container, no file I/O
-          • optimize_streaming_latency=4 — ElevenLabs prioritises first-byte speed
-          • sounddevice OutputStream — plays chunks as they land, no afplay startup lag
-          • Human voice quality instead of Microsoft TTS
+        We use afplay instead of sounddevice PCM streaming because:
+          • afplay respects macOS system volume (sounddevice bypasses it)
+          • MP3 + afplay is rock-solid; PCM through sounddevice had
+            silent-failure modes that were hard to debug
+          • Latency cost is small (~80-150ms per sentence) and masked by pipelining
         """
-        import numpy as np
-        import sounddevice as _sd
         from voice.latency import profiler
-        from elevenlabs import VoiceSettings
 
         collected: list[str] = []
         sentence_q: queue.Queue = queue.Queue()
-        pcm_q: queue.Queue      = queue.Queue(maxsize=4)
+        audio_q: queue.Queue    = queue.Queue(maxsize=5)
 
         # ── Producer: tokenise LLM stream → sentence chunks ──────────────────
+        # First sentence flushes EAGERLY — perceived latency = time to first audio.
+        # Subsequent sentences bundle (>= _MIN_CHUNK) so inter-sentence gaps are
+        # masked by playback of the previous sentence.
         def producer() -> None:
             buf = ""; pending = ""
+            first_emit = True
             for chunk in text_gen:
                 if self._stop_flag.is_set(): break
                 buf += chunk
@@ -356,8 +468,10 @@ class Speaker:
                     buf = buf[m.end():]
                     if not sentence: continue
                     candidate = (pending + " " + sentence).strip() if pending else sentence
-                    if len(candidate) >= _MIN_CHUNK:
+                    min_chunk = 1 if first_emit else _MIN_CHUNK
+                    if len(candidate) >= min_chunk:
                         sentence_q.put(candidate); pending = ""
+                        first_emit = False
                     else:
                         pending = candidate
             tail = (pending + " " + buf).strip() if pending else buf.strip()
@@ -365,42 +479,43 @@ class Speaker:
                 sentence_q.put(tail)
             sentence_q.put(None)
 
-        # ── Synthesizer: sentence → ElevenLabs PCM bytes ─────────────────────
+        # ── Synthesizer: sentence → ElevenLabs MP3 file path ─────────────────
         _first_synth = [True]
+
+        def _safe_put(item) -> bool:
+            """
+            Put onto the bounded audio_q WITHOUT blocking forever. On barge-in
+            the player stops draining; a plain blocking put() on a full queue
+            would wedge this synthesizer thread permanently. Returns False if we
+            gave up because playback is stopping (caller then unlinks the file
+            so it isn't leaked).
+            """
+            while not self._stop_flag.is_set():
+                try:
+                    audio_q.put(item, timeout=0.2)
+                    return True
+                except queue.Full:
+                    continue
+            return False
 
         def synthesizer() -> None:
             while True:
                 try:
                     sentence = sentence_q.get(timeout=0.5)
                 except queue.Empty:
-                    if self._stop_flag.is_set(): pcm_q.put(None); return
+                    if self._stop_flag.is_set(): _safe_put(None); return
                     continue
                 if sentence is None or self._stop_flag.is_set():
-                    pcm_q.put(None); return
+                    _safe_put(None); return
                 if _first_synth[0]:
                     profiler.mark("tts_first_synth_start")
-                try:
-                    pcm_bytes = b""
-                    for chunk in _eleven_client.text_to_speech.stream(
-                        voice_id   = _ELEVEN_VOICE,
-                        text       = sentence,
-                        model_id   = _ELEVEN_MODEL,
-                        output_format = f"pcm_{_ELEVEN_SAMPLERATE}",
-                        optimize_streaming_latency = _ELEVEN_LATENCY,
-                        voice_settings = VoiceSettings(
-                            stability        = _ELEVEN_STABILITY,
-                            similarity_boost = _ELEVEN_SIMILARITY,
-                            style            = _ELEVEN_STYLE,
-                            use_speaker_boost= True,
-                        ),
-                    ):
-                        if self._stop_flag.is_set(): break
-                        if chunk: pcm_bytes += chunk
-                    if pcm_bytes and not self._stop_flag.is_set():
-                        pcm_q.put(pcm_bytes)
-                except Exception as exc:
-                    console.print(f"[dim]ElevenLabs PCM error: {exc}[/dim]")
-                    pcm_q.put(None); return
+                path = self._synthesize_eleven(sentence)
+                if path:
+                    if not _safe_put(path):
+                        self._unlink(path)   # stopping — don't leak the mp3
+                        return
+                else:
+                    console.print("[dim]ElevenLabs returned no audio for sentence — skipping[/dim]")
                 if _first_synth[0]:
                     profiler.mark("tts_first_synth_end")
                     _first_synth[0] = False
@@ -408,11 +523,11 @@ class Speaker:
         threading.Thread(target=producer,    daemon=True, name="tts-producer").start()
         threading.Thread(target=synthesizer, daemon=True, name="tts-synth").start()
 
-        # ── Player: PCM bytes → sounddevice output ────────────────────────────
+        # ── Player: MP3 paths → afplay ────────────────────────────────────────
         _first_play = [True]
         while True:
             try:
-                item = pcm_q.get(timeout=0.15)
+                item = audio_q.get(timeout=0.15)
             except queue.Empty:
                 if self._stop_flag.is_set(): break
                 continue
@@ -420,19 +535,17 @@ class Speaker:
             if _first_play[0]:
                 profiler.mark("tts_first_play")
                 _first_play[0] = False
+            self._play_file(item)   # afplay + auto-delete
+
+        # Drain any synthesized-but-unplayed mp3s still queued (barge-in breaks
+        # the loop above while files may remain) so they don't leak in /tmp.
+        while True:
             try:
-                arr = np.frombuffer(item, dtype=np.int16)
-                with self._lock:
-                    if not self._stop_flag.is_set():
-                        _sd.play(arr, samplerate=_ELEVEN_SAMPLERATE, blocking=False)
-                # Poll until done or interrupted
-                import time as _time
-                while _sd.get_stream().active:
-                    if self._stop_flag.is_set():
-                        _sd.stop(); break
-                    _time.sleep(0.015)
-            except Exception as exc:
-                console.print(f"[dim]ElevenLabs playback error: {exc}[/dim]")
+                leftover = audio_q.get_nowait()
+            except queue.Empty:
+                break
+            if leftover:
+                self._unlink(leftover)
 
         return "".join(collected)
 
@@ -454,8 +567,10 @@ class Speaker:
         audio_q: queue.Queue    = queue.Queue(maxsize=5)
         collected: list[str]    = []
 
+        # First sentence flushes eagerly; subsequent sentences bundle (see _stream_speak_eleven).
         def producer() -> None:
             buf = ""; pending = ""
+            first_emit = True
             for chunk in text_gen:
                 if self._stop_flag.is_set(): break
                 buf += chunk
@@ -467,8 +582,10 @@ class Speaker:
                     buf = buf[m.end():]
                     if not sentence: continue
                     candidate = (pending + " " + sentence).strip() if pending else sentence
-                    if len(candidate) >= _MIN_CHUNK:
+                    min_chunk = 1 if first_emit else _MIN_CHUNK
+                    if len(candidate) >= min_chunk:
                         sentence_q.put(candidate); pending = ""
+                        first_emit = False
                     else:
                         pending = candidate
             tail = (pending + " " + buf).strip() if pending else buf.strip()
