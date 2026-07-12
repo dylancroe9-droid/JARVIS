@@ -135,6 +135,49 @@ def _system_status_section() -> str:
   {summary}
   Be honest. Never claim systems work if they show ✗ above.
   If asked "are you working?" / "self-diagnose" → report from this table exactly.
+  Otherwise do NOT bring this up — it's background health, not conversation.
+═══════════════════════════════════════════════════════════════════════════════\n"""
+
+
+# ── Live self-awareness: what mode JARVIS is in + what's on screen ─────────────
+# Set by server.py as the mode changes / screen is described, so JARVIS can
+# answer "what are you doing / why are you in watch mode" from FACTS instead of
+# guessing (it used to deny being in a mode it was actually in).
+_current_state: dict = {"mode": "normal", "reason": "", "screen": ""}
+
+_MODE_EXPLAIN = {
+    "watch":  "a video is playing, so you've gone quiet and compact and silenced notifications",
+    "gaming": "a game is running, so you're compact and silent until told 'exit gaming mode'",
+    "work":   "a work app (editor/terminal/docs) is focused, so you're a compact corner HUD",
+    "normal": "the normal desktop view with the full HUD",
+}
+
+def set_current_mode(mode: str, reason: str = "") -> None:
+    _current_state["mode"] = mode or "normal"
+    _current_state["reason"] = reason or ""
+
+def set_screen_context(desc: str) -> None:
+    _current_state["screen"] = (desc or "").strip()
+
+def _self_awareness_section() -> str:
+    """
+    JARVIS's CURRENT mode + what's on screen, so it answers "what are you doing /
+    why are you in X mode" TRUTHFULLY instead of denying or guessing.
+    """
+    mode   = _current_state.get("mode", "normal")
+    reason = _current_state.get("reason", "")
+    screen = _current_state.get("screen", "")
+    lines  = [f"  You are currently in {mode.upper()} mode — {_MODE_EXPLAIN.get(mode, mode)}."]
+    if reason and reason not in ("forced by voice", "voice"):
+        lines.append(f"  You switched to it because: {reason}.")
+    if screen:
+        lines.append(f"  What's on Dylan's screen right now: {screen}")
+    body = "\n".join(lines)
+    return f"""
+═══ YOUR CURRENT STATE — answer questions about yourself from THIS ══════════════
+{body}
+  If Dylan asks what mode you're in, what you're doing, or why you changed — answer
+  from the lines above, honestly. NEVER deny being in a mode you're actually in.
 ═══════════════════════════════════════════════════════════════════════════════\n"""
 
 # ── Arrival phrase rotation ───────────────────────────────────────────────────
@@ -396,6 +439,7 @@ def _generic_system_prompt() -> str:
     mem = load_memory()
     mem_section = f"\nWHAT YOU KNOW ABOUT {USER_NAME.upper()}\n{mem}\n" if mem else ""
     status_section = _system_status_section()
+    aware_section = _self_awareness_section()
 
     return f"""CURRENT TIME: {now} — exact. Never guess. Use verbatim when asked.
 TIME AWARENESS: Let time colour tone, never announce it unless relevant.
@@ -502,7 +546,7 @@ Always read the actual file. Key paths:
   {IRON_MAN_DIR}/4_ARTIFICIAL_MUSCLES/BUILD_GUIDE.md (muscle build + live test)
   {IRON_MAN_DIR}/5_REPULSOR_GAUNTLET/BUILD_GUIDE.md (repulsor + safety rules)
 
-{status_section}
+{aware_section}{status_section}
 """
 
 

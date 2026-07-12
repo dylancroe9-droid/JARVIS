@@ -78,17 +78,25 @@ def _get_page():
 
 def close_browser() -> str:
     global _pw_instance, _browser_context, _page
+    # Attempt both shutdowns, but ALWAYS null the globals afterward — even if
+    # one raises. The old code reset them only after both succeeded, so a
+    # failing context.close() left _pw_instance set (leaked node process) and
+    # stale globals that the next _get_page() would reuse.
+    err = None
     try:
         if _browser_context:
             _browser_context.close()
+    except Exception as e:
+        err = e
+    try:
         if _pw_instance:
             _pw_instance.stop()
-        _page = None
-        _browser_context = None
-        _pw_instance = None
-        return "Browser closed."
     except Exception as e:
-        return f"Error closing browser: {e}"
+        err = err or e
+    _page = None
+    _browser_context = None
+    _pw_instance = None
+    return "Browser closed." if err is None else f"Browser closed (with errors: {err})"
 
 
 # --------------------------------------------------------------------------- #

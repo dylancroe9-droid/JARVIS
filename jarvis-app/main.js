@@ -180,6 +180,10 @@ let _normalBounds = null
 
 ipcMain.on('cam-mode-on', () => {
   if (!mainWindow) return
+  // Guard against a second 'camera mode' while already in it — otherwise we'd
+  // overwrite _normalBounds with the CURRENT (fullscreen) bounds, and exit
+  // would then "restore" to fullscreen instead of the real normal size.
+  if (_normalBounds !== null) return
   _normalBounds = mainWindow.getBounds()
   const { workArea } = screen.getPrimaryDisplay()
   mainWindow.setBounds({
@@ -202,6 +206,17 @@ ipcMain.on('cam-mode-off', () => {
 ipcMain.on('set-display-mode', (_e, mode) => {
   if (!mainWindow) return
   const { workArea } = screen.getPrimaryDisplay()
+  // Any mode other than the compact gaming HUD needs the normal window chrome.
+  // The 'gaming' branch strips resizable/opacity/vibrancy; previously only the
+  // never-sent 'gaming-exit' restored them, so exiting gaming via 'desktop' or
+  // 'work' left the window stuck fixed-size, 6% translucent, and vibrancy-less
+  // until an app restart. Restoring here for every non-gaming mode fixes that.
+  if (mode !== 'gaming') {
+    mainWindow.setResizable(true)
+    mainWindow.setMinimumSize(380, 600)
+    try { mainWindow.setVibrancy('under-window') } catch (_) {}
+    mainWindow.setOpacity(1.0)
+  }
   if (mode === 'desktop') {
     const w = Math.min(960, workArea.width - 40)
     const h = 520

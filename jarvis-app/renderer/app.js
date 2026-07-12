@@ -339,6 +339,7 @@ window.setHubVersion = setHubVersion
 let _hv2RAF = null
 let _hv2Pts = null
 let _hv2ClockTimer = null
+let _hv2Resize = null   // the resize handler, so stop() can remove it (no leak)
 function _hv2BuildPoints (n) {
   const pts = []
   for (let i = 0; i < n; i++) {
@@ -357,6 +358,9 @@ function _hv2BuildPoints (n) {
 function startHubV2Sphere () {
   const canvas = document.getElementById('hub-v2-sphere')
   if (!canvas) return
+  // Already running? Don't stack a second rAF loop / resize listener — a double
+  // setHubVersion('v2') (or v2 sent twice) would otherwise run 2×… loops.
+  if (_hv2RAF) return
   const ctx = canvas.getContext('2d', { alpha: true })
   if (!_hv2Pts) _hv2Pts = _hv2BuildPoints(4200)
   let W = 0, H = 0, cx_ = 0, cy_ = 0, R = 0
@@ -370,7 +374,8 @@ function startHubV2Sphere () {
     R = Math.min(W, H) * 0.18
   }
   size()
-  window.addEventListener('resize', size)
+  _hv2Resize = size
+  window.addEventListener('resize', _hv2Resize)
   const t0 = performance.now()
   function frame (now) {
     if (!document.body.classList.contains('hub-v2')) {
@@ -425,6 +430,7 @@ function startHubV2Sphere () {
 function stopHubV2Sphere () {
   if (_hv2RAF) { cancelAnimationFrame(_hv2RAF); _hv2RAF = null }
   if (_hv2ClockTimer) { clearInterval(_hv2ClockTimer); _hv2ClockTimer = null }
+  if (_hv2Resize) { window.removeEventListener('resize', _hv2Resize); _hv2Resize = null }
 }
 
 // Apply hub version on load. Runs after DOM is ready so the body is paintable.
@@ -915,6 +921,12 @@ function _arPolygon (ctx, r, sides, startAngle = 0) {
 // ── Called from WebSocket message handler ─────────────────────────────────────
 
 function handleArSceneUpdate (scene) {
+  // Guard against a malformed frame (missing/na scene). Without this, a null
+  // scene makes the next _arDraw / _arHitTest throw on `arScene.shapes`, and
+  // because that throw happens before requestAnimationFrame re-arms, the whole
+  // AR render loop dies permanently until AR mode is re-entered.
+  if (!scene || typeof scene !== 'object') return
+  if (!Array.isArray(scene.shapes)) scene.shapes = []
   arScene  = scene
   _arDirty = true
 }
@@ -1046,7 +1058,18 @@ function hideBackendDownBanner () {
   if (el) el.style.display = 'none'
 }
 
+let _reconnectTimer = null
+
 function connect () {
+  // Don't stack sockets. If one is already open/connecting, or a reconnect is
+  // already scheduled, bail — clicking "Retry now" while auto-retry was pending
+  // used to spawn parallel reconnect chains, so every frame got processed 2–N
+  // times once the server came back.
+  if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
+    return
+  }
+  if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null }
+
   ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws`)
 
   ws.onopen = () => {
@@ -1064,14 +1087,24 @@ function connect () {
     _wsRetries += 1
     // After 4 failed attempts (~6 seconds), show the user-visible banner.
     if (_wsRetries >= 4) showBackendDownBanner()
-    setTimeout(connect, 1500)
+    if (_reconnectTimer) clearTimeout(_reconnectTimer)
+    _reconnectTimer = setTimeout(() => { _reconnectTimer = null; connect() }, 1500)
   }
   ws.onerror = () => {
     if ($hudLinkVal) { $hudLinkVal.textContent = 'ERROR'; $hudLinkVal.style.color = 'var(--red)' }
   }
 
   ws.onmessage = ({ data }) => {
-    const msg = JSON.parse(data)
+    // Guard JSON.parse — a malformed frame would otherwise throw out of the
+    // handler and drop the message (and, for stateful frames like
+    // ar_scene_update, could leave a render loop wedged). Drop it cleanly.
+    let msg
+    try {
+      msg = JSON.parse(data)
+    } catch (err) {
+      console.warn('[JARVIS] dropped malformed WS frame:', err)
+      return
+    }
 
     if (msg.type === 'state') {
       applyState(msg.state)
@@ -3511,9 +3544,14 @@ function showTimerHUD (id, remaining, total, label) {
         <svg viewBox="0 0 60 60"><circle class="timer-track" cx="30" cy="30" r="26"/><circle class="timer-fill" cx="30" cy="30" r="26"/></svg>
         <div class="timer-hud-time"></div>
       </div>
-      <button class="timer-cancel-btn" onclick="cancelTimer('${id}')">✕</button>
+      <button class="timer-cancel-btn">✕</button>
     `
     document.body.appendChild(timerEl)
+    // Bind the handler in JS (not an inline onclick with `${id}` interpolated
+    // into the attribute) so a server-supplied id can't break out of the
+    // attribute and inject a handler. `id` here is the real value, closed over.
+    timerEl.querySelector('.timer-cancel-btn')
+           .addEventListener('click', () => cancelTimer(id))
     setTimeout(() => timerEl.classList.add('visible'), 10)
     _activeTimers.set(id, { el: timerEl })
   }
@@ -4165,7 +4203,10 @@ function hideComputerAgentHUD () {
     // Audio histogram — mirrors waveform activity
     if (Math.floor(t * 4) !== Math.floor((t - 0.05) * 4)) {
       histAudData.shift()
-      const isActive = document.body.classList.contains('state-speaking') || document.body.classList.contains('state-thinking')
+      // Use jarvisState — the 'state-speaking'/'state-thinking' body classes it
+      // checked before are never set (applyState sets bare state on #app), so
+      // the audio histogram stayed idle even while JARVIS spoke.
+      const isActive = jarvisState === 'speaking' || jarvisState === 'thinking'
       histAudData.push(isActive ? 40 + Math.random() * 55 : 5 + Math.random() * 30)
     }
     const audBars = document.querySelectorAll('#hist-audio .hud-hist-bar')

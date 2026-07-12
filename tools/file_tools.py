@@ -347,6 +347,43 @@ def create_spreadsheet(
 # File management (find / delete / count by pattern + age)                     #
 # --------------------------------------------------------------------------- #
 
+def _fs_id(p: Path):
+    """(device, inode) identity of a path, or None if it can't be stat'd."""
+    try:
+        st = p.stat()
+        return (st.st_dev, st.st_ino)
+    except OSError:
+        return None
+
+
+def _refuse_delete_scope(dir_path: Path) -> Optional[str]:
+    """
+    Return a refusal message if `dir_path` is too dangerous to bulk-delete from
+    (the home directory itself, the filesystem root, or a parent of home), else
+    None.
+
+    Compares by FILESYSTEM IDENTITY (device + inode), NOT by resolved-path
+    string. macOS's default filesystem is case-INSENSITIVE, and Path.resolve()
+    does not case-fold — so a string compare let 'directory="/USERS/DYLANROE"'
+    slip past the home check while rglob still walked the real home dir. Inode
+    identity is case- and symlink-proof.
+    """
+    try:
+        target = dir_path.resolve()
+        home = Path.home().resolve()
+    except Exception:
+        return "Couldn't resolve that path safely — not deleting anything."
+    t_id = _fs_id(target)
+    if t_id is None:
+        return None  # doesn't exist; the "no files matched" path handles it
+    forbidden = {home, Path("/"), *home.parents}
+    forbidden_ids = {fid for fid in (_fs_id(p) for p in forbidden) if fid is not None}
+    if t_id in forbidden_ids:
+        return (f"Refusing to bulk-delete from {target} — that's your home or a "
+                f"root directory. Point me at a specific subfolder.")
+    return None
+
+
 def manage_files(
     action: str,
     directory: str = "~/Desktop",
@@ -364,7 +401,8 @@ def manage_files(
     pattern: glob pattern, e.g. "Screenshot*.png", "*.tmp", "*.pdf"
     age_hours: delete files OLDER than this many hours (0 = any age)
     newer_than_hours: only match files created in the last N hours (0 = any age)
-    confirm: if True, list files before deleting (set to True always — model decides)
+    confirm: legacy no-op. Deletes ALWAYS prompt the user via the UI now and
+             refuse home/root scope, regardless of this flag.
     """
     import time as _time
 
@@ -409,8 +447,27 @@ def manage_files(
         return f"{len(matched)} file(s):\n" + "\n".join(lines) + suffix
 
     if action == "delete":
+        # HARD REFUSAL for catastrophic scope — never bulk-delete the home dir
+        # or a filesystem root, even if the model (or an approval) says to.
+        # Uses filesystem identity so it can't be bypassed by path casing on a
+        # case-insensitive macOS volume.
+        _refusal = _refuse_delete_scope(dir_path)
+        if _refusal:
+            return _refusal
+
         if not matched:
             return f"No files matching '{pattern}' in {dir_path} to delete."
+
+        # Require explicit user confirmation via the UI before deleting anything.
+        # (Auto-approved only in test/terminal mode where no callback is set.)
+        # The old code deleted immediately and ignored its own `confirm` flag —
+        # "clean up my desktop" could wipe every file with no prompt.
+        _preview = ", ".join(p.name for p in matched[:5])
+        _more = f" (+{len(matched) - 5} more)" if len(matched) > 5 else ""
+        from tools.permissions import request
+        if not request(f"Delete {len(matched)} file(s) from {dir_path}? {_preview}{_more}"):
+            return f"Cancelled — nothing deleted from {dir_path}."
+
         deleted, failed = [], []
         for p in matched:
             try:

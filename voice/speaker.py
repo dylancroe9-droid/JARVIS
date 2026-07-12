@@ -156,6 +156,15 @@ class Speaker:
         self._lock      = threading.Lock()
         self._play_proc: Optional[subprocess.Popen] = None
 
+        # True while TTS audio is actively playing, plus a timestamp of when it
+        # last finished. The server drops transcripts during this window so
+        # JARVIS never hears his OWN voice through the mic and processes it as a
+        # command (a real feedback loop — see server.on_transcription). This is
+        # separate from barge-in, which works on raw mic ENERGY before any
+        # transcription, so dropping transcripts here doesn't disable it.
+        self.speaking  = False
+        self.last_done = 0.0
+
         # ── Persistent async event loop for edge-tts ──────────────────────────
         # Reusing one event loop keeps the WebSocket connection to Microsoft's
         # TTS server alive between sentences. Without this, every sentence pays
@@ -552,6 +561,20 @@ class Speaker:
     # ── Streaming (pipelined) — edge-tts / say fallback ───────────────────────
 
     def stream_speak(self, text_gen: Generator[str, None, None]) -> str:
+        """
+        Speak `text_gen`, tracking `self.speaking` for the whole duration so the
+        server can drop mic transcripts of JARVIS's own voice. Thin wrapper over
+        _stream_speak_impl so BOTH TTS routes are covered by one try/finally.
+        """
+        import time as _t
+        self.speaking = True
+        try:
+            return self._stream_speak_impl(text_gen)
+        finally:
+            self.speaking = False
+            self.last_done = _t.time()
+
+    def _stream_speak_impl(self, text_gen: Generator[str, None, None]) -> str:
         """
         Route to ElevenLabs PCM streaming if available, else edge-tts sentence pipeline.
         ElevenLabs path: human voice, PCM streaming, no files, starts playing faster.

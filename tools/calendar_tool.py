@@ -37,8 +37,12 @@ def _run_cal(script: str, timeout: int = 30) -> tuple[bool, str]:
 
 def _permission_error(err: str) -> bool:
     err_l = err.lower()
+    # NB: bare "access" was too broad — many unrelated Calendar errors contain
+    # that substring and got misreported as a permissions problem, masking the
+    # real fault. Match specific permission phrases only.
     return any(k in err_l for k in ["not authorized", "1743", "not allowed",
-                                     "user canceled", "access denied", "access"])
+                                     "user canceled", "access denied",
+                                     "access not granted", "denied access"])
 
 
 _PERMISSION_MSG = (

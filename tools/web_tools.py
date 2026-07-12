@@ -557,7 +557,7 @@ def deep_research(query: str) -> str:
                 url,
                 headers={"User-Agent": "Mozilla/5.0"},
             )
-            with urllib.request.urlopen(page_req, timeout=6) as resp:
+            with urllib.request.urlopen(page_req, timeout=6, context=_SSL_CTX) as resp:
                 page_html = resp.read().decode("utf-8", errors="ignore")
 
             # Strip tags, get readable text
@@ -621,7 +621,7 @@ def get_wikipedia_summary(query: str, sentences: int = 12) -> str:
             extract_url,
             headers={"User-Agent": "JARVIS/1.0 (contact@jarvis.ai)"},
         )
-        with urllib.request.urlopen(req2, timeout=8) as resp:
+        with urllib.request.urlopen(req2, timeout=8, context=_SSL_CTX) as resp:
             extract_data = _json.loads(resp.read())
 
         pages = extract_data.get("query", {}).get("pages", {})

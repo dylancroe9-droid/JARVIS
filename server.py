@@ -210,6 +210,7 @@ _ACK_SOUND_PATH = "/tmp/jarvis_ack.aiff"
 # restore the volume a few seconds after the conversation goes quiet. This
 # timer is reset on every command so a back-and-forth keeps the music low.
 _unduck_timer = None
+_unduck_lock = threading.Lock()
 _UNDUCK_GRACE_SEC = 10.0
 
 
@@ -219,11 +220,15 @@ def _duck_music_for_conversation() -> None:
     try:
         from tools.music_tools import duck_music, unduck_music
         duck_music()
-        if _unduck_timer is not None:
-            _unduck_timer.cancel()
-        _unduck_timer = threading.Timer(_UNDUCK_GRACE_SEC, unduck_music)
-        _unduck_timer.daemon = True
-        _unduck_timer.start()
+        # Guard the timer swap — this is now called from both the request thread
+        # (music gate) and a background thread (_say), so an unguarded
+        # cancel/create/assign could leak a timer or restore at the wrong time.
+        with _unduck_lock:
+            if _unduck_timer is not None:
+                _unduck_timer.cancel()
+            _unduck_timer = threading.Timer(_UNDUCK_GRACE_SEC, unduck_music)
+            _unduck_timer.daemon = True
+            _unduck_timer.start()
     except Exception:
         pass
 
@@ -1346,9 +1351,22 @@ def _on_notification(app_name: str, content: str) -> None:
     try:
         notify(title=f"📬 {app_name}", message=content or "New notification",
                sound=False, also_in_hud=True)
+        # SUSPEND THE MIC while speaking the announcement. Otherwise the mic
+        # transcribes JARVIS's own "New notification from Snapchat" and processes
+        # it as a phantom command (seen live: 'notification from snapchat. why is
+        # it still running...'). stream_speak blocks until the audio finishes, so
+        # the mic stays closed for the whole announcement; the finally resumes it
+        # (even on error) so the mic can never get stuck deaf.
+        if audio:
+            audio.suspend()
         speaker.stream_speak(iter([line]))
     except Exception as exc:
         print(f"[notif] speak error: {exc}", flush=True)
+    finally:
+        if audio:
+            import time as _t
+            _t.sleep(0.4)   # let the announcement's audio tail die out
+            _resume_audio()
 
 
 def _start_notif_monitor() -> bool:
@@ -1384,6 +1402,13 @@ def _on_mode_change(mode: str, reason: str) -> None:
       normal → full HUD, notifications on
     """
     global _notifications_muted, _work_mode, _gaming_mode
+    # Tell the brain its own current mode so it can answer "what mode are you in
+    # / why did you switch" truthfully instead of denying or guessing.
+    try:
+        from brain.personality import set_current_mode
+        set_current_mode(mode, reason)
+    except Exception:
+        pass
     try:
         if mode in ("watch", "gaming", "work"):
             _work_mode = True
@@ -1719,13 +1744,46 @@ def _say(msg: str) -> None:
     speaker.resume()
     if audio:
         audio.suspend()
+    # If music is playing, duck it (in the background so it doesn't delay
+    # speech) so the mic hears the user's reply/interrupt over a quieter bed.
+    # Reuses the conversation ducker, which restores itself after a short grace.
+    if _music_is_playing:
+        threading.Thread(target=_duck_music_for_conversation, daemon=True).start()
     broadcast({"type": "chunk", "text": msg})
     broadcast({"type": "done",  "full_text": msg})
-    speaker.stream_speak(iter([msg]))
-    set_state("idle")
+    try:
+        speaker.stream_speak(iter([msg]))
+    finally:
+        # ALWAYS resume the mic — even if TTS raised. Otherwise a throw here
+        # (this runs on request AND background threads, e.g. the mode manager)
+        # would leave the mic suspended and JARVIS deaf until the next restart.
+        set_state("idle")
+        if audio:
+            _t.sleep(0.5)
+            _resume_audio()
+
+
+def _speak_gated(text: str) -> None:
+    """
+    Speak `text` with the mic SUSPENDED for the duration, then resume it.
+
+    Use this for intercepts that already broadcast their own chunk/done and
+    just need the audio spoken — it stops JARVIS from hearing his own reply and
+    transcribing it as a phantom command (the same feedback loop the
+    notification path had). stream_speak blocks until the audio finishes, and
+    the finally always resumes the mic, so it can never be left deaf. Safe to
+    use even where a resume already follows — _resume_audio just re-selects the
+    current mode.
+    """
+    import time as _t
     if audio:
-        _t.sleep(0.5)
-        _resume_audio()
+        audio.suspend()
+    try:
+        speaker.stream_speak(iter([text]))
+    finally:
+        if audio:
+            _t.sleep(0.4)   # let the audio tail die out before reopening the mic
+            _resume_audio()
 
 
 def process(text: str, skip_echo: bool = False) -> None:
@@ -1862,6 +1920,17 @@ def process(text: str, skip_echo: bool = False) -> None:
             _on_mode_change("normal", "voice")
         _say("Back to normal, sir.")
 
+    # ── Guard: a QUESTION about a mode must not TRIGGER the mode command ──────
+    # "why did you go back to desktop mode" contains "desktop mode"/"back to
+    # desktop" (exit triggers). Asking ABOUT a mode should get an ANSWER from
+    # the LLM, not silently execute a switch. Skip the mode intercepts for
+    # anything that reads as a question.
+    _mode_q = (low.rstrip().endswith("?") or low.startswith((
+        "why", "what", "how", "when", "who", "which", "whats", "what's",
+        "did you", "do you", "are you", "were you", "can you tell",
+        "tell me why", "tell me what", "explain", "i asked",
+    )))
+
     # ── Auto-mode global on/off ──────────────────────────────────────────────
     # Lets Dylan stop JARVIS from auto-switching modes based on his screen.
     _AUTO_OFF_PHRASES = (
@@ -1873,7 +1942,7 @@ def process(text: str, skip_echo: bool = False) -> None:
         "resume auto mode", "turn on auto mode", "enable auto mode",
         "start auto mode", "auto mode on", "watch my screen again",
     )
-    if any(p in low for p in _AUTO_OFF_PHRASES):
+    if any(p in low for p in _AUTO_OFF_PHRASES) and not _mode_q:
         try:
             from tools.mode_manager import get_manager
             mgr = get_manager()
@@ -1883,7 +1952,7 @@ def process(text: str, skip_echo: bool = False) -> None:
             pass
         _say("Auto mode off, sir. I'll stay put until you turn it back on.")
         return
-    if any(p in low for p in _AUTO_ON_PHRASES):
+    if any(p in low for p in _AUTO_ON_PHRASES) and not _mode_q:
         try:
             from tools.mode_manager import get_manager
             mgr = get_manager()
@@ -1895,10 +1964,10 @@ def process(text: str, skip_echo: bool = False) -> None:
         return
 
     # ── Gaming Mode ──────────────────────────────────────────────────────────
-    if any(p in low for p in _GAMING_EXIT_PHRASES) and _gaming_mode:
+    if any(p in low for p in _GAMING_EXIT_PHRASES) and _gaming_mode and not _mode_q:
         _exit_mode()
         return
-    if any(p in low for p in _GAMING_ENTER_PHRASES) and not _gaming_mode:
+    if any(p in low for p in _GAMING_ENTER_PHRASES) and not _gaming_mode and not _mode_q:
         _force_mode("gaming")
         return
 
@@ -1906,10 +1975,10 @@ def process(text: str, skip_echo: bool = False) -> None:
     # EXIT check runs FIRST. Otherwise "exit work load" matches both lists
     # (because "work load" is in ENTER as a Whisper-mishearing alias) and the
     # ENTER branch fires first, re-entering work mode instead of leaving.
-    if any(p in low for p in _WORK_EXIT_PHRASES) and _work_mode:
+    if any(p in low for p in _WORK_EXIT_PHRASES) and _work_mode and not _mode_q:
         _exit_mode()
         return
-    if any(p in low for p in _WORK_ENTER_PHRASES) and not _work_mode and not _gaming_mode:
+    if any(p in low for p in _WORK_ENTER_PHRASES) and not _work_mode and not _gaming_mode and not _mode_q:
         _enter_work_mode("Work mode. I'll be here when you need me, sir.")
         return
     # NOTE: a second `if _WORK_EXIT_PHRASES` block lived here previously —
@@ -2214,9 +2283,14 @@ def process(text: str, skip_echo: bool = False) -> None:
     # Voice command runs the full health check on the sphere overlay,
     # narrates each failure with its behavioral impact, and tries auto-fixes.
     _DIAG_PHRASES = (
-        # diagnostic noun
+        # diagnostic noun — include SINGULAR "diagnostic" forms. "run a full
+        # system diagnostic" matched none of the old phrases (they were all
+        # plural "diagnostics" or lacked the word "system"), so it fell through
+        # to the LLM and got answered with a battery check.
         "run diagnostics", "run a diagnostic", "run a full diagnostic",
         "system diagnostics", "systems diagnostics", "full diagnostic",
+        "system diagnostic", "full system diagnostic", "run a system diagnostic",
+        "run a full system diagnostic",
         "diagnostic check", "diagnostics on yourself", "diagnose yourself",
         # check noun (singular AND plural — "systems check" was missing)
         "system check", "systems check",
@@ -3221,11 +3295,9 @@ def _process_unsafe(text: str, skip_echo: bool = False) -> None:
             "ap csp":          ("AP CSP",           "AP Computer Science Principles"),
         }
         _course_short = "AP Classroom"
-        _course_full  = "AP Classroom"
         for _kw, (_short, _full) in _course_map.items():
             if _kw in _text_lower:
                 _course_short = _short
-                _course_full  = _full
                 break
 
         # ── Parse unit number ──────────────────────────────────────────────
@@ -3247,7 +3319,7 @@ def _process_unsafe(text: str, skip_echo: bool = False) -> None:
         else:
             _task_desc = f"{_course_short} Progress Check"
 
-        ack = f"On it. Opening AP Classroom — {_task_desc}. I'll navigate there and answer every question."
+        ack = f"Opening AP Classroom for you, sir — {_task_desc}. You'll take it from there."
         broadcast({"type": "chunk",    "text": ack})
         broadcast({"type": "done",     "full_text": ack})
         broadcast({"type": "state",    "state": "speaking"})
@@ -3256,47 +3328,18 @@ def _process_unsafe(text: str, skip_echo: bool = False) -> None:
         speaker.stream_speak(iter([ack]))
         broadcast({"type": "state",    "state": "idle"})
 
-        # Build the injected navigation context for the LLM
-        _unit_context = f"Unit {_unit_num}" if _unit_num else "the correct unit"
-        _ap_nav_prompt = (
-            f"[AP CLASSROOM TASK — NAVIGATE AND ANSWER]\n"
-            f"Course: {_course_full}\n"
-            f"Target: {_task_desc}\n"
-            f"URL: https://myap.collegeboard.org/student/classroom\n\n"
-            f"STEP-BY-STEP PLAN:\n"
-            f"1. take_screenshot to see current screen state.\n"
-            f"2. If Chrome is not on AP Classroom, call web_search or open_application to open "
-            f"   https://myap.collegeboard.org/student/classroom in Chrome.\n"
-            f"3. take_screenshot — find the {_course_full} course card and click it.\n"
-            f"4. Locate {_unit_context} in the left sidebar or unit list — click it.\n"
-            f"5. Find 'Progress Check' link — click it.\n"
-            f"6. Find '{_section}' option — click 'Start' or 'Resume'.\n"
-            f"7. Now you're in the quiz. Answer EVERY question using the standard loop:\n"
-            f"   a. take_screenshot(for_control=True) — read question + options.\n"
-            f"   b. Determine correct answer from your AP knowledge.\n"
-            f"   c. click_screen(x, y) on the correct radio button.\n"
-            f"   d. take_screenshot to confirm selection.\n"
-            f"   e. Click 'Next Question' button, or scroll down to next question.\n"
-            f"   f. Repeat until all questions done.\n"
-            f"8. Click 'Submit' when all questions are answered. take_screenshot to confirm.\n"
-            f"9. Report: 'Done — {_task_desc} submitted.'\n\n"
-            f"RULES:\n"
-            f"- Never skip a question. Never stop early.\n"
-            f"- If already on AP Classroom, skip to the course navigation step.\n"
-            f"- If a login screen appears, stop and tell Dylan — you cannot enter credentials.\n"
-            f"- Radio buttons: click dead center. If it doesn't register, click the option label.\n"
-            f"- Use your full AP knowledge — you know this material cold.\n"
-            f"The user said: {text}"
-        )
-
-        # Inject this as a new user turn and run the LLM in heavy-task mode
+        # Just open the AP Classroom page — helpful without auto-answering a
+        # graded assessment. The old auto-answer agent called jarvis.run(),
+        # which doesn't exist (Jarvis only has .chat()), so this always threw
+        # AttributeError and never worked.
         def _run_ap_agent():
             try:
-                # Temporarily prepend the nav prompt so the LLM has full instructions
-                jarvis.run(_ap_nav_prompt)
+                import subprocess as _sp_ap
+                _sp_ap.run(["open", "https://myap.collegeboard.org/student/classroom"],
+                           timeout=5)
             except Exception as _exc:
-                broadcast({"type": "chunk", "text": f"AP Classroom agent error: {_exc}"})
-                broadcast({"type": "done",  "full_text": f"AP Classroom agent error: {_exc}"})
+                broadcast({"type": "chunk", "text": f"Couldn't open AP Classroom: {_exc}"})
+                broadcast({"type": "done",  "full_text": f"Couldn't open AP Classroom: {_exc}"})
 
         import threading as _t_ap
         _t_ap.Thread(target=_run_ap_agent, daemon=True).start()
@@ -3396,16 +3439,19 @@ def _process_unsafe(text: str, skip_echo: bool = False) -> None:
                 broadcast({"type": "chunk", "text": chunk})
                 yield chunk
 
-        # ── Activate barge-in AFTER a short delay so TTS is already playing ─
-        # If we start immediately, the measurement window captures dead silence
-        # Barge-in RE-ENABLED with voice-profile guard. The audio engine now
-        # only counts loud audio as barge-in if voice_profile says it sounds
-        # like Dylan. JARVIS's own speaker bleed → fails voice profile → no
-        # self-interruption. Dylan's voice → passes → JARVIS stops talking.
+        # ── Activate barge-in AFTER a delay so TTS is already playing ────────
+        # The barge-in threshold is set by sampling the "ambient" (which is
+        # really JARVIS's own speaker bleed) for the first ~640ms after arming.
+        # If we arm before audio is actually coming out of the speakers, that
+        # window samples dead silence → the threshold floors low → JARVIS's own
+        # voice then crosses it and he interrupts himself. Wait long enough that
+        # ElevenLabs audio is reliably playing before we start measuring.
+        # (The RMS floor in audio_engine is the real safety net; this just makes
+        # the dynamic measurement land on real bleed more often.)
         if audio:
             def _delayed_barge_in():
                 import time as _bt
-                _bt.sleep(0.6)   # let first audio start playing first
+                _bt.sleep(0.9)   # let first audio start playing first
                 if audio:
                     audio.start_barge_in()
             threading.Thread(target=_delayed_barge_in, daemon=True,
@@ -3577,8 +3623,12 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                     # stalled) for seconds at a time.
                     _mc_action = msg.get("action", "")
                     _mc_value = msg.get("value")
+                    # Bind the values as default args — the executor runs the
+                    # lambda later, and these locals are reassigned on the next
+                    # music_control message; a bare closure would read the newer
+                    # values (a rapid pause-then-seek could run seek twice).
                     asyncio.get_event_loop().run_in_executor(
-                        None, lambda: _music_control(_mc_action, _mc_value)
+                        None, lambda a=_mc_action, v=_mc_value: _music_control(a, v)
                     )
 
                 elif kind == "mute":
@@ -3948,7 +3998,13 @@ async def startup() -> None:
     # (compact HUD, notification silencing, ad-skip).
     try:
         from tools.mode_manager import get_manager
-        get_manager(on_mode_change=_on_mode_change, poll_sec=30.0).start()
+        get_manager(
+            on_mode_change=_on_mode_change,
+            poll_sec=30.0,
+            # Keep watch mode alive while a video/music is still playing, even if
+            # Dylan tabs from Peacock to another app.
+            media_playing=lambda: bool(_system_audio_playing or _music_is_playing),
+        ).start()
         print("[mode] manager started", flush=True)
     except Exception as exc:
         print(f"[mode] failed to start: {exc}", flush=True)
@@ -3959,6 +4015,19 @@ async def startup() -> None:
         def on_transcription(kind: str, text: str) -> None:
             import time as _t
             stripped = text.strip()
+
+            # ── Echo guard: drop JARVIS's own voice ───────────────────────────
+            # If TTS is actively playing, this transcript is almost certainly
+            # JARVIS's own speech bleeding into the mic (seen live: he announced
+            # a Snapchat notification and then "heard" himself say it). Drop it.
+            # This is the single choke-point that covers EVERY speak path
+            # (replies, intercept acks, notifications) without gating each site.
+            # Barge-in is energy-based and fires BEFORE transcription — it stops
+            # the speaker first, so `speaking` is already False by the time a
+            # real interruption reaches here. So this doesn't block interrupting.
+            if speaker.speaking:
+                print(f"[echo-drop] ignored own-voice: {stripped[:45]!r}", flush=True)
+                return
 
             # ── Sleep mode: only process wake-up phrases ──────────────────────
             if _sleep_mode:

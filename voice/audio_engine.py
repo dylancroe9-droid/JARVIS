@@ -66,7 +66,13 @@ CMD_TIMEOUT_BLKS = int(CMD_TIMEOUT_SECS * SAMPLE_RATE / BLOCK_SIZE)
 CONVERSE_TIMEOUT_SECS = 2     # seconds of silence before reverting to wake-word mode
 CONVERSE_TIMEOUT_BLKS = int(CONVERSE_TIMEOUT_SECS * SAMPLE_RATE / BLOCK_SIZE)
 
-BARGE_RMS_MIN  = 800          # floor: low enough that normal-volume speech triggers
+BARGE_RMS_MIN  = 1800         # floor: MUST sit above JARVIS's own ElevenLabs
+                              # speaker bleed (~1500 RMS) or he self-interrupts.
+                              # Was 800 — when the ambient window happened to
+                              # sample a silent gap, the threshold floored to 800
+                              # (BELOW his own voice) and he cut himself off
+                              # mid-sentence. 1800 clears the bleed with margin
+                              # while normal near-mic speech (2000+) still trips it.
 BARGE_RMS_MAX  = 3500         # ceiling: high enough that ElevenLabs speaker bleed
                               # (~1500 RMS) doesn't pin the threshold at the cap
 BARGE_MEASURE  = 20           # blocks to sample ambient/speaker level (~640ms)
@@ -296,13 +302,15 @@ class AudioEngine:
 
     def _is_speech(self, chunk: np.ndarray, rms: float) -> bool:
         """
-        Returns True if this audio block contains human speech FROM the enrolled user.
+        Returns True if this audio block contains human speech.
 
         Pipeline:
           1. Energy floor — reject absolute silence instantly
           2. WebRTC VAD — ML model rejects noise/music/fan hum/phone bleed
-          3. Voice profile check — compares speaker embedding to Dylan's voiceprint
-             (only runs when a profile is enrolled; skips if none saved)
+
+        No per-block speaker check: a 32ms chunk is far too short for
+        resemblyzer (needs ~0.5s), so it can't verify identity here. The
+        server's wake-word gate ("Hey JARVIS") is what scopes commands to Dylan.
         """
         if rms < VAD_RMS_FLOOR:
             return False
@@ -335,24 +343,13 @@ class AudioEngine:
         if not is_speech:
             return False
 
-        # Step 2: Voice profile check — is this speech from Dylan?
-        # Runs only if a profile is enrolled. Adds ~20ms but only reaches here
-        # after WebRTC already confirmed speech.
-        # SKIPPED during music playback — when music + voice mix together in
-        # the mic, the voice embedding shifts and the profile check often
-        # fails on Dylan's real speech. The wake-word check at the server
-        # layer still filters out non-command audio (lyrics get dropped there).
-        try:
-            from server import _music_is_playing, _system_audio_playing
-            if _music_is_playing or _system_audio_playing:
-                return True
-        except Exception:
-            pass
-        try:
-            from voice.voice_profile import is_owner
-            return is_owner(chunk)
-        except Exception:
-            return True   # profile check failed → accept (don't drop real commands)
+        # Speaker identity is NOT checked here. A per-block resemblyzer check on
+        # a single 32ms chunk can't work (it needs >= 0.5s), so the old
+        # is_owner(chunk) call always returned True — pure dead weight. WebRTC
+        # VAD above already rejects music/noise/bleed, and the server's
+        # wake-word gate ("Hey JARVIS") filters non-commands, so a block that
+        # reaches here is treated as speech.
+        return True
 
     def start_detecting(self) -> None:
         """Passive wake word scanning."""
@@ -543,27 +540,25 @@ class AudioEngine:
                     console.print(f"[dim]barge-in threshold set: {self._barge_threshold:.0f} (ambient {avg:.0f})[/dim]")
                 return  # don't fire during measurement window
 
-            # Phase 2 — detect sustained voice above threshold.
-            # Loud audio counts toward barge-in trigger ONLY if it sounds like
-            # Dylan's voice (per voice_profile). This stops JARVIS's own audio
-            # bleed from triggering self-interruption.
+            # Phase 2 — fire on sustained voice above the measured threshold.
+            #
+            # There is deliberately NO speaker-ID check here. During barge-in the
+            # mic is hearing JARVIS's OWN TTS bleed mixed with whatever the user
+            # says, so any resemblyzer embedding is contaminated — it can't tell
+            # "Dylan over my voice" from "my voice alone", and verifying would
+            # only add false-negatives (dropping real interruptions). The dynamic
+            # threshold (2.5× the measured bleed/ambient) is the correct and
+            # sufficient signal: only audio LOUDER than JARVIS's own bleed counts.
             if rms > self._barge_threshold:
-                is_dylan = True
-                try:
-                    from voice.voice_profile import is_owner
-                    is_dylan = is_owner(chunk)
-                except Exception:
-                    pass
-                if is_dylan:
-                    self._loud_count += 1
-                    if self._loud_count >= BARGE_FRAMES:
-                        self._loud_count = 0
-                        self._state      = self.DETECTING
-                        threading.Thread(
-                            target=self._on_barge_in,
-                            daemon=True,
-                            name="barge-in-cb",
-                        ).start()
+                self._loud_count += 1
+                if self._loud_count >= BARGE_FRAMES:
+                    self._loud_count = 0
+                    self._state      = self.DETECTING
+                    threading.Thread(
+                        target=self._on_barge_in,
+                        daemon=True,
+                        name="barge-in-cb",
+                    ).start()
             else:
                 self._loud_count = max(0, self._loud_count - 1)
 
@@ -633,11 +628,12 @@ class AudioEngine:
             try:
                 import whisper as _whisper
                 audio_f32 = audio_np.astype(np.float32) / 32768.0
-                # Pick model based on clip length
-                is_short  = len(audio_np) <= SAMPLE_RATE * 2   # ≤ 2 seconds
-                model     = getattr(self, "_whisper_tiny", None) if is_short else None
-                if model is None:
-                    model = self._whisper
+                # Use the ACCURATE model for every clip. The old two-tier path
+                # sent short (≤2s) clips to the `tiny` model to save ~0.5s — but
+                # short clips are exactly the voice COMMANDS, and mis-hearing a
+                # command (which then does the wrong thing) is far worse than a
+                # small delay. tiny is only a last-resort fallback now.
+                model = self._whisper or getattr(self, "_whisper_tiny", None)
                 # NO initial_prompt — even "Hey JARVIS, this is Dylan" caused
                 # Whisper to hallucinate that exact phrase from silence/noise.
                 # Wake-word fuzzy matcher catches transcription variants instead.

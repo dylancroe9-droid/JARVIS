@@ -23,6 +23,7 @@ it or the screen clearly moves to a different context.
 
 from __future__ import annotations
 
+import subprocess
 import threading
 from typing import Callable, Optional
 
@@ -144,9 +145,56 @@ def classify(app: str, title: str) -> tuple[str, str]:
     return "normal", app
 
 
+# AppleScript to read the ACTIVE TAB's URL + title for each browser. macOS's
+# CGWindowList almost always returns an empty window title for browsers, so
+# without this we can never see "peacock"/"youtube"/"github" in a browser and
+# every browser just classifies as "normal". The URL is the reliable signal
+# (peacocktv.com, youtube.com, github.com…). First run prompts once for
+# Automation permission ("JARVIS wants to control Google Chrome").
+_BROWSER_SCRIPTS = {
+    "Google Chrome":  'tell application "Google Chrome" to return (URL of active tab of front window) & " " & (title of active tab of front window)',
+    "Brave Browser":  'tell application "Brave Browser" to return (URL of active tab of front window) & " " & (title of active tab of front window)',
+    "Microsoft Edge": 'tell application "Microsoft Edge" to return (URL of active tab of front window) & " " & (title of active tab of front window)',
+    "Arc":            'tell application "Arc" to return (URL of active tab of front window) & " " & (title of active tab of front window)',
+    "Opera":          'tell application "Opera" to return (URL of active tab of front window) & " " & (title of active tab of front window)',
+    "Safari":         'tell application "Safari" to return (URL of current tab of front window) & " " & (name of current tab of front window)',
+}
+
+
+def _browser_url_title(app: str) -> str:
+    """Active-tab 'URL title' for a browser via AppleScript, or '' on failure."""
+    script = _BROWSER_SCRIPTS.get(app)
+    if not script:
+        return ""
+    try:
+        r = subprocess.run(["osascript", "-e", script],
+                           capture_output=True, text=True, timeout=2)
+        if r.returncode == 0:
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _frontmost_context() -> tuple[str, str]:
+    """
+    Frontmost (app, title), with the browser's active-tab URL+title folded into
+    the title. Browsers hide their tab title from CGWindowList, so without this
+    YouTube/Netflix/Peacock (watch) and GitHub/Gmail (work) are invisible and
+    every browser reads as 'normal'. Does an osascript call for browsers — keep
+    it OUT of any held lock (it can take up to 2s).
+    """
+    app, title = _frontmost()
+    if app in _BROWSER_SCRIPTS:
+        enriched = _browser_url_title(app)
+        if enriched:
+            title = f"{title} {enriched}".strip()
+    return app, title
+
+
 def classify_screen() -> tuple[str, str]:
     """Classify what's currently on screen. Returns (mode, reason)."""
-    app, title = _frontmost()
+    app, title = _frontmost_context()
     return classify(app, title)
 
 
@@ -171,9 +219,14 @@ class ModeManager:
 
     def __init__(self,
                  on_mode_change: Callable[[str, str], None],
-                 poll_sec: float = 30.0):
+                 poll_sec: float = 30.0,
+                 media_playing: Optional[Callable[[], bool]] = None):
         self.on_mode_change = on_mode_change
         self.poll_sec = poll_sec
+        # Returns True while a video/music is actively playing. Used to keep
+        # watch mode from dropping to the big desktop HUD the moment you tab
+        # away from Peacock to answer a message — the video's still going.
+        self.media_playing = media_playing
         self._mode = "normal"
         self._forced: Optional[str] = None       # mode pinned by voice / pull-up
         self._forced_app: Optional[str] = None   # frontmost app when pinned
@@ -291,10 +344,12 @@ class ModeManager:
         One auto-detection pass. Factored out of the loop so it's unit-testable
         without a live thread. Fires the callback OUTSIDE the lock (TTS blocks).
 
-        A single _frontmost() probe drives both the pin-release check and the
-        classification, so we never read the window list twice per tick.
+        A single probe drives both the pin-release check and the
+        classification, so we never read the window list twice per tick. The
+        browser-URL lookup happens here, OUTSIDE the lock, so its osascript call
+        can't stall the manager.
         """
-        app, title = _frontmost()
+        app, title = _frontmost_context()
         mode = reason = prev = None
         changed = False
         with self._lock:
@@ -309,6 +364,18 @@ class ModeManager:
                 self._forced = None
                 self._forced_app = None
             m, r = classify(app, title)
+            # Keep watch mode while a video/music is still playing, even if you
+            # tabbed away from Peacock to a normal/work app (e.g. Claude) — don't
+            # yank the big desktop HUD back over a video that's still going. Only
+            # leave watch when the media actually stops, you switch to a GAME
+            # (gaming wins), or you exit by voice.
+            if (self._mode == "watch" and m in ("normal", "work")
+                    and self.media_playing is not None):
+                try:
+                    if self.media_playing():
+                        return                       # media still on → stay watch
+                except Exception:
+                    pass
             if m != self._mode:
                 prev, mode, reason = self._mode, m, r
                 self._mode = m
@@ -322,8 +389,12 @@ class ModeManager:
             self._fire(mode, reason, prev)
 
     def _loop(self) -> None:
-        # Small initial delay so the app is fully up
-        self._stop.wait(8)
+        # Wait a good while before the first auto-classification. At launch the
+        # frontmost non-JARVIS window is usually the Terminal you ran start.sh
+        # from — classifying that as "work" the instant the greeting ends is
+        # jarring and confusing. Give yourself time to move to what you actually
+        # want to do first.
+        self._stop.wait(25)
         while not self._stop.is_set():
             try:
                 self._poll_once()
@@ -336,8 +407,9 @@ _singleton: Optional[ModeManager] = None
 
 
 def get_manager(on_mode_change: Callable[[str, str], None] = None,
-                poll_sec: float = 30.0) -> ModeManager:
+                poll_sec: float = 30.0,
+                media_playing: Optional[Callable[[], bool]] = None) -> ModeManager:
     global _singleton
     if _singleton is None and on_mode_change is not None:
-        _singleton = ModeManager(on_mode_change, poll_sec)
+        _singleton = ModeManager(on_mode_change, poll_sec, media_playing)
     return _singleton

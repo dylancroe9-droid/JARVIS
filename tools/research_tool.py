@@ -114,11 +114,17 @@ CURATED = {
 
 
 def _match_subject(subject: str) -> Optional[list]:
-    """Find curated resources for a subject using fuzzy keyword matching."""
+    """Find curated resources for a subject using WHOLE-WORD keyword matching.
+
+    Word boundaries matter: a raw substring test let the 2-char token 'ap'
+    (from 'ap gov') match inside 'grape', 'chapter', 'maps', 'therapy' — so
+    'grape farming' opened AP Government resources. \\b fixes that.
+    """
+    import re
     sl = subject.lower()
     for key, resources in CURATED.items():
         keywords = key.split()
-        if any(kw in sl for kw in keywords):
+        if any(re.search(r"\b" + re.escape(kw) + r"\b", sl) for kw in keywords):
             return resources
     return None
 

@@ -20,6 +20,8 @@ import tools.mode_manager as mm
 
 def _patch_front(monkeypatch, app, title):
     monkeypatch.setattr(mm, "_frontmost", lambda: (app, title))
+    # Stub the browser-URL AppleScript so tests never shell out to osascript.
+    monkeypatch.setattr(mm, "_browser_url_title", lambda a: "")
 
 
 def test_classify_youtube_in_browser_is_watch(monkeypatch):
@@ -96,6 +98,29 @@ def test_own_hud_never_classifies(monkeypatch):
     assert mm.classify_screen()[0] == "normal"
 
 
+def test_browser_url_enrichment_detects_peacock(monkeypatch):
+    # The real bug: CGWindowList gives Chrome an EMPTY title, so Peacock read as
+    # "normal". With the active-tab URL folded in, peacocktv.com → watch.
+    monkeypatch.setattr(mm, "_frontmost", lambda: ("Google Chrome", ""))
+    monkeypatch.setattr(mm, "_browser_url_title",
+                        lambda a: "https://www.peacocktv.com/watch/home The Office | Peacock")
+    assert mm.classify_screen()[0] == "watch"
+
+
+def test_browser_url_enrichment_detects_github_as_work(monkeypatch):
+    monkeypatch.setattr(mm, "_frontmost", lambda: ("Google Chrome", ""))
+    monkeypatch.setattr(mm, "_browser_url_title",
+                        lambda a: "https://github.com/dylanroe/JARVIS dylanroe/JARVIS")
+    assert mm.classify_screen()[0] == "work"
+
+
+def test_browser_empty_url_falls_back_to_normal(monkeypatch):
+    # AppleScript failed (returns "") and CGWindow title empty → normal, no crash.
+    monkeypatch.setattr(mm, "_frontmost", lambda: ("Google Chrome", ""))
+    monkeypatch.setattr(mm, "_browser_url_title", lambda a: "")
+    assert mm.classify_screen()[0] == "normal"
+
+
 def test_classify_pure_function_is_side_effect_free():
     # classify() must not touch the system — same inputs, same output.
     assert mm.classify("Steam", "") == mm.classify("Steam", "")
@@ -133,6 +158,8 @@ def _mk_manager():
 def _front(monkeypatch, app, title=""):
     """Point both _frontmost() and classify_screen() at a fixed window."""
     monkeypatch.setattr(mm, "_frontmost", lambda: (app, title))
+    # Stub the browser-URL AppleScript so tests never shell out to osascript.
+    monkeypatch.setattr(mm, "_browser_url_title", lambda a: "")
 
 
 def test_force_fires_callback():
@@ -259,6 +286,40 @@ def test_autodetected_watch_is_not_sticky(monkeypatch):
     _front(monkeypatch, "Finder", "Downloads")
     mgr._poll_once()
     assert mgr.mode == "normal"
+
+
+def test_watch_persists_while_media_playing(monkeypatch):
+    # Tabbing from Peacock to another app must NOT drop watch mode while the
+    # video is still playing (the annoying "went back to desktop" bug).
+    playing = {"on": True}
+    events = []
+    mgr = mm.ModeManager(on_mode_change=lambda m, r: events.append((m, r)),
+                         poll_sec=999, media_playing=lambda: playing["on"])
+    _front(monkeypatch, "Safari", "Netflix")
+    mgr._poll_once()
+    assert mgr.mode == "watch"
+    events.clear()
+    # Tab to a normal app while media still playing → stay watch, no switch.
+    _front(monkeypatch, "Finder", "Downloads")
+    mgr._poll_once()
+    assert mgr.mode == "watch"
+    assert events == []
+    # Media stops → next poll releases watch.
+    playing["on"] = False
+    mgr._poll_once()
+    assert mgr.mode == "normal"
+
+
+def test_watch_still_switches_to_gaming_over_media(monkeypatch):
+    # Media playing shouldn't trap watch forever — a real game still wins.
+    mgr = mm.ModeManager(on_mode_change=lambda m, r: None, poll_sec=999,
+                         media_playing=lambda: True)
+    _front(monkeypatch, "Safari", "Netflix")
+    mgr._poll_once()
+    assert mgr.mode == "watch"
+    _front(monkeypatch, "Steam", "")
+    mgr._poll_once()
+    assert mgr.mode == "gaming"   # explicit gaming context overrides
 
 
 def test_work_tracks_screen(monkeypatch):

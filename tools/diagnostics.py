@@ -144,24 +144,36 @@ def _probe_whisper() -> bool:
         return False
 
 
-def _probe_mic_perm() -> bool:
+def _server_mod():
     """
-    Mic accessible. Renderer doesn't explicitly report mic permission, so we
-    infer it from the audio engine: if the AudioEngine instance is alive and
-    has been receiving frames, mic access is working.
+    The RUNNING server module. Launched via `python server.py`, that's
+    __main__ — NOT the "server" entry in sys.modules. An `import server`
+    elsewhere creates a SECOND, un-started copy whose globals (audio,
+    _system_status, _clients) are all at their initial empty values. Reading
+    THAT copy is what made the mic + camera probes report false failures while
+    the mic/camera were actually working. Prefer the module really running.
     """
     import sys
-    srv = sys.modules.get("server")
+    main = sys.modules.get("__main__")
+    if main is not None and str(getattr(main, "__file__", "")).endswith("server.py"):
+        return main
+    return sys.modules.get("server")
+
+
+def _probe_mic_perm() -> bool:
+    """
+    Mic accessible. Inferred from the audio engine: `audio.ready` goes True once
+    the input stream is created, which requires mic permission. (The old check
+    looked for a non-existent `is_running` attribute AND read the wrong module
+    copy — so it reported the mic as failed while it was working fine.)
+    """
+    srv = _server_mod()
     if not srv:
         return False
     audio = getattr(srv, "audio", None)
     if audio is None:
         return False
-    # AudioEngine creates an internal stream when started; failed mic access
-    # means the engine never enters the running state.
-    if hasattr(audio, "is_running"):
-        return bool(audio.is_running)
-    return True   # engine present, assume OK
+    return bool(getattr(audio, "ready", True))
 
 
 def _probe_camera_perm() -> bool:
@@ -170,8 +182,7 @@ def _probe_camera_perm() -> bool:
     camera is actively streaming, so we also accept `gesture: true` (which
     requires camera) as proof permission is granted.
     """
-    import sys
-    srv = sys.modules.get("server")
+    srv = _server_mod()
     if not srv:
         return False
     status = getattr(srv, "_system_status", {})
@@ -266,8 +277,7 @@ def _probe_mail_app() -> bool:
 
 def _probe_websocket_clients() -> bool:
     """Renderer is connected if there's at least one WS subscriber."""
-    import sys
-    srv = sys.modules.get("server")
+    srv = _server_mod()
     if not srv:
         return False
     clients = getattr(srv, "_clients", None)
