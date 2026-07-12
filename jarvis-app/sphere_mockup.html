@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>JARVIS — Sphere HUD Mockup</title>
+<style>
+  :root {
+    --cyan: #00d4ff;
+    --cyan-dim: rgba(0, 212, 255, 0.55);
+    --cyan-glow: rgba(0, 212, 255, 0.14);
+    --green: #2effb6;
+    --amber: #ffba3a;
+    --red: #ff4d65;
+    --bg: #02060a;
+    --panel-bg: rgba(0, 12, 20, 0.7);
+    --panel-border: rgba(0, 212, 255, 0.35);
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; width: 100%; overflow: hidden; background: var(--bg); color: var(--cyan); font-family: -apple-system, "SF Pro Display", "Helvetica Neue", sans-serif; }
+  body {
+    background:
+      radial-gradient(ellipse at center, #021b29 0%, #000204 75%) no-repeat,
+      #000204;
+  }
+
+  /* Canvas (the sphere) */
+  #scene { position: absolute; inset: 0; }
+
+  /* Frame brackets in each corner */
+  .frame {
+    position: absolute; pointer-events: none; width: 60px; height: 60px;
+    border: 1px solid var(--cyan-dim);
+  }
+  .frame.tl { top: 24px; left: 24px; border-right: 0; border-bottom: 0; }
+  .frame.tr { top: 24px; right: 24px; border-left: 0; border-bottom: 0; }
+  .frame.bl { bottom: 24px; left: 24px; border-right: 0; border-top: 0; }
+  .frame.br { bottom: 24px; right: 24px; border-left: 0; border-top: 0; }
+
+  /* Header */
+  #hud-top {
+    position: absolute; top: 36px; left: 50%; transform: translateX(-50%);
+    text-align: center; letter-spacing: 8px; font-size: 13px;
+    color: var(--cyan); text-shadow: 0 0 10px var(--cyan);
+  }
+  #hud-top .sub {
+    margin-top: 6px; letter-spacing: 4px; font-size: 10px; opacity: 0.7;
+  }
+  .pill {
+    display: inline-block; padding: 1px 8px; border: 1px solid var(--cyan-dim);
+    border-radius: 999px; margin: 0 4px; opacity: 0.8;
+  }
+
+  /* Threat banner */
+  #threat-banner {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -150%);
+    padding: 8px 26px; border: 1px solid var(--green);
+    background: rgba(0, 50, 30, 0.4);
+    color: var(--green); letter-spacing: 4px; font-size: 13px;
+    text-shadow: 0 0 12px var(--green);
+    box-shadow: 0 0 30px rgba(46, 255, 182, 0.35), inset 0 0 22px rgba(46, 255, 182, 0.15);
+    opacity: 0; transition: opacity 0.6s ease;
+  }
+  #threat-banner.show { opacity: 1; }
+
+  /* Console panel — hidden by default, appears only on threat */
+  #console {
+    position: absolute; bottom: 36px; right: 36px;
+    width: 460px; height: 240px;
+    background: var(--panel-bg); border: 1px solid var(--green);
+    color: #80f0c8; font-family: "SF Mono", Menlo, monospace; font-size: 11px; line-height: 1.55;
+    overflow: hidden; padding: 12px 14px;
+    box-shadow: 0 0 50px rgba(46, 255, 182, 0.35) inset, 0 0 40px rgba(46, 255, 182, 0.18);
+    opacity: 0; transform: translateY(20px);
+    transition: opacity 0.5s ease, transform 0.5s ease;
+    pointer-events: none;
+  }
+  #console.active { opacity: 1; transform: translateY(0); }
+  #console .head {
+    color: var(--cyan); font-family: -apple-system, sans-serif; font-size: 10px;
+    letter-spacing: 3px; padding-bottom: 6px; margin-bottom: 8px;
+    border-bottom: 1px solid rgba(0, 212, 255, 0.25);
+  }
+  #console-log { white-space: pre-wrap; }
+  #console-log .cmd { color: var(--cyan); }
+  #console-log .ok  { color: var(--green); }
+  #console-log .warn { color: var(--amber); }
+  #console-log .err { color: var(--red); }
+
+  /* Side stats panel */
+  #stats {
+    position: absolute; bottom: 36px; left: 36px;
+    width: 220px; padding: 12px 14px;
+    background: var(--panel-bg); border: 1px solid var(--panel-border);
+    font-family: "SF Mono", Menlo, monospace; font-size: 10px;
+    color: #b0e7ff; line-height: 1.65;
+  }
+  #stats .head {
+    color: var(--cyan); letter-spacing: 3px; padding-bottom: 6px; margin-bottom: 6px;
+    border-bottom: 1px solid rgba(0, 212, 255, 0.25);
+    font-family: -apple-system, sans-serif;
+  }
+  #stats .row { display: flex; justify-content: space-between; }
+  #stats .bar {
+    height: 3px; margin: 3px 0 6px; background: rgba(0, 212, 255, 0.15);
+    position: relative; overflow: hidden;
+  }
+  #stats .bar > i {
+    position: absolute; inset: 0 auto 0 0; width: 60%;
+    background: linear-gradient(90deg, var(--cyan) 0%, transparent 100%);
+    box-shadow: 0 0 8px var(--cyan);
+  }
+
+  /* Status label below the sphere */
+  #core-label {
+    position: absolute; top: 50%; left: 50%;
+    transform: translate(-50%, 280px);
+    text-align: center; letter-spacing: 6px; font-size: 11px; opacity: 0.7;
+  }
+
+  /* Ring around the sphere (just decorative) */
+  .ring {
+    position: absolute; top: 50%; left: 50%;
+    border: 1px solid rgba(0, 212, 255, 0.18);
+    border-radius: 50%; pointer-events: none;
+    transition: border-color 0.6s ease;
+  }
+  .ring.r1 { width: 640px; height: 640px; transform: translate(-50%, -50%); }
+  .ring.r2 { width: 760px; height: 760px; transform: translate(-50%, -50%); border-style: dashed; }
+  body.threat .ring { border-color: rgba(46, 255, 182, 0.35); }
+
+  /* Demo trigger button (top-right, subtle) — for previewing threat mode */
+  #demo-btn {
+    position: absolute; top: 36px; right: 100px;
+    padding: 6px 12px; background: transparent;
+    border: 1px solid var(--cyan-dim); color: var(--cyan);
+    font-family: -apple-system, sans-serif; font-size: 10px; letter-spacing: 2px;
+    cursor: pointer; transition: all 0.2s ease;
+  }
+  #demo-btn:hover { background: rgba(0, 212, 255, 0.1); border-color: var(--cyan); }
+  body.threat #demo-btn { border-color: var(--green); color: var(--green); }
+
+  /* Subtle "scanning" indicator that's always there in idle mode */
+  #status-line {
+    position: absolute; top: 50%; left: 50%;
+    transform: translate(-50%, 240px);
+    text-align: center; letter-spacing: 6px; font-size: 11px; opacity: 0.5;
+    color: var(--cyan);
+  }
+  body.threat #status-line { color: var(--green); opacity: 0.9; }
+</style>
+</head>
+<body>
+  <canvas id="scene"></canvas>
+
+  <div class="frame tl"></div>
+  <div class="frame tr"></div>
+  <div class="frame bl"></div>
+  <div class="frame br"></div>
+  <div class="ring r1"></div>
+  <div class="ring r2"></div>
+
+  <div id="hud-top">
+    J . A . R . V . I . S
+    <div class="sub">
+      <span class="pill">NEURAL OPERATING SYSTEM</span>
+      <span class="pill">v4.1</span>
+      <span class="pill" id="clock">--:--:--</span>
+      <span class="pill" style="color: var(--green); border-color: var(--green);">ONLINE</span>
+    </div>
+  </div>
+
+  <div id="status-line">STANDING BY</div>
+
+  <div id="stats">
+    <div class="head">SYSTEM</div>
+    <div class="row"><span>CPU</span><span id="cpu">24%</span></div>
+    <div class="bar"><i style="width:24%"></i></div>
+    <div class="row"><span>MEM</span><span id="mem">61%</span></div>
+    <div class="bar"><i style="width:61%"></i></div>
+    <div class="row"><span>GPU</span><span id="gpu">38%</span></div>
+    <div class="bar"><i style="width:38%"></i></div>
+    <div class="row"><span>NETWORK</span><span style="color:var(--green)">SECURE</span></div>
+    <div class="row"><span>FIREWALL</span><span style="color:var(--green)">ACTIVE</span></div>
+  </div>
+
+  <div id="console">
+    <div class="head">▼ DEFENSE CONSOLE — SECURED</div>
+    <div id="console-log"></div>
+  </div>
+
+<script>
+// ─── Particle sphere ────────────────────────────────────────────────────────
+const canvas = document.getElementById('scene');
+const ctx    = canvas.getContext('2d', { alpha: true });
+let W = 0, H = 0, cx = 0, cy = 0;
+function resize() {
+  W = canvas.width  = window.innerWidth  * devicePixelRatio;
+  H = canvas.height = window.innerHeight * devicePixelRatio;
+  canvas.style.width  = window.innerWidth + 'px';
+  canvas.style.height = window.innerHeight + 'px';
+  cx = W / 2; cy = H / 2;
+}
+window.addEventListener('resize', resize);
+resize();
+
+const N = 4200;
+const R = Math.min(W, H) * 0.18;  // sphere radius
+
+// Uniform points on a sphere via Fibonacci spiral
+const pts = [];
+for (let i = 0; i < N; i++) {
+  const k = (i + 0.5) / N;
+  const phi = Math.acos(1 - 2 * k);
+  const theta = Math.PI * (1 + Math.sqrt(5)) * (i + 0.5);
+  pts.push({
+    x: Math.sin(phi) * Math.cos(theta),
+    y: Math.sin(phi) * Math.sin(theta),
+    z: Math.cos(phi),
+    j: Math.random() * 0.06 + 0.01,  // jitter amount
+  });
+}
+
+let t0 = performance.now();
+function frame(now) {
+  const t = (now - t0) / 1000;
+  ctx.clearRect(0, 0, W, H);
+
+  // Soft glow background ring around center
+  const grd = ctx.createRadialGradient(cx, cy, R * 0.4, cx, cy, R * 1.8);
+  grd.addColorStop(0, 'rgba(0, 212, 255, 0.14)');
+  grd.addColorStop(1, 'rgba(0, 0, 0, 0)');
+  ctx.fillStyle = grd;
+  ctx.fillRect(0, 0, W, H);
+
+  // Rotation matrices (Y + slight X tilt)
+  const ay = t * 0.45;        // around Y
+  const ax = Math.sin(t * 0.3) * 0.2 + 0.15;
+  const sy = Math.sin(ay), cy_ = Math.cos(ay);
+  const sx = Math.sin(ax), cx_ = Math.cos(ax);
+
+  ctx.fillStyle = 'rgba(180,240,255,0.9)';
+  for (let i = 0; i < N; i++) {
+    const p = pts[i];
+
+    // Living jitter — particles breathe outward
+    const breathe = 1 + Math.sin(t * 1.3 + i) * p.j;
+
+    // Rotate around Y
+    let x = p.x * cy_ + p.z * sy;
+    let z = -p.x * sy + p.z * cy_;
+    let y = p.y;
+
+    // Tilt on X
+    const y2 = y * cx_ - z * sx;
+    const z2 = y * sx + z * cx_;
+
+    // Perspective-ish: just dim the back hemisphere
+    const depth = (z2 + 1) / 2;   // 0 (back) … 1 (front)
+    const size = (0.6 + depth * 2.2) * devicePixelRatio;
+    const alpha = 0.15 + depth * 0.85;
+
+    // Cyan→white front, dim back
+    const cyanMix = 0.4 + depth * 0.6;
+    const r = Math.round(80 + 175 * (1 - cyanMix));
+    const g = Math.round(220 + 35 * (1 - cyanMix));
+    const b = 255;
+
+    const sx_ = cx + x * R * breathe;
+    const sy_ = cy + y2 * R * breathe;
+
+    ctx.fillStyle = `rgba(${r},${g},${b},${alpha.toFixed(3)})`;
+    ctx.beginPath();
+    ctx.arc(sx_, sy_, size, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ─── Threat response sequence ───────────────────────────────────────────────
+// Plays only when an actual threat is detected. Console pops in,
+// commands stream in real-time, threat banner fires, then it all clears
+// out and we go back to idle. Mimics the rhythm of the Manina Labs videos.
+const logEl    = document.getElementById('console-log');
+const consoleEl = document.getElementById('console');
+const banner   = document.getElementById('threat-banner');
+const statusEl = document.getElementById('status-line');
+const btnEl    = document.getElementById('demo-btn');
+
+const THREAT_SEQUENCE = [
+  { delay: 0,    cls: 'warn', txt: '!! INTRUSION DETECTED — 192.0.2.77' },
+  { delay: 600,  cls: 'cmd',  txt: 'JARVIS> Get-NetTCPConnection -RemoteAddress 192.0.2.77' },
+  { delay: 1100, cls: 'ok',   txt: '>> 3 active connections — flagged hostile.' },
+  { delay: 1700, cls: 'cmd',  txt: 'JARVIS> New-NetFirewallRule -RemoteAddress 192.0.2.77 -Action Block' },
+  { delay: 2300, cls: 'ok',   txt: '>> 192.0.2.77 severed — inbound + outbound.' },
+  { delay: 2800, cls: 'cmd',  txt: 'JARVIS> Stop-Process -Id 6516 -Force' },
+  { delay: 3300, cls: 'ok',   txt: '>> hostile process terminated.' },
+  { delay: 3800, cls: 'warn', txt: '-- FULL LOCKDOWN --' },
+  { delay: 4400, cls: 'cmd',  txt: 'JARVIS> Get-ScheduledTask | Find-Persistence' },
+  { delay: 5000, cls: 'ok',   txt: '>> no persistence mechanisms survived. clean.' },
+  { delay: 5500, cls: 'cmd',  txt: 'JARVIS> Disable-LocalUser intruder' },
+  { delay: 6000, cls: 'ok',   txt: '>> rogue account disabled. sessions logged off.' },
+  { delay: 6600, cls: 'ok',   txt: '>> ALL SYSTEMS NOMINAL.' },
+];
+
+let threatActive = false;
+function simulateThreat() {
+  if (threatActive) return;
+  threatActive = true;
+  document.body.classList.add('threat');
+  statusEl.textContent = 'RESPONDING TO INTRUSION';
+  btnEl.textContent = 'RESPONDING…';
+  btnEl.disabled = true;
+  logEl.innerHTML = '';
+  consoleEl.classList.add('active');
+  let buffer = [];
+  for (const ev of THREAT_SEQUENCE) {
+    setTimeout(() => {
+      buffer.push(`<span class="${ev.cls}">${ev.txt}</span>`);
+      if (buffer.length > 12) buffer.shift();
+      logEl.innerHTML = buffer.join('\n');
+    }, ev.delay);
+  }
+  // Flash the threat banner after the lockdown line
+  setTimeout(() => {
+    banner.classList.add('show');
+    setTimeout(() => banner.classList.remove('show'), 3000);
+  }, 6400);
+  // Clear out and return to idle
+  setTimeout(() => {
+    consoleEl.classList.remove('active');
+    document.body.classList.remove('threat');
+    statusEl.textContent = 'STANDING BY';
+    btnEl.textContent = 'SIMULATE THREAT';
+    btnEl.disabled = false;
+    threatActive = false;
+  }, 11000);
+}
+window.simulateThreat = simulateThreat;
+
+// ─── Clock ──────────────────────────────────────────────────────────────────
+function tick() {
+  const d = new Date();
+  const pad = n => String(n).padStart(2, '0');
+  document.getElementById('clock').textContent =
+    `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+setInterval(tick, 1000); tick();
+
+// ─── Live stats jiggle (just for the look) ──────────────────────────────────
+setInterval(() => {
+  const cpu = 18 + Math.floor(Math.random() * 14);
+  const mem = 55 + Math.floor(Math.random() * 10);
+  const gpu = 30 + Math.floor(Math.random() * 18);
+  document.getElementById('cpu').textContent = cpu + '%';
+  document.getElementById('mem').textContent = mem + '%';
+  document.getElementById('gpu').textContent = gpu + '%';
+  document.querySelectorAll('#stats .bar > i')[0].style.width = cpu + '%';
+  document.querySelectorAll('#stats .bar > i')[1].style.width = mem + '%';
+  document.querySelectorAll('#stats .bar > i')[2].style.width = gpu + '%';
+}, 1800);
+</script>
+</body>
+</html>

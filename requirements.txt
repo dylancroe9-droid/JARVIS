@@ -12,6 +12,8 @@ openai-whisper>=20231117
 
 # macOS system integration
 pyobjc-framework-Cocoa>=9.0
+pyobjc-framework-Vision>=10.0    # Apple Vision OCR for screen watcher
+pyobjc-framework-Quartz>=10.0    # Synthetic mouse events for auto-skip / auto-dismiss
 
 # Voice — TTS (priority order: ElevenLabs → edge-tts → macOS say)
 elevenlabs>=1.0.0

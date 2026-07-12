@@ -7,6 +7,7 @@ Fallback: Groq              — when only GROQ_API_KEY is available
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections import deque
 from typing import Generator
@@ -48,6 +49,51 @@ _MUSIC_SKIP_WORDS  = frozenset({"skip", "next song", "next track", "skip this",
 _MUSIC_PREV_WORDS  = frozenset({"previous song", "previous track", "last song",
                                  "last track", "last one", "go back", "previous"})
 _MUSIC_WORDS = _MUSIC_PLAY_WORDS | _MUSIC_PAUSE_WORDS | _MUSIC_SKIP_WORDS | _MUSIC_PREV_WORDS
+
+
+# Tools the tiny 8b fallback tends to fire spuriously on garbled/ambiguous
+# input (e.g. take_screenshot on "run a-", open_application on "system search").
+# Each requires at least one matching keyword in the user's actual words, or
+# the call is treated as a hallucination and dropped.
+_SURPRISING_TOOL_KEYWORDS = {
+    "open_application": ("open", "launch", "start", "fire up", "pull up",
+                         "go to", "bring up"),
+    "take_screenshot":  ("screenshot", "screen", "look at", "what's on",
+                         "whats on", "see my", "capture", "what do you see"),
+    "read_camera":      ("camera", "look at this", "what am i holding",
+                         "what is this", "see this", "hold"),
+}
+
+
+def _tool_call_plausible(name: str, user_text: str) -> bool:
+    """
+    True if a tool call is plausible given the user's words. Only gates the
+    'surprising' tools above — everything else is always allowed. Prevents the
+    8b fallback from firing a screenshot / app-launch on input that never
+    asked for one.
+    """
+    kws = _SURPRISING_TOOL_KEYWORDS.get(name)
+    if not kws:
+        return True
+    low = (user_text or "").lower()
+    return any(k in low for k in kws)
+
+
+def _has_music_word(text: str, words) -> bool:
+    """
+    Match music keywords against text:
+      - Single-word entries match on word boundary ("skip" ≠ "skipping")
+      - Multi-word phrases match as substring ("next song" → in text)
+    Prevents disasters like 'skipping ads' triggering next_track.
+    """
+    import re
+    for w in words:
+        if " " in w:
+            if w in text:
+                return True
+        elif re.search(r"\b" + re.escape(w) + r"\b", text):
+            return True
+    return False
 
 # Overlay trigger phrases — force show_overlay tool when detected.
 # Phrase match: ANY of these substrings in the user message → force overlay.
@@ -228,6 +274,7 @@ _TOOL_ACKS: dict[str, str | None] = {
     "web_search":             "Let me look that up.",
     "web_search_results":     "Searching now.",
     "get_calendar_events":    "Checking your calendar.",
+    "read_calendar_visually":  "Pulling up your calendar.",
     "create_calendar_event":  "Adding that to your schedule.",
     "get_unread_emails":      "Checking your inbox.",
     "get_recent_emails":      "Pulling up your emails.",
@@ -399,18 +446,30 @@ _BAD_REQUEST_MSG = (
 )
 
 _FALLBACK_MODELS = [
-    # llama-4-scout removed — it outputs words without spaces (tokenizer bug)
-    "llama3-groq-8b-8192-tool-use-preview",
+    # llama-4-scout removed — outputs words without spaces (tokenizer bug)
+    # llama3-groq-8b-8192-tool-use-preview removed — DECOMMISSIONED 2025
     "llama-3.1-8b-instant",
 ]
 
 
 class Jarvis:
+    # Conversation history is persisted here so JARVIS remembers across restarts.
+    # Cap stored history at 200 messages; in-memory cap stays at 40 (last 40
+    # are sent to the LLM for context).
+    HISTORY_PATH = os.path.join(os.path.expanduser("~"), ".jarvis_history.json")
+    HISTORY_MAX  = 200
+
     def __init__(self) -> None:
-        self._executor = None
+        # Eager construction — lazy init was racy (two threads could each
+        # create a ToolsExecutor instance, doubling tool-call accounting).
+        # The executor is cheap; build it up front.
+        from brain._executor import ToolsExecutor
+        self._executor = ToolsExecutor()
         self.messages: list[dict] = []
         self._recent_replies: deque = deque(maxlen=5)
         self._last_blueprint_subject: str = ""  # context for follow-up requests like "pull it up"
+        # Load saved conversation from previous sessions
+        self._load_history()
 
         # ── Local Ollama brain (runs on YOUR hardware) ────────────────────────
         self._local: "OpenAI | None" = None
@@ -422,9 +481,9 @@ class Jarvis:
                 self._local = _OAI(base_url=f"{OLLAMA_URL}/v1", api_key="ollama")
                 console.print(f"[green]Local brain: Ollama {OLLAMA_MODEL} ✓[/green]")
             else:
-                console.print(f"[dim]Ollama not running — using cloud only[/dim]")
+                console.print("[dim]Ollama not running — using cloud only[/dim]")
         except Exception:
-            console.print(f"[dim]Ollama not found — using cloud only[/dim]")
+            console.print("[dim]Ollama not found — using cloud only[/dim]")
 
         # ── Primary: Claude ────────────────────────────────────────────────────
         if _USE_CLAUDE:
@@ -451,9 +510,7 @@ class Jarvis:
 
     @property
     def tools_executor(self):
-        if self._executor is None:
-            from brain._executor import ToolsExecutor
-            self._executor = ToolsExecutor()
+        # Built eagerly in __init__ to avoid a TOCTOU on lazy init.
         return self._executor
 
     # ── Public API ─────────────────────────────────────────────────────────────
@@ -466,6 +523,11 @@ class Jarvis:
             r'^\[(?:WORK MODE|GAMING MODE)[^\]]*\]\s*(?:Use this[^.]*\.)?\s*(?:User said:\s*)?',
             '', user_input
         ).strip() or user_input
+        # Reset the per-turn self-inspect counter — see _executor.py for cap logic
+        try:
+            self.tools_executor.reset_self_inspect_counter()
+        except AttributeError:
+            pass
         self.messages.append({"role": "user", "content": _clean_input})
         if len(self.messages) > 40:   # tighter cap — 60 was too many with tool results
             self.messages = self.messages[-40:]
@@ -488,6 +550,61 @@ class Jarvis:
 
     def reset(self) -> None:
         self.messages.clear()
+        # Clear persisted history too — fresh start
+        try:
+            if os.path.exists(self.HISTORY_PATH):
+                os.unlink(self.HISTORY_PATH)
+        except Exception:
+            pass
+
+    def _load_history(self) -> None:
+        """Restore conversation messages from disk on startup."""
+        try:
+            if not os.path.exists(self.HISTORY_PATH):
+                return
+            import json as _json
+            with open(self.HISTORY_PATH, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+            if isinstance(data, list):
+                # Only keep messages whose content is a plain string — skip
+                # any old tool-use/result blocks that may have stale references.
+                cleaned = []
+                for m in data[-self.HISTORY_MAX:]:
+                    if not isinstance(m, dict):
+                        continue
+                    if m.get("role") not in ("user", "assistant"):
+                        continue
+                    if not isinstance(m.get("content"), str):
+                        continue
+                    cleaned.append(m)
+                # Trim to recent in-memory cap for active context
+                self.messages = cleaned[-40:]
+                if cleaned:
+                    console.print(
+                        f"[dim]Conversation memory: loaded {len(cleaned)} prior messages ({len(self.messages)} active in context)[/dim]"
+                    )
+        except Exception as exc:
+            console.print(f"[dim]Could not load history: {exc}[/dim]")
+
+    def _save_history(self) -> None:
+        """Persist conversation messages to disk. Called after each turn."""
+        try:
+            import json as _json
+            # Only persist plain text messages — tool-result blocks reference
+            # mid-turn state that won't make sense after restart.
+            persistable = [
+                m for m in self.messages
+                if isinstance(m, dict) and isinstance(m.get("content"), str)
+                and m.get("role") in ("user", "assistant")
+            ]
+            # Cap at HISTORY_MAX to avoid file bloat
+            persistable = persistable[-self.HISTORY_MAX:]
+            tmp = self.HISTORY_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                _json.dump(persistable, f, ensure_ascii=False)
+            os.replace(tmp, self.HISTORY_PATH)
+        except Exception:
+            pass
 
     def _get_recent_replies_note(self) -> str:
         if not self._recent_replies:
@@ -526,7 +643,7 @@ class Jarvis:
         # CRITICAL: only inject real calendar data. Never invent events from memory.
         try:
             from tools.calendar_tool import get_calendar_events
-            cal = get_calendar_events(days=1)
+            cal = get_calendar_events(days=7)
             if cal and "nothing" not in cal.lower() and "unavailable" not in cal.lower():
                 notes.append(
                     f"TODAY'S REAL CALENDAR DATA (from device): {cal[:400]}\n"
@@ -960,6 +1077,8 @@ class Jarvis:
 
     def _append_assistant_text(self, text: str) -> None:
         self.messages.append({"role": "assistant", "content": text})
+        # Persist conversation after each assistant turn so we survive restarts.
+        self._save_history()
 
     # ── Groq path (original — preserved as fallback) ───────────────────────────
 
@@ -1010,6 +1129,19 @@ class Jarvis:
         show_overlay with 20+ spec items.  The model doesn't need to re-read the
         full item list; knowing the call was made is enough.
         """
+        # Drop leading ORPHAN tool messages. A tail slice (self.messages[-N:])
+        # can begin partway through a tool exchange — on a role:"tool" message
+        # whose parent assistant(tool_calls) fell just outside the window. Groq
+        # then 400s ("tool message must be preceded by the assistant tool_calls
+        # message"), which _stream_with_tools mislabels as "API access
+        # restricted" and drops the user's turn. Trimming leading tool messages
+        # makes any window start on a valid boundary (user / system / an
+        # assistant whose tool_calls ARE followed by their results in-window).
+        start = 0
+        while start < len(msgs) and msgs[start].get("role") == "tool":
+            start += 1
+        msgs = msgs[start:]
+
         _TC_ARG_LIMIT = 120  # characters to keep from tool_call arguments
         out = []
         for m in msgs:
@@ -1080,8 +1212,16 @@ class Jarvis:
         _is_study_gen = _last_msg_lower.startswith("[study]")
 
         if emergency:
-            # Absolute minimum — just the current user turn.  Avoids any 413.
-            system, history, max_tok = get_fast_prompt(), self._slim_history(self.messages[-2:]), 256
+            # Absolute minimum — Groq 8b free tier is 6000 TPM. The fast prompt
+            # is ~2400 tokens; with tools + history we exceeded 6k on a 'project
+            # iron' turn. Hard-code a TINY system prompt for emergency retries.
+            system  = (
+                "You are JARVIS, Dylan's AI. Helpful, capable, calm authority. "
+                "British style. Short replies. Say 'sir' occasionally. "
+                "Never invent capabilities or facts. If unsure, say so."
+            )
+            history = self._slim_history(self.messages[-2:], max_chars=120)
+            max_tok = 256
         elif is_primary:
             # Use the condensed prompt for Groq — the full prompt is ~3000 tokens
             # and burns through the free-tier token-per-minute quota before the
@@ -1104,20 +1244,32 @@ class Jarvis:
         if note:
             all_messages[0]["content"] += note
 
+        # Temperature 0.9 — higher than the default 0.7 to push variety in
+        # conversational/humor responses. 0.7 was producing same-y replies to
+        # the same prompts across sessions; 0.9 keeps the model on-voice while
+        # giving it room to riff differently each time.
         kwargs = dict(
             model=model,
             messages=all_messages,
             stream=True,
             max_tokens=max_tok,
-            temperature=0.7,
+            temperature=0.9,
         )
         if with_tools:
             if is_primary:
-                kwargs["tools"] = get_openai_tools()
+                # Groq free tier is 6-12k TOKENS-PER-MINUTE. The full 106-tool
+                # schema is ~11k tokens and the fuller core set ~8.5k — a single
+                # such request blows the entire minute's budget, which is what
+                # produced the 47-second "Request too large" cascades. Use the
+                # compact ~17-tool set (~1.5k tokens) so the primary request
+                # fits with room to spare. The long-tail tools are reached
+                # through the hard-coded intercepts (overlays, AR, calendar,
+                # music, deep scan, etc.), not this general path.
+                kwargs["tools"] = get_8b_tools()
             elif is_fast:
                 kwargs["tools"] = get_8b_tools()   # compact set — avoids 413 payload errors
             else:
-                kwargs["tools"] = get_core_tools()  # scout gets the fuller set
+                kwargs["tools"] = get_8b_tools()  # keep every Groq path lean
             last_user = next(
                 (m["content"] for m in reversed(history) if m.get("role") == "user"), ""
             ).lower()
@@ -1256,19 +1408,22 @@ class Jarvis:
                 kwargs["tool_choice"] = {"type": "function",
                                          "function": {"name": "show_overlay"}}
                 kwargs["max_tokens"] = max_tok
-            elif any(w in last_user for w in _MUSIC_PAUSE_WORDS):
+            elif _has_music_word(last_user, _MUSIC_PAUSE_WORDS):
                 kwargs["tool_choice"] = {"type": "function", "function": {"name": "pause_music"}}
-            elif any(w in last_user for w in _MUSIC_SKIP_WORDS):
+            elif _has_music_word(last_user, _MUSIC_SKIP_WORDS):
                 kwargs["tool_choice"] = {"type": "function", "function": {"name": "next_track"}}
-            elif any(w in last_user for w in _MUSIC_PREV_WORDS):
+            elif _has_music_word(last_user, _MUSIC_PREV_WORDS):
                 kwargs["tool_choice"] = {"type": "function", "function": {"name": "previous_track"}}
-            elif any(w in last_user for w in _MUSIC_PLAY_WORDS):
+            elif _has_music_word(last_user, _MUSIC_PLAY_WORDS):
                 kwargs["tool_choice"] = {"type": "function", "function": {"name": "play_music"}}
             elif any(w in last_user for w in {
-                "timer", "set a timer", "set timer", "start a timer", "start timer",
-                "countdown", "count down", "set an alarm", "set alarm",
+                "set a timer", "set timer", "start a timer", "start timer",
+                "timer for", "set a countdown", "set countdown",
+                "countdown for", "set an alarm", "set alarm", "alarm for",
             }):
-                # Force set_timer tool — models prefer run_command otherwise
+                # Force set_timer tool — models prefer run_command otherwise.
+                # Bare "timer" intentionally dropped — Whisper often mis-hears
+                # math expressions ("300 over 38") with words containing "timer".
                 timer_tool = [t for t in get_openai_tools()
                               if t["function"]["name"] == "set_timer"]
                 if timer_tool:
@@ -1439,6 +1594,20 @@ class Jarvis:
                 except json.JSONDecodeError:
                     args = {}
 
+                # A fallback model (8b) is hallucination-prone: drop 'surprising'
+                # tool calls (screenshot / app-launch / camera) whose trigger
+                # words never appeared in what the user said. The primary 70b is
+                # trustworthy, so gate only when we actually fell back — the same
+                # protection _minimal_tool_retry has, which the main loop lacked.
+                if model != GROQ_MODEL and not _tool_call_plausible(name, _last_user):
+                    console.print(f"[yellow]  ⚠ dropped implausible {name}() "
+                                  f"from fallback model[/yellow]")
+                    self.messages.append({
+                        "role": "tool", "tool_call_id": tc["id"],
+                        "content": "(skipped — not what the user asked for)",
+                    })
+                    continue
+
                 console.print(f"[dim]  ⚙  {name}({_summarise(args)})[/dim]")
                 result = self.tools_executor.execute(name, args)
 
@@ -1483,6 +1652,14 @@ class Jarvis:
                             "add_to_playlist", "create_playlist"}:
                 yield from self._plain_stream()
                 break
+        else:
+            # Loop fell through _MAX_TOOL_ROUNDS with no terminal answer — every
+            # round kept calling non-finishing tools (read_file, grep_code, …).
+            # Force a final plain (tool-free) response so the turn isn't silently
+            # dropped AND self.messages doesn't end on a dangling tool message
+            # (which would orphan the next turn's history window). Mirrors what
+            # the Claude tool loop does after its own round budget.
+            yield from self._plain_stream()
 
     def _blueprint_recovery(self, last_user: str) -> Generator[str, None, None]:
         """
@@ -1597,11 +1774,10 @@ class Jarvis:
         ]
 
         from openai import RateLimitError
-        # Try models in order — prefer tool-use-optimised models for recovery
+        # Try models in order. llama3-groq-8b-tool-use-preview and llama-4-scout
+        # both removed — first decommissioned, second has tokenizer bugs.
         _recovery_models = [
             GROQ_MODEL,
-            "llama3-groq-8b-8192-tool-use-preview",  # Groq fine-tuned for tools
-            "meta-llama/llama-4-scout-17b-16e-instruct",
             "llama-3.1-8b-instant",
         ]
         for _rm in _recovery_models:
@@ -1643,23 +1819,26 @@ class Jarvis:
         console.print("[yellow]Blueprint recovery: all models exhausted[/yellow]")
 
     def _minimal_tool_retry(self) -> Generator[str, None, None]:
-        from openai import RateLimitError
         from brain.tools import get_minimal_tools
+        from brain.personality import get_tiny_prompt
         fast_model = "llama-3.1-8b-instant"
-        system = get_fast_prompt()
-        # Use only the last 6 messages — the 8B model has a very tight TPM limit
-        messages = [{"role": "system", "content": system}] + self.messages[-6:]
+        # Tiny prompt (~120 tok) not get_fast_prompt (~3000 tok): the emergency
+        # path must stay under the 8b's 6,000 TPM limit or it 413s and the user
+        # gets nothing. Slim history too.
+        system = get_tiny_prompt()
+        messages = [{"role": "system", "content": system}] + self._slim_history(
+            self.messages[-4:], max_chars=140)
         try:
             last_u = next(
                 (m["content"] for m in reversed(self.messages) if m.get("role") == "user"), ""
             ).lower()
-            if any(w in last_u for w in _MUSIC_PAUSE_WORDS):
+            if _has_music_word(last_u, _MUSIC_PAUSE_WORDS):
                 _forced = {"type": "function", "function": {"name": "pause_music"}}
-            elif any(w in last_u for w in _MUSIC_SKIP_WORDS):
+            elif _has_music_word(last_u, _MUSIC_SKIP_WORDS):
                 _forced = {"type": "function", "function": {"name": "next_track"}}
-            elif any(w in last_u for w in _MUSIC_PREV_WORDS):
+            elif _has_music_word(last_u, _MUSIC_PREV_WORDS):
                 _forced = {"type": "function", "function": {"name": "previous_track"}}
-            elif any(w in last_u for w in _MUSIC_PLAY_WORDS):
+            elif _has_music_word(last_u, _MUSIC_PLAY_WORDS):
                 _forced = {"type": "function", "function": {"name": "play_music"}}
             elif any(w in last_u for w in ("remind me", "set a reminder", "add a reminder", "reminder")):
                 _forced = {"type": "function", "function": {"name": "add_reminder"}}
@@ -1714,12 +1893,29 @@ class Jarvis:
                 "role": "assistant", "content": full_text or None,
                 "tool_calls": tool_calls_formatted,
             })
+            # Last thing the user actually said — used to sanity-check the
+            # fallback model's tool choices.
+            _last_user_text = next(
+                (m["content"] for m in reversed(self.messages)
+                 if m.get("role") == "user" and isinstance(m.get("content"), str)),
+                "",
+            )
             for tc in tool_calls_formatted:
                 name = tc["function"]["name"]
                 try:
                     args = json.loads(tc["function"]["arguments"])
                 except json.JSONDecodeError:
                     args = {}
+                # Drop hallucinated 'surprising' tool calls — the 8b fallback
+                # fires screenshots / app-launches on input that never asked.
+                if not _tool_call_plausible(name, _last_user_text):
+                    console.print(f"[yellow]  ⚠ dropped implausible {name}() — "
+                                  f"no matching keyword in {_last_user_text[:40]!r}[/yellow]")
+                    self.messages.append({
+                        "role": "tool", "tool_call_id": tc["id"],
+                        "content": "(skipped — not what the user asked for)",
+                    })
+                    continue
                 console.print(f"[dim]  ⚙  {name}({_summarise(args)})[/dim]")
                 result = self.tools_executor.execute(name, args)
                 content = str(result) if not isinstance(result, list) else \
@@ -1758,16 +1954,16 @@ class Jarvis:
             last_user = next(
                 (m["content"] for m in reversed(self.messages) if m.get("role") == "user"), ""
             ).lower()
-            if any(w in last_user for w in _MUSIC_PAUSE_WORDS):
+            if _has_music_word(last_user, _MUSIC_PAUSE_WORDS):
                 self.tools_executor.execute("pause_music", {})
                 reply = "Paused."
-            elif any(w in last_user for w in _MUSIC_SKIP_WORDS):
+            elif _has_music_word(last_user, _MUSIC_SKIP_WORDS):
                 self.tools_executor.execute("next_track", {})
                 reply = "Next."
-            elif any(w in last_user for w in _MUSIC_PREV_WORDS):
+            elif _has_music_word(last_user, _MUSIC_PREV_WORDS):
                 self.tools_executor.execute("previous_track", {})
                 reply = "Going back."
-            elif any(w in last_user for w in _MUSIC_PLAY_WORDS):
+            elif _has_music_word(last_user, _MUSIC_PLAY_WORDS):
                 self.tools_executor.execute("play_music", {})
                 reply = "Playing."
             else:

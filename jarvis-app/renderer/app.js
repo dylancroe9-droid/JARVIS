@@ -10,6 +10,12 @@ let sessionStart = Date.now()
 // can safely reference them at boot (avoids Temporal Dead Zone).
 let arOverlay    = null
 let mpReady      = false   // true when MediaPipe Hands is ready
+// Interval handles for the two MediaPipe pollers. Tracked so re-init paths
+// (camera reconnect, deferred retry) can clear the previous interval
+// before installing a new one — otherwise duplicate intervals stack up
+// and we'd run the model N× per tick.
+let _mpHandsInterval = null
+let _mpFaceInterval  = null
 
 // ─── State map ───────────────────────────────────────────────────────────────
 
@@ -242,6 +248,11 @@ $close.addEventListener('click', () => window.jarvis?.close())
 $min.addEventListener('click',   () => window.jarvis?.minimize())
 
 $clear.addEventListener('click', () => {
+  // finishStreaming() clears currentRow AND the stream watchdog. Setting
+  // currentRow=null alone left the watchdog armed, and a late chunk for the
+  // cleared turn would spin up a phantom JARVIS row. Tear the stream down
+  // properly first.
+  finishStreaming()
   Array.from($chat.children).forEach(el => {
     if (el.id !== 'empty-state') el.remove()
   })
@@ -310,6 +321,239 @@ $btnDisplayMode?.addEventListener('click', () =>
 
 // Restore saved mode on load
 if (displayMode === 'desktop') setDisplayMode('desktop')
+
+// ─── HUB VERSION (v2 = sphere-centric — the permanent default) ───────────────
+// v1 (the old chrome-heavy look) is kept in code as a fallback only.
+// If Dylan ever says "I want hub v1 back" we change THIS LINE to 'v1'.
+const HUB_VERSION = 'v2'   // ← change to 'v1' to revert
+
+function setHubVersion (v) {
+  v = (v === 'v2' || v === '2' || v === 'sphere') ? 'v2' : 'v1'
+  document.body.classList.toggle('hub-v2', v === 'v2')
+  if (v === 'v2') startHubV2Sphere()
+  else stopHubV2Sphere()
+}
+window.setHubVersion = setHubVersion
+
+// Particle sphere — runs only when hub v2 is active.
+let _hv2RAF = null
+let _hv2Pts = null
+let _hv2ClockTimer = null
+let _hv2Resize = null   // the resize handler, so stop() can remove it (no leak)
+function _hv2BuildPoints (n) {
+  const pts = []
+  for (let i = 0; i < n; i++) {
+    const k   = (i + 0.5) / n
+    const phi = Math.acos(1 - 2 * k)
+    const th  = Math.PI * (1 + Math.sqrt(5)) * (i + 0.5)
+    pts.push({
+      x: Math.sin(phi) * Math.cos(th),
+      y: Math.sin(phi) * Math.sin(th),
+      z: Math.cos(phi),
+      j: Math.random() * 0.06 + 0.01,
+    })
+  }
+  return pts
+}
+function startHubV2Sphere () {
+  const canvas = document.getElementById('hub-v2-sphere')
+  if (!canvas) return
+  // Already running? Don't stack a second rAF loop / resize listener — a double
+  // setHubVersion('v2') (or v2 sent twice) would otherwise run 2×… loops.
+  if (_hv2RAF) return
+  const ctx = canvas.getContext('2d', { alpha: true })
+  if (!_hv2Pts) _hv2Pts = _hv2BuildPoints(4200)
+  let W = 0, H = 0, cx_ = 0, cy_ = 0, R = 0
+  const dpr = window.devicePixelRatio || 1
+  function size () {
+    W = canvas.width  = window.innerWidth  * dpr
+    H = canvas.height = window.innerHeight * dpr
+    canvas.style.width  = window.innerWidth  + 'px'
+    canvas.style.height = window.innerHeight + 'px'
+    cx_ = W / 2; cy_ = H / 2
+    R = Math.min(W, H) * 0.18
+  }
+  size()
+  _hv2Resize = size
+  window.addEventListener('resize', _hv2Resize)
+  const t0 = performance.now()
+  function frame (now) {
+    if (!document.body.classList.contains('hub-v2')) {
+      _hv2RAF = null; return
+    }
+    const t = (now - t0) / 1000
+    ctx.clearRect(0, 0, W, H)
+    // Soft cyan glow halo
+    const grd = ctx.createRadialGradient(cx_, cy_, R * 0.4, cx_, cy_, R * 1.8)
+    grd.addColorStop(0, 'rgba(0, 212, 255, 0.14)')
+    grd.addColorStop(1, 'rgba(0, 0, 0, 0)')
+    ctx.fillStyle = grd
+    ctx.fillRect(0, 0, W, H)
+    const ay = t * 0.45
+    const ax = Math.sin(t * 0.3) * 0.2 + 0.15
+    const sy = Math.sin(ay), cy__ = Math.cos(ay)
+    const sx = Math.sin(ax), cx__ = Math.cos(ax)
+    const N = _hv2Pts.length
+    for (let i = 0; i < N; i++) {
+      const p = _hv2Pts[i]
+      const breathe = 1 + Math.sin(t * 1.3 + i) * p.j
+      const x = p.x * cy__ + p.z * sy
+      const z = -p.x * sy + p.z * cy__
+      const y = p.y
+      const y2 = y * cx__ - z * sx
+      const z2 = y * sx + z * cx__
+      const depth = (z2 + 1) / 2
+      const sz    = (0.6 + depth * 2.2) * dpr
+      const a     = 0.15 + depth * 0.85
+      const cm    = 0.4 + depth * 0.6
+      const r = Math.round(80 + 175 * (1 - cm))
+      const g = Math.round(220 + 35 * (1 - cm))
+      ctx.fillStyle = `rgba(${r},${g},255,${a.toFixed(3)})`
+      ctx.beginPath()
+      ctx.arc(cx_ + x * R * breathe, cy_ + y2 * R * breathe, sz, 0, Math.PI * 2)
+      ctx.fill()
+    }
+    _hv2RAF = requestAnimationFrame(frame)
+  }
+  _hv2RAF = requestAnimationFrame(frame)
+  // Clock
+  if (!_hv2ClockTimer) {
+    const tick = () => {
+      const d = new Date()
+      const p = n => String(n).padStart(2, '0')
+      const el = document.getElementById('hv2-clock')
+      if (el) el.textContent = `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+    }
+    tick(); _hv2ClockTimer = setInterval(tick, 1000)
+  }
+}
+function stopHubV2Sphere () {
+  if (_hv2RAF) { cancelAnimationFrame(_hv2RAF); _hv2RAF = null }
+  if (_hv2ClockTimer) { clearInterval(_hv2ClockTimer); _hv2ClockTimer = null }
+  if (_hv2Resize) { window.removeEventListener('resize', _hv2Resize); _hv2Resize = null }
+}
+
+// Apply hub version on load. Runs after DOM is ready so the body is paintable.
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', () => setHubVersion(HUB_VERSION))
+} else {
+  setHubVersion(HUB_VERSION)
+}
+
+// ─── Rich Music Player widget (draggable, with controls + scrubber) ──────────
+const mpEl = () => document.getElementById('music-player')
+let _mpLastPayload = null   // last poll payload — used for local scrubber tween
+let _mpLocalPos    = 0
+let _mpLastUpdate  = 0
+
+function _fmtTime (s) {
+  if (!s || !isFinite(s)) return '0:00'
+  s = Math.max(0, Math.floor(s))
+  const m = Math.floor(s / 60)
+  const ss = String(s % 60).padStart(2, '0')
+  return `${m}:${ss}`
+}
+
+function mpShow (data) {
+  const w = mpEl(); if (!w) return
+  w.classList.add('visible')
+  _mpLastPayload = data
+  _mpLastUpdate  = performance.now()
+  _mpLocalPos    = data.position || 0
+
+  const t = document.getElementById('mp-title')
+  const a = document.getElementById('mp-artist')
+  const img = document.getElementById('mp-art')
+  if (t) t.textContent = data.title || '—'
+  if (a) a.textContent = data.artist || ''
+  if (img) {
+    if (data.artwork) {
+      img.src = data.artwork
+      img.style.opacity = '1'
+    } else {
+      // No artwork — show a dim placeholder instead of broken image
+      img.removeAttribute('src')
+      img.style.opacity = '0.15'
+    }
+  }
+}
+function mpHide () {
+  const w = mpEl(); if (!w) return
+  w.classList.remove('visible')
+  _mpLastPayload = null
+}
+window.mpShow = mpShow
+window.mpHide = mpHide
+
+// Smooth scrubber animation — extrapolate position between server polls
+function _mpTick (now) {
+  if (_mpLastPayload && _mpLastPayload.state === 'playing') {
+    const elapsed = (now - _mpLastUpdate) / 1000
+    _mpLocalPos = (_mpLastPayload.position || 0) + elapsed
+  }
+  if (_mpLastPayload) {
+    const dur = _mpLastPayload.duration || 0
+    const pct = dur > 0 ? Math.min(100, (_mpLocalPos / dur) * 100) : 0
+    const fill = document.getElementById('mp-scrub-fill')
+    const pos  = document.getElementById('mp-pos')
+    const durEl = document.getElementById('mp-dur')
+    if (fill) fill.style.width = pct + '%'
+    if (pos) pos.textContent  = _fmtTime(_mpLocalPos)
+    if (durEl) durEl.textContent = _fmtTime(dur)
+  }
+  requestAnimationFrame(_mpTick)
+}
+requestAnimationFrame(_mpTick)
+
+// Control buttons — send WebSocket music_control to server
+function _mpSend (action, value) {
+  try {
+    send({ type: 'music_control', action, value })
+  } catch (_) {}
+}
+document.addEventListener('click', (e) => {
+  if (e.target.closest('#mp-prev'))  return _mpSend('previous')
+  if (e.target.closest('#mp-next'))  return _mpSend('next')
+  if (e.target.closest('#mp-play'))  return _mpSend('playpause')
+})
+
+// Scrubber click-to-seek
+document.addEventListener('click', (e) => {
+  const scrub = e.target.closest('#mp-scrub')
+  if (!scrub || !_mpLastPayload || !_mpLastPayload.duration) return
+  const rect = scrub.getBoundingClientRect()
+  const pct  = (e.clientX - rect.left) / rect.width
+  const newPos = Math.max(0, Math.min(_mpLastPayload.duration, pct * _mpLastPayload.duration))
+  _mpLocalPos = newPos
+  _mpSend('seek', newPos)
+})
+
+// Drag the player around — drag handle = #mp-drag bar at the top
+;(function makeDraggable () {
+  let dragging = false, startX = 0, startY = 0, baseLeft = 0, baseTop = 0
+  document.addEventListener('mousedown', (e) => {
+    const handle = e.target.closest('#mp-drag')
+    if (!handle) return
+    const w = mpEl()
+    dragging = true
+    startX = e.clientX; startY = e.clientY
+    const r = w.getBoundingClientRect()
+    baseLeft = r.left; baseTop = r.top
+    w.style.transition = 'none'
+    e.preventDefault()
+  })
+  document.addEventListener('mousemove', (e) => {
+    if (!dragging) return
+    const w = mpEl()
+    const newLeft = baseLeft + (e.clientX - startX)
+    const newTop  = baseTop  + (e.clientY - startY)
+    w.style.left   = newLeft + 'px'
+    w.style.top    = newTop  + 'px'
+    w.style.right  = 'auto'
+    w.style.bottom = 'auto'
+  })
+  document.addEventListener('mouseup', () => { dragging = false })
+})()
 
 // ═══════════════════════════════════════════════════════════════════════════
 // AR HOLOGRAPHIC SHAPE BUILDER
@@ -677,6 +921,12 @@ function _arPolygon (ctx, r, sides, startAngle = 0) {
 // ── Called from WebSocket message handler ─────────────────────────────────────
 
 function handleArSceneUpdate (scene) {
+  // Guard against a malformed frame (missing/na scene). Without this, a null
+  // scene makes the next _arDraw / _arHitTest throw on `arScene.shapes`, and
+  // because that throw happens before requestAnimationFrame re-arms, the whole
+  // AR render loop dies permanently until AR mode is re-entered.
+  if (!scene || typeof scene !== 'object') return
+  if (!Array.isArray(scene.shapes)) scene.shapes = []
   arScene  = scene
   _arDirty = true
 }
@@ -808,7 +1058,18 @@ function hideBackendDownBanner () {
   if (el) el.style.display = 'none'
 }
 
+let _reconnectTimer = null
+
 function connect () {
+  // Don't stack sockets. If one is already open/connecting, or a reconnect is
+  // already scheduled, bail — clicking "Retry now" while auto-retry was pending
+  // used to spawn parallel reconnect chains, so every frame got processed 2–N
+  // times once the server came back.
+  if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
+    return
+  }
+  if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null }
+
   ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws`)
 
   ws.onopen = () => {
@@ -826,22 +1087,39 @@ function connect () {
     _wsRetries += 1
     // After 4 failed attempts (~6 seconds), show the user-visible banner.
     if (_wsRetries >= 4) showBackendDownBanner()
-    setTimeout(connect, 1500)
+    if (_reconnectTimer) clearTimeout(_reconnectTimer)
+    _reconnectTimer = setTimeout(() => { _reconnectTimer = null; connect() }, 1500)
   }
   ws.onerror = () => {
     if ($hudLinkVal) { $hudLinkVal.textContent = 'ERROR'; $hudLinkVal.style.color = 'var(--red)' }
   }
 
   ws.onmessage = ({ data }) => {
-    const msg = JSON.parse(data)
+    // Guard JSON.parse — a malformed frame would otherwise throw out of the
+    // handler and drop the message (and, for stateful frames like
+    // ar_scene_update, could leave a render loop wedged). Drop it cleanly.
+    let msg
+    try {
+      msg = JSON.parse(data)
+    } catch (err) {
+      console.warn('[JARVIS] dropped malformed WS frame:', err)
+      return
+    }
 
     if (msg.type === 'state') {
       applyState(msg.state)
+    } else if (msg.type === 'overlay_close' || msg.type === 'hide_overlay') {
+      // Hard-coded dismiss from server — fires even when LLM is rate-limited.
+      clearOverlay(true)
+    } else if (msg.type === 'set_hub_version') {
+      // Voice command from server: "hub v2" / "hub v1" / "sphere mode"
+      setHubVersion(msg.version || 'v1')
     } else if (msg.type === 'user_message') {
       addMessage('user', msg.text)
       if (window._incSidePanelRequest) window._incSidePanelRequest()
-      // Auto-close overlay on voice dismiss commands
-      if (arOverlay && /\b(close|dismiss|hide|clear|remove)\b.*(overlay|visual|cards?|diagram|timeline)|^(close|dismiss|hide) it$/i.test(msg.text)) {
+      // Auto-close overlay on voice dismiss commands (regex fallback,
+      // server-side _OVERLAY_DISMISS_PHRASES covers most cases first).
+      if (arOverlay && /\b(close|dismiss|hide|clear|remove|drop|take|get rid of)\b.*(overlay|visual|cards?|diagram|timeline|blueprint|hologram|it|that|this)|^(close|dismiss|hide|drop) it$/i.test(msg.text)) {
         setTimeout(() => clearOverlay(true), 300)
       }
       // Camera mode voice commands
@@ -870,8 +1148,12 @@ function connect () {
           renderPracticeContent(ft)
         }
       }
-      // Auto-parse weather data and update the right sidebar widget
-      if (msg.full_text && /weather|temperature|°F|°C|forecast|sunny|cloudy|rainy|clear/i.test(msg.full_text)) {
+      // Auto-parse weather data and update the right sidebar widget. Require
+      // an actual temperature reading (a number followed by ° or "degrees")
+      // so unrelated replies like "let me clear that up" don't pop the widget
+      // just because they contain a weather word.
+      if (msg.full_text && /\d+\s*°|\d+\s*degrees/i.test(msg.full_text)
+          && /weather|temperature|forecast|sunny|cloudy|rainy|clear|snow/i.test(msg.full_text)) {
         updateWeatherWidget(msg.full_text)
       }
     } else if (msg.type === 'muted') {
@@ -962,7 +1244,19 @@ function connect () {
 
     // ── Now Playing extended ──────────────────────────────────────────────────
     } else if (msg.type === 'now_playing') {
-      updateNowPlaying(msg.title, msg.artist, msg.album)
+      // Rich payload from the music poller. State = "playing"|"paused"|"stopped"
+      if (msg.state === 'stopped' || msg.state === 'not_running') {
+        mpHide()
+      } else if (msg.title) {
+        mpShow(msg)
+      } else if (typeof msg.text === 'string') {
+        // Legacy text-only path — keep working as fallback
+        if (msg.text.trim() === '') {
+          mpHide()
+        } else {
+          mpShow({ title: msg.text, artist: '', state: 'playing' })
+        }
+      }
 
     // ── Info card ─────────────────────────────────────────────────────────────
     } else if (msg.type === 'info_card') {
@@ -979,20 +1273,557 @@ function connect () {
       if (window.jarvis && window.jarvis.setDisplayMode) {
         window.jarvis.setDisplayMode('gaming')
       }
+      // Work mode = revert to v1 layout. v2 sphere + chat-on-bottom isn't
+      // what Dylan wants while he's working — he wants the classic chrome.
+      setHubVersion('v1')
       _gmAttach()
+      _setModeBadge(msg.mode || 'work')
     } else if (msg.type === 'gaming_mode_exit') {
       document.body.classList.remove('gaming-mode')
       $app.classList.remove('gaming-mode')
       if (window.jarvis && window.jarvis.setDisplayMode) {
-        window.jarvis.setDisplayMode('gaming-exit')
+        window.jarvis.setDisplayMode('desktop')
       }
+      // Restore the permanent v2 sphere look when leaving work mode.
+      setHubVersion(HUB_VERSION)
+      _setModeBadge(null)
+    } else if (msg.type === 'mode_status') {
+      // Auto-mode manager reporting the current mode; keep the badge in sync.
+      _setModeBadge(msg.mode === 'normal' ? null : msg.mode)
     } else if (msg.type === 'ar_labels') {
       _arLabels = msg.visible
       _arDirty  = true
     } else if (msg.type === 'system_health') {
       _applySystemHealth(msg.status)
+    } else if (msg.type === 'diagnostic_start' ||
+               msg.type === 'diagnostic_step' ||
+               msg.type === 'diagnostic_done' ||
+               msg.type === 'diagnostic_investigation_start' ||
+               msg.type === 'diagnostic_investigation_done') {
+      _handleDiagnosticEvent(msg)
+    } else if (msg.type === 'diagnostic_dismiss') {
+      _diagHide()
+    } else if (msg.type === 'deep_scan_start' ||
+               msg.type === 'deep_scan_progress' ||
+               msg.type === 'deep_scan_finding' ||
+               msg.type === 'deep_scan_done' ||
+               msg.type === 'deep_scan_error') {
+      _handleDeepScanEvent(msg)
+    } else if (msg.type === 'deep_scan_show_results') {
+      _showDeepScanResults(msg.findings, msg.summary)
     }
   }
+}
+
+// ── Diagnostic overlay handlers ───────────────────────────────────────────────
+const _diag = {
+  ringCanvas: null, ringCtx: null,
+  visible: false, total: 0, hideTimer: null,
+  rows: {},     // index → row element
+}
+
+function _diagInit () {
+  if (_diag.ringCanvas) return
+  _diag.ringCanvas = document.getElementById('diag-ring')
+  if (!_diag.ringCanvas) return
+  const dpr = window.devicePixelRatio || 1
+  _diag.ringCanvas.width  = 460 * dpr
+  _diag.ringCanvas.height = 460 * dpr
+  _diag.ringCtx = _diag.ringCanvas.getContext('2d')
+  _diag.ringCtx.scale(dpr, dpr)
+  // Wire the close button once
+  const closeBtn = document.getElementById('diag-close')
+  if (closeBtn) {
+    closeBtn.addEventListener('click', (e) => {
+      e.stopPropagation()
+      _diagHide()
+    })
+  }
+}
+
+function _diagShow () {
+  const el = document.getElementById('diag-overlay')
+  if (!el) return
+  if (_diag.hideTimer) { clearTimeout(_diag.hideTimer); _diag.hideTimer = null }
+  el.classList.remove('diag-hidden')
+  el.classList.add('diag-visible')
+  _diag.visible = true
+  // Reset content
+  const list = document.getElementById('diag-checks')
+  if (list) list.innerHTML = ''
+  _diag.rows = {}
+  const sum = document.getElementById('diag-summary')
+  if (sum) { sum.textContent = ''; sum.classList.remove('show') }
+  _diagSetProgress(0)
+  _diagDrawArc(0)
+}
+
+function _diagHide () {
+  const el = document.getElementById('diag-overlay')
+  if (!el) return
+  el.classList.add('diag-hidden')
+  el.classList.remove('diag-visible')
+  el.style.pointerEvents = 'none'
+  _diag.visible = false
+  _diag.completed = false
+  const closeBtn = document.getElementById('diag-close')
+  if (closeBtn) closeBtn.style.display = 'none'
+}
+
+function _diagSetProgress (pct) {
+  const p = document.getElementById('diag-percent')
+  if (p) p.textContent = Math.round(pct) + '%'
+}
+
+function _diagSetLabel (txt) {
+  const l = document.getElementById('diag-progress-label')
+  if (l) l.textContent = txt
+}
+
+function _diagDrawArc (pct) {
+  _diagInit()
+  if (!_diag.ringCtx) return
+  const ctx = _diag.ringCtx
+  const w = 460, h = 460, cx = w / 2, cy = h / 2
+  const r = 215
+  ctx.clearRect(0, 0, w, h)
+  // Background ring (dim)
+  ctx.beginPath()
+  ctx.arc(cx, cy, r, 0, Math.PI * 2)
+  ctx.lineWidth = 2
+  ctx.strokeStyle = 'rgba(0, 220, 255, 0.10)'
+  ctx.stroke()
+  // Progress arc
+  const end = -Math.PI / 2 + (Math.PI * 2) * (pct / 100)
+  ctx.beginPath()
+  ctx.arc(cx, cy, r, -Math.PI / 2, end)
+  ctx.lineWidth = 4
+  ctx.strokeStyle = 'rgba(0, 220, 255, 0.95)'
+  ctx.shadowColor = 'rgba(0, 220, 255, 0.8)'
+  ctx.shadowBlur = 12
+  ctx.lineCap = 'round'
+  ctx.stroke()
+}
+
+function _diagAddOrUpdateRow (event) {
+  const list = document.getElementById('diag-checks')
+  if (!list) return
+  let row = _diag.rows[event.index]
+  if (!row) {
+    row = document.createElement('div')
+    row.className = 'diag-row status-running'
+    row.innerHTML = `
+      <span class="diag-mark">◐</span>
+      <div class="diag-text">
+        <div class="diag-label"></div>
+        <div class="diag-impact" style="display:none"></div>
+        <div class="diag-fix" style="display:none"></div>
+      </div>`
+    list.appendChild(row)
+    _diag.rows[event.index] = row
+    // Auto-scroll the latest row into view — but only while the run is
+    // still in progress, so the user can scroll freely after it completes.
+    if (!_diag.completed) {
+      setTimeout(() => row.scrollIntoView({behavior:'smooth', block:'nearest'}), 30)
+    }
+  }
+  row.classList.remove('status-running', 'status-pass', 'status-fail',
+                       'status-fixed', 'status-fixing')
+  row.classList.add('status-' + event.status)
+  row.querySelector('.diag-label').textContent = event.label
+  const marks = { running: '◐', fixing: '⚒', pass: '✓', fail: '✗', fixed: '⚒' }
+  row.querySelector('.diag-mark').textContent = marks[event.status] || '·'
+  // Impact line — shown for failures AND while fixing AND for unfixable items
+  const impactEl = row.querySelector('.diag-impact')
+  if ((event.status === 'fail' || event.status === 'fixing') && event.impact) {
+    impactEl.textContent = event.impact
+    impactEl.style.display = 'block'
+  } else {
+    impactEl.style.display = 'none'
+  }
+  // Fix-state line — clearly labels what JARVIS did/tried
+  const fixEl = row.querySelector('.diag-fix')
+  if (event.status === 'fixing') {
+    fixEl.textContent = 'Attempting auto-repair…'
+    fixEl.style.display = 'block'
+  } else if (event.status === 'fixed') {
+    fixEl.textContent = 'Auto-restored ✓'
+    fixEl.style.display = 'block'
+  } else if (event.status === 'fail') {
+    if (event.fix_attempted) {
+      fixEl.textContent = "Auto-repair failed — manual action required"
+    } else if (event.fixable === false) {
+      fixEl.textContent = "No auto-repair available — manual action required"
+    } else {
+      fixEl.textContent = ''
+    }
+    fixEl.style.display = fixEl.textContent ? 'block' : 'none'
+  } else {
+    fixEl.style.display = 'none'
+  }
+}
+
+function _diagShowSummary (data) {
+  const el = document.getElementById('diag-summary')
+  if (!el) return
+  const passed = data.passed || 0
+  const fixed  = data.fixed  || 0
+  const failed = data.failed || 0
+  const parts = []
+  parts.push(`<span class="ok">${passed} NOMINAL</span>`)
+  if (fixed)  parts.push(`<span class="warn">${fixed} RESTORED</span>`)
+  if (failed) parts.push(`<span class="err">${failed} DEGRADED</span>`)
+  else        parts.push(`<span class="ok">0 DEGRADED</span>`)
+  el.innerHTML = parts.join('  ·  ') +
+    '<div id="diag-dismiss-hint">Say "close diagnostics" or click anywhere to dismiss</div>'
+  el.classList.add('show')
+  _diagSetLabel(failed === 0 ? 'All systems nominal' : 'Diagnostics complete')
+  // Stop auto-scrolling so user can review the full check list manually
+  _diag.completed = true
+  // Show the close button + accept click-anywhere-to-dismiss
+  const closeBtn = document.getElementById('diag-close')
+  if (closeBtn) closeBtn.style.display = 'block'
+  const overlay = document.getElementById('diag-overlay')
+  if (overlay) {
+    overlay.style.pointerEvents = 'auto'
+    overlay.addEventListener('click', _diagDismissOnce, { once: true })
+  }
+}
+
+// Single-use click handler that wraps _diagHide and tears down state
+function _diagDismissOnce () { _diagHide() }
+
+function _handleDiagnosticEvent (event) {
+  const t = event.type
+  if (t === 'diagnostic_start') {
+    _diagShow()
+    _diag.total = event.total || 0
+    _diagSetLabel('Probing subsystems…')
+    return
+  }
+  if (t === 'diagnostic_step') {
+    _diagAddOrUpdateRow(event)
+    if (event.status !== 'running') {
+      const done = event.index + 1
+      const pct  = _diag.total ? (done / _diag.total) * 100 : 0
+      _diagSetProgress(pct)
+      _diagDrawArc(pct)
+      _diagSetLabel(event.label)
+    }
+    return
+  }
+  if (t === 'diagnostic_done') {
+    _diagSetProgress(100)
+    _diagDrawArc(100)
+    _diagShowSummary(event)
+    return
+  }
+  if (t === 'diagnostic_investigation_start') {
+    _diagAttachInvestigation(event, { phase: 'start' })
+    return
+  }
+  if (t === 'diagnostic_investigation_done') {
+    _diagAttachInvestigation(event, { phase: 'done' })
+    return
+  }
+}
+
+function _diagAttachInvestigation (event, { phase }) {
+  const row = _diag.rows[event.index]
+  if (!row) return
+  let panel = row.querySelector('.diag-investigation')
+  if (!panel) {
+    panel = document.createElement('div')
+    panel.className = 'diag-investigation'
+    row.querySelector('.diag-text').appendChild(panel)
+  }
+  if (phase === 'start') {
+    panel.innerHTML = `
+      <div class="diag-investigate-head">
+        <span class="diag-investigate-spinner">⟲</span>
+        <span>INVESTIGATING — reading logs &amp; source…</span>
+      </div>`
+    return
+  }
+  // Build the findings block
+  const logs    = event.log_matches  || []
+  const sources = event.source_files || []
+  const summary = event.summary || ''
+  const logHtml = logs.length
+    ? `<div class="diag-investigate-section">
+         <div class="diag-investigate-label">Log evidence (${logs.length})</div>
+         <div class="diag-investigate-logs">${
+           logs.map(l => `<div class="diag-investigate-log">${_escapeHtml(l)}</div>`).join('')
+         }</div>
+       </div>`
+    : ''
+  const srcHtml = sources.length
+    ? `<div class="diag-investigate-section">
+         <div class="diag-investigate-label">Source files</div>
+         <div class="diag-investigate-srcs">${
+           sources.map(p => `<code>${_escapeHtml(p)}</code>`).join(' · ')
+         }</div>
+       </div>`
+    : ''
+  panel.innerHTML = `
+    <div class="diag-investigate-head done">
+      <span>⌕ INVESTIGATION COMPLETE</span>
+    </div>
+    <div class="diag-investigate-summary">${_escapeHtml(summary)}</div>
+    ${logHtml}${srcHtml}
+    <div class="diag-investigate-hint">Ask "why did ${_escapeHtml(event.label)} fail?" for a full explanation.</div>`
+}
+
+function _escapeHtml (s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;',
+  }[c]))
+}
+
+// ── Deep scan loading bar + results modal ─────────────────────────────────────
+const _deepScan = {
+  total: 0, current: 0,
+  // Split by severity so we never report "90 issues" when the breakdown
+  // is really 1 HIGH + 28 MEDIUM + 61 LOW
+  counts: {high: 0, medium: 0, low: 0},
+  hideTimer: null,
+  findings: [],           // last completed run, for filter switching
+  activeFilter: 'all',
+  modalWired: false,
+}
+
+function _handleDeepScanEvent (msg) {
+  const bar = document.getElementById('deepscan-bar')
+  if (!bar) return
+
+  if (msg.type === 'deep_scan_start') {
+    if (_deepScan.hideTimer) { clearTimeout(_deepScan.hideTimer); _deepScan.hideTimer = null }
+    _deepScan.total = msg.total || 0
+    _deepScan.current = 0
+    _deepScan.counts = {high: 0, medium: 0, low: 0}
+    _deepScan.deep = !!msg.deep
+    _deepScan.engine = msg.engine || 'none'
+    _dsbSetLabel('DEEP SCAN')
+    _dsbSetFill(0)
+    _dsbSetFile('Initializing…')
+    _dsbSetTicker(msg.deep
+      ? `mechanical pass, then AI review via ${_escapeHtml(msg.engine || 'local')}…`
+      : 'mechanical pass (no AI model available)…')
+    _dsbRenderCounts()
+    _dsbUpdateCounter()
+    bar.classList.remove('dsb-hidden')
+    bar.classList.add('dsb-visible')
+    return
+  }
+  if (msg.type === 'deep_scan_progress') {
+    _deepScan.current = msg.current || 0
+    const pct = _deepScan.total ? ((msg.current + 1) / _deepScan.total) * 100 : 0
+    _dsbSetFill(pct)
+    _dsbSetFile(msg.file || '')
+    // Honest phase label: MECHANICAL (fast pyflakes) vs AI REVIEW (real
+    // semantic analysis via the named engine). This is what tells the user
+    // the time is real work, not padding.
+    if (msg.phase === 'ai') {
+      _dsbSetLabel(`AI REVIEW · ${(msg.engine || '').toUpperCase()}`)
+    } else if (msg.phase === 'mechanical') {
+      _dsbSetLabel('SCANNING')
+    }
+    _dsbUpdateCounter()
+    return
+  }
+  if (msg.type === 'deep_scan_finding') {
+    const sev = msg.severity || 'low'
+    if (sev in _deepScan.counts) _deepScan.counts[sev] += 1
+    // Ticker: show the actual finding text so the user can SEE what was
+    // found. Brief flash animation marks each new entry as a discrete event.
+    const fileBase = (msg.file || '').split('/').pop()
+    const summary = (msg.message || '').replace(/\s+/g, ' ').slice(0, 80)
+    // Escape sev + coerce line to a number — defense-in-depth so a crafted
+    // severity/line can't inject into the innerHTML ticker.
+    const sevSafe = _escapeHtml(String(sev))
+    const lineSafe = Number(msg.line) || 0
+    _dsbSetTicker(
+      `<span class="sev-${sevSafe}">[${sevSafe.toUpperCase()}]</span> `
+      + `${_escapeHtml(fileBase)}:${lineSafe} — ${_escapeHtml(summary)}`,
+      /* html */ true,
+    )
+    _dsbRenderCounts()
+    return
+  }
+  if (msg.type === 'deep_scan_done') {
+    _dsbSetLabel('COMPLETE')
+    _dsbSetFill(100)
+    _dsbSetFile(`${msg.total_files} files scanned`)
+    const findings = msg.findings || []
+    _deepScan.findings = findings
+    _deepScan.summary = msg.summary || null
+    // Recompute counts from authoritative summary so the final number
+    // doesn't drift from the streamed events
+    const bs = (msg.summary && msg.summary.by_severity) || {}
+    _deepScan.counts = {
+      high:   bs.high   || 0,
+      medium: bs.medium || 0,
+      low:    bs.low    || 0,
+    }
+    _dsbRenderCounts()
+    _dsbUpdateCounter()
+    // Pause the ticker on a "done" line so the user has time to read the
+    // final state before the bar slides away
+    const total = findings.length
+    _dsbSetTicker(
+      total === 0
+        ? '<span class="sev-low">no issues — codebase clean</span>'
+        : `done — ${total} finding${total === 1 ? '' : 's'} ready to review`,
+      /* html */ true,
+    )
+    _deepScan.hideTimer = setTimeout(() => {
+      bar.classList.add('dsb-hidden')
+      bar.classList.remove('dsb-visible')
+    }, 6500)
+    return
+  }
+  if (msg.type === 'deep_scan_error') {
+    _dsbSetLabel('FAILED')
+    _dsbSetFile(`error: ${msg.message || 'scan crashed'}`)
+    setTimeout(() => {
+      bar.classList.add('dsb-hidden')
+      bar.classList.remove('dsb-visible')
+    }, 6000)
+    return
+  }
+}
+
+function _dsbSetLabel (s) {
+  const el = document.getElementById('dsb-label')
+  if (el) el.textContent = s
+}
+function _dsbSetFill (pct) {
+  const el = document.getElementById('dsb-fill')
+  if (el) el.style.width = `${Math.min(100, Math.max(0, pct))}%`
+}
+function _dsbSetFile (s) {
+  const el = document.getElementById('dsb-file')
+  if (el) el.textContent = s
+}
+function _dsbSetTicker (s, asHtml = false) {
+  const el = document.getElementById('dsb-ticker')
+  if (!el) return
+  // Brief flash so the user perceives each finding as discrete
+  el.classList.add('flash')
+  setTimeout(() => el.classList.remove('flash'), 120)
+  if (asHtml) el.innerHTML = s
+  else        el.textContent = s
+}
+function _dsbUpdateCounter () {
+  const counter = document.getElementById('dsb-counter')
+  if (counter && _deepScan.total) {
+    counter.textContent = `${Math.min(_deepScan.current + 1, _deepScan.total)} / ${_deepScan.total}`
+  }
+}
+function _dsbRenderCounts () {
+  const wrap = document.getElementById('dsb-issues')
+  if (!wrap) return
+  const {high, medium, low} = _deepScan.counts
+  wrap.innerHTML =
+    `<span class="ds-h ${high   ? '' : 'ds-zero'}">${high}H</span>` +
+    `<span class="ds-m ${medium ? '' : 'ds-zero'}">${medium}M</span>` +
+    `<span class="ds-l ${low    ? '' : 'ds-zero'}">${low}L</span>`
+}
+
+function _showDeepScanResults (findings, summary) {
+  const modal = document.getElementById('deepscan-modal')
+  if (!modal) return
+  _deepScan.findings = findings || []
+  _deepScan.summary = summary || null
+  _deepScan.activeFilter = 'all'
+  _wireDeepScanModal()
+  _renderDeepScanList()
+  // Reset filter highlight to "ALL"
+  modal.querySelectorAll('.dsm-tab').forEach(t => {
+    t.classList.toggle('active', t.dataset.sev === 'all')
+  })
+  modal.classList.remove('dsm-hidden')
+  modal.classList.add('dsm-visible')
+}
+
+function _wireDeepScanModal () {
+  if (_deepScan.modalWired) return
+  const modal = document.getElementById('deepscan-modal')
+  if (!modal) return
+  modal.addEventListener('click', e => {
+    if (e.target === modal) _hideDeepScanResults()    // click outside card
+  })
+  const close = document.getElementById('dsm-close')
+  if (close) close.addEventListener('click', _hideDeepScanResults)
+  modal.querySelectorAll('.dsm-tab').forEach(tab => {
+    tab.addEventListener('click', e => {
+      _deepScan.activeFilter = tab.dataset.sev
+      modal.querySelectorAll('.dsm-tab').forEach(t => t.classList.remove('active'))
+      tab.classList.add('active')
+      _renderDeepScanList()
+    })
+  })
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && modal.classList.contains('dsm-visible')) {
+      _hideDeepScanResults()
+    }
+  })
+  _deepScan.modalWired = true
+}
+
+function _hideDeepScanResults () {
+  const modal = document.getElementById('deepscan-modal')
+  if (!modal) return
+  modal.classList.add('dsm-hidden')
+  modal.classList.remove('dsm-visible')
+}
+
+function _renderDeepScanList () {
+  const list = document.getElementById('dsm-list')
+  const summaryEl = document.getElementById('dsm-summary')
+  if (!list) return
+  const filter = _deepScan.activeFilter
+  const items = (_deepScan.findings || []).filter(f =>
+    filter === 'all' ? true : f.severity === filter
+  )
+  // Sort: high > medium > low, then by file. Defaults guard against a
+  // finding missing `file` or carrying an unknown `severity` (which would
+  // otherwise throw on .localeCompare or yield NaN comparisons).
+  const sevRank = {high: 3, medium: 2, low: 1}
+  items.sort((a, b) =>
+    ((sevRank[b.severity] ?? 0) - (sevRank[a.severity] ?? 0))
+    || (a.file || '').localeCompare(b.file || '')
+    || ((a.line || 0) - (b.line || 0))
+  )
+  if (summaryEl) {
+    const s = _deepScan.summary || {}
+    const bs = s.by_severity || {}
+    summaryEl.innerHTML =
+      `<span class="sev-high">${bs.high || 0} HIGH</span>  ·  ` +
+      `<span class="sev-medium">${bs.medium || 0} MEDIUM</span>  ·  ` +
+      `<span class="sev-low">${bs.low || 0} LOW</span>  ·  ` +
+      `${(_deepScan.findings || []).length} TOTAL` +
+      ` <span style="opacity:0.5;font-size:10px">(${items.length} shown)</span>`
+  }
+  if (!items.length) {
+    list.innerHTML = `<div style="color:rgba(255,255,255,0.5);text-align:center;padding:32px;font-size:11px;letter-spacing:1px;">
+                       Nothing in this severity bucket.
+                     </div>`
+    return
+  }
+  list.innerHTML = items.map(f => {
+    const sev = _escapeHtml(String(f.severity || 'low'))
+    const line = Number(f.line) || 0
+    return `
+    <div class="dsm-row dsm-${sev}">
+      <div class="dsm-sev">${sev.toUpperCase()}</div>
+      <div class="dsm-body">
+        <div class="dsm-msg">${_escapeHtml(f.message)}</div>
+        <div class="dsm-meta"><code>${_escapeHtml(f.file)}</code>:${line}</div>
+      </div>
+      <div class="dsm-cat">${_escapeHtml(f.category || '')}</div>
+    </div>`
+  }).join('')
 }
 
 // ── Real system health display ────────────────────────────────────────────────
@@ -1119,6 +1950,7 @@ const $proactiveToastMsg = document.getElementById('proactive-toast-msg')
 let   _proactiveTimer    = null
 
 function showProactiveToast (text) {
+  if (!text) return   // a proactive message with no text must not crash the handler
   if (!$proactiveToast || !$proactiveToastMsg) return
   $proactiveToastMsg.textContent = text
   $proactiveToast.classList.add('visible')
@@ -1225,7 +2057,14 @@ function applyState (state) {
 // ─── Markdown renderer ───────────────────────────────────────────────────────
 
 function escHtml (s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')
+  // String(s) coerces null/undefined/numbers so a missing field can't throw
+  // a TypeError and abort the whole handler (files widget, timer labels,
+  // overlay chips all interpolate possibly-absent fields). The single-quote
+  // escape matters because some values land inside onclick="foo('...')" —
+  // a class name like "Wendy's" would otherwise break the handler (self-XSS).
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;')
 }
 
 function renderMarkdown (raw) {
@@ -1292,6 +2131,23 @@ function addMessage (role, text) {
   return body
 }
 
+// Watchdog for the streaming chunk renderer: if no chunk and no `done`
+// arrive for this many ms, auto-finish the current row. Prevents a stuck
+// row from swallowing chunks belonging to the NEXT turn (the race that
+// was bug #17 in the audit).
+const _STREAM_WATCHDOG_MS = 8000
+let _streamWatchdog = null
+
+function _resetStreamWatchdog () {
+  if (_streamWatchdog) { clearTimeout(_streamWatchdog); _streamWatchdog = null }
+  _streamWatchdog = setTimeout(() => {
+    if (currentRow) {
+      console.warn('[stream] watchdog fired — forcing finishStreaming')
+      finishStreaming()
+    }
+  }, _STREAM_WATCHDOG_MS)
+}
+
 function appendChunk (chunk) {
   if (!currentRow) {
     $empty.style.display = 'none'
@@ -1315,9 +2171,17 @@ function appendChunk (chunk) {
     body.textContent = body._raw
   }
   $chat.scrollTop = $chat.scrollHeight
+  // Renew the watchdog with each chunk — only fires if the stream goes
+  // silent without a `done` event
+  _resetStreamWatchdog()
 }
 
 function updateNowPlaying (text) {
+  // Only treat SHORT, announcement-style replies as now-playing. A long
+  // conversational reply that merely says "now playing devil's advocate"
+  // shouldn't pop the music widget — the authoritative source is the
+  // now_playing WebSocket event from the music poller anyway.
+  if (!text || text.length > 120) return
   const m = text.match(/[Nn]ow playing[:\s]+(.+?)(?:\.|$)/m)
            || text.match(/[Pp]laying '(.+?)'/m)
            || text.match(/[Ss]huffling .+ for[:\s]+(.+?)(?:\.|$)/m)
@@ -1328,6 +2192,9 @@ function updateNowPlaying (text) {
 }
 
 function finishStreaming () {
+  // Always clear the watchdog — even if currentRow is null, leftover
+  // timers waste a tick and can briefly log spurious "watchdog fired"
+  if (_streamWatchdog) { clearTimeout(_streamWatchdog); _streamWatchdog = null }
   if (currentRow) {
     currentRow.classList.remove('streaming')
     const body = currentRow.querySelector('.msg-body')
@@ -1422,6 +2289,8 @@ async function initCamera () {
 
     // Camera is now live — (re)start MediaPipe Hands if not already running.
     if (!mpReady) setTimeout(() => initMediaPipe(), 800)
+    // FaceMesh — lip motion detection for speaker presence verification.
+    if (!mpFaceReady) setTimeout(() => initFaceMesh(), 1200)
   } catch (err) {
     cameraActive = false
     const denied = err.name === 'NotAllowedError'
@@ -2317,12 +3186,128 @@ async function initMediaPipe () {
     mpHands.onResults(onHandResults)
     await mpHands.initialize()
     mpReady = true
-    setInterval(runMediaPipe, 67)
+    // Clear any previously-set interval before installing a new one — if
+    // initMediaPipe() runs twice (camera re-init, deferred retry), each
+    // call without this would add a fresh interval and we'd poll N×.
+    if (_mpHandsInterval) clearInterval(_mpHandsInterval)
+    _mpHandsInterval = setInterval(runMediaPipe, 67)
     console.log('[pinch] MediaPipe Hands ready')
     sendSystemStatus({ gesture: true })
   } catch (err) {
     console.warn('[pinch] MediaPipe failed:', err.message || err)
     sendSystemStatus({ gesture: false })
+  }
+}
+
+// ─── Lip motion detection (speaker presence verification) ────────────────────
+// Uses MediaPipe FaceMesh to track lip landmarks every frame, compute mouth-
+// aspect-ratio (MAR), and detect when the user's mouth is actually moving.
+// The backend uses this signal to ignore audio that didn't come from Dylan —
+// e.g. course video narrators, people in the room, the phone speaker.
+//
+// Landmarks used (FaceMesh canonical indices):
+//   13   — upper inner lip center
+//   14   — lower inner lip center
+//   78   — left mouth corner
+//   308  — right mouth corner
+// MAR = |y13 - y14| / |x308 - x78|  → invariant to face distance and zoom.
+
+let mpFaceMesh        = null
+let mpFaceReady       = false
+let mpFaceProcessing  = false
+const _marWindow      = []     // recent MAR samples — sliding window for variance
+const _MAR_WINDOW_MS  = 500    // analyse last 500ms of mouth state
+const _MAR_THRESH     = 0.006  // variance threshold — loosened from 0.012 (was rejecting real speech)
+let _lastMouthActiveTs = 0     // last time mouth was confirmed active (ms)
+let _lastMouthStateSent = 0    // throttle WebSocket sends
+let _marDebugLastLog   = 0     // throttle MAR debug logs to 1Hz
+
+function onFaceResults (results) {
+  const now = performance.now()
+  const landmarks = results.multiFaceLandmarks && results.multiFaceLandmarks[0]
+  let mouthActive = false
+
+  if (landmarks && landmarks.length >= 309) {
+    const upper = landmarks[13]
+    const lower = landmarks[14]
+    const left  = landmarks[78]
+    const right = landmarks[308]
+    const vertical   = Math.abs(upper.y - lower.y)
+    const horizontal = Math.abs(right.x - left.x) || 1e-6
+    const mar = vertical / horizontal
+
+    // Maintain sliding window of MAR samples
+    _marWindow.push({ ts: now, mar })
+    while (_marWindow.length && now - _marWindow[0].ts > _MAR_WINDOW_MS) {
+      _marWindow.shift()
+    }
+
+    // Speaking → MAR varies as the mouth opens/closes between phonemes.
+    // Static face (resting / silent) → MAR is near-constant.
+    if (_marWindow.length >= 4) {
+      const vals = _marWindow.map(s => s.mar)
+      const mean = vals.reduce((a, b) => a + b, 0) / vals.length
+      const variance = vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length
+      const stdDev = Math.sqrt(variance)
+      mouthActive = stdDev > _MAR_THRESH
+      if (mouthActive) _lastMouthActiveTs = now
+      // Debug log once per second so we can tune threshold empirically
+      if (now - _marDebugLastLog > 1000) {
+        _marDebugLastLog = now
+        console.log(`[lips] MAR std=${stdDev.toFixed(4)} thresh=${_MAR_THRESH} active=${mouthActive}`)
+      }
+    }
+  }
+
+  // Throttle to ~5 Hz — backend only needs a recent timestamp, not every frame.
+  if (now - _lastMouthStateSent > 200) {
+    _lastMouthStateSent = now
+    send({
+      type: 'mouth_state',
+      active: mouthActive,
+      face_visible: !!landmarks,
+      ts: Date.now(),
+    })
+  }
+}
+
+async function runFaceMesh () {
+  if (!mpFaceReady || mpFaceProcessing) return
+  if (!$camVideo || $camVideo.readyState < 2 || !$camVideo.srcObject) return
+  mpFaceProcessing = true
+  try {
+    await mpFaceMesh.send({ image: $camVideo })
+  } catch (_) {}
+  mpFaceProcessing = false
+}
+
+async function initFaceMesh () {
+  if (mpFaceReady) return
+  try {
+    if (typeof FaceMesh === 'undefined') {
+      console.warn('[lips] MediaPipe FaceMesh not loaded')
+      return
+    }
+    mpFaceMesh = new FaceMesh({
+      locateFile: f => `../node_modules/@mediapipe/face_mesh/${f}`,
+    })
+    mpFaceMesh.setOptions({
+      maxNumFaces:            1,
+      refineLandmarks:        false,   // we don't need iris/lip refinement → faster
+      minDetectionConfidence: 0.5,
+      minTrackingConfidence:  0.5,
+    })
+    mpFaceMesh.onResults(onFaceResults)
+    await mpFaceMesh.initialize()
+    mpFaceReady = true
+    // 12 FPS is plenty — speech phonemes change at ~5-8 Hz; we just need to catch motion.
+    // Clear any previously-set interval before installing a new one
+    // (initFaceMesh can re-run on camera re-init).
+    if (_mpFaceInterval) clearInterval(_mpFaceInterval)
+    _mpFaceInterval = setInterval(runFaceMesh, 83)
+    console.log('[lips] MediaPipe FaceMesh ready — lip motion gating active')
+  } catch (err) {
+    console.warn('[lips] FaceMesh failed:', err.message || err)
   }
 }
 
@@ -2559,9 +3544,14 @@ function showTimerHUD (id, remaining, total, label) {
         <svg viewBox="0 0 60 60"><circle class="timer-track" cx="30" cy="30" r="26"/><circle class="timer-fill" cx="30" cy="30" r="26"/></svg>
         <div class="timer-hud-time"></div>
       </div>
-      <button class="timer-cancel-btn" onclick="cancelTimer('${id}')">✕</button>
+      <button class="timer-cancel-btn">✕</button>
     `
     document.body.appendChild(timerEl)
+    // Bind the handler in JS (not an inline onclick with `${id}` interpolated
+    // into the attribute) so a server-supplied id can't break out of the
+    // attribute and inject a handler. `id` here is the real value, closed over.
+    timerEl.querySelector('.timer-cancel-btn')
+           .addEventListener('click', () => cancelTimer(id))
     setTimeout(() => timerEl.classList.add('visible'), 10)
     _activeTimers.set(id, { el: timerEl })
   }
@@ -2821,12 +3811,13 @@ function showComputerAgentHUD (request) {
 
 function addComputerAgentAction (action, detail) {
   if (!$caHud || !$caHud.classList.contains('visible')) return
-  if ($caHudStatus) $caHudStatus.textContent = detail.slice(0, 30).toUpperCase()
+  const d = detail || ''   // guard: a message with no `detail` must not crash
+  if ($caHudStatus) $caHudStatus.textContent = d.slice(0, 30).toUpperCase()
 
   const row = document.createElement('div')
   row.className = `ca-action ${action}`
   const icon = _CA_ICONS[action] || _CA_ICONS.default
-  row.innerHTML = `<span class="ca-action-icon">${icon}</span><span>${escHtml(detail)}</span>`
+  row.innerHTML = `<span class="ca-action-icon">${icon}</span><span>${escHtml(d)}</span>`
   $caHudLog.appendChild(row)
 
   // Keep only last _CA_MAX_LOG rows
@@ -3212,7 +4203,10 @@ function hideComputerAgentHUD () {
     // Audio histogram — mirrors waveform activity
     if (Math.floor(t * 4) !== Math.floor((t - 0.05) * 4)) {
       histAudData.shift()
-      const isActive = document.body.classList.contains('state-speaking') || document.body.classList.contains('state-thinking')
+      // Use jarvisState — the 'state-speaking'/'state-thinking' body classes it
+      // checked before are never set (applyState sets bare state on #app), so
+      // the audio histogram stayed idle even while JARVIS spoke.
+      const isActive = jarvisState === 'speaking' || jarvisState === 'thinking'
       histAudData.push(isActive ? 40 + Math.random() * 55 : 5 + Math.random() * 30)
     }
     const audBars = document.querySelectorAll('#hist-audio .hud-hist-bar')
@@ -3253,8 +4247,27 @@ function hideComputerAgentHUD () {
 
 // ── Gaming HUD input wiring ───────────────────────────────────────────────────
 
+// Update the corner-strip mode badge. Pass 'watch' | 'gaming' | 'work' to show
+// it, or null/undefined to hide it. Unknown modes are ignored (badge hidden).
+function _setModeBadge (mode) {
+  const el = document.getElementById('gm-mode')
+  if (!el) return
+  const known = { watch: 'WATCH', gaming: 'GAMING', work: 'WORK' }
+  const label = known[mode]
+  if (!label) {
+    el.hidden = true
+    el.textContent = ''
+    el.className = ''
+    return
+  }
+  el.textContent = label
+  el.className = 'mode-' + mode
+  el.hidden = false
+}
+
 function _gmAttach () {
   const inp = document.getElementById('gm-input')
+  const hud = document.getElementById('gaming-hud')
   if (!inp || inp._gmBound) return
   inp._gmBound = true
   inp.addEventListener('keydown', (e) => {
@@ -3266,5 +4279,16 @@ function _gmAttach () {
       }
     }
   })
+  // Auto-focus immediately when entering work/gaming mode so user can type
+  setTimeout(() => inp.focus(), 80)
+  // Clicking anywhere on the HUD strip focuses the input (bigger click target)
+  if (hud && !hud._gmClickBound) {
+    hud._gmClickBound = true
+    hud.addEventListener('click', (e) => {
+      // Don't steal focus from links/buttons inside the HUD
+      if (e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return
+      inp.focus()
+    })
+  }
 }
 

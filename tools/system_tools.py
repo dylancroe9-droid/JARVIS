@@ -131,6 +131,23 @@ def open_application(target: str) -> str:
         except Exception:
             pass
 
+    # ── FALLBACK: no app by that name → treat it as a place to VISIT on the web.
+    # "Open Peacock" should never dead-end just because there's no native app —
+    # open the known site (peacock → peacocktv.com) or, failing that, a search.
+    try:
+        from tools.web_tools import _resolve_known_site
+        url = _resolve_known_site(target)
+    except Exception:
+        url = None
+    if not url:
+        import urllib.parse as _up
+        url = "https://www.google.com/search?q=" + _up.quote(target)
+    try:
+        subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return f"No app called '{target}', sir — opened it on the web instead."
+    except Exception:
+        pass
+
     return f"Couldn't open '{app_name}': {result.stderr.strip() or 'app not found'}"
 
 

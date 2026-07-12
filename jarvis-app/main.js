@@ -155,16 +155,35 @@ ipcMain.on('open-external', (_e, url) => {
 })
 ipcMain.on('app-relaunch', () => {
   // Kill the Python server before relaunch so the new process can bind 8765.
-  if (pyProcess) { try { pyProcess.kill('SIGTERM') } catch (_) {} }
-  app.relaunch()
-  app.exit(0)
+  // Previous code only sent SIGTERM and immediately called app.exit, which
+  // left a zombie Python process if SIGTERM hung (Whisper warm-up, mic
+  // closing, etc.). Try SIGTERM first, escalate to SIGKILL after 1.5s.
+  killPythonServerForcefully(() => { app.relaunch(); app.exit(0) })
 })
+
+function killPythonServerForcefully (done) {
+  if (!pyProcess) { done(); return }
+  let killed = false
+  try { pyProcess.kill('SIGTERM') } catch (_) {}
+  const onExit = () => { killed = true; done() }
+  pyProcess.once('exit', onExit)
+  setTimeout(() => {
+    if (killed) return
+    try { pyProcess.kill('SIGKILL') } catch (_) {}
+    // Give SIGKILL a tick to actually terminate, then proceed regardless
+    setTimeout(() => { if (!killed) done() }, 200)
+  }, 1500)
+}
 
 // ── Camera mode — resize window to fill screen / restore ──────────────────────
 let _normalBounds = null
 
 ipcMain.on('cam-mode-on', () => {
   if (!mainWindow) return
+  // Guard against a second 'camera mode' while already in it — otherwise we'd
+  // overwrite _normalBounds with the CURRENT (fullscreen) bounds, and exit
+  // would then "restore" to fullscreen instead of the real normal size.
+  if (_normalBounds !== null) return
   _normalBounds = mainWindow.getBounds()
   const { workArea } = screen.getPrimaryDisplay()
   mainWindow.setBounds({
@@ -187,6 +206,17 @@ ipcMain.on('cam-mode-off', () => {
 ipcMain.on('set-display-mode', (_e, mode) => {
   if (!mainWindow) return
   const { workArea } = screen.getPrimaryDisplay()
+  // Any mode other than the compact gaming HUD needs the normal window chrome.
+  // The 'gaming' branch strips resizable/opacity/vibrancy; previously only the
+  // never-sent 'gaming-exit' restored them, so exiting gaming via 'desktop' or
+  // 'work' left the window stuck fixed-size, 6% translucent, and vibrancy-less
+  // until an app restart. Restoring here for every non-gaming mode fixes that.
+  if (mode !== 'gaming') {
+    mainWindow.setResizable(true)
+    mainWindow.setMinimumSize(380, 600)
+    try { mainWindow.setVibrancy('under-window') } catch (_) {}
+    mainWindow.setOpacity(1.0)
+  }
   if (mode === 'desktop') {
     const w = Math.min(960, workArea.width - 40)
     const h = 520
@@ -327,7 +357,19 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
 })
 
-app.on('before-quit', () => {
+app.on('before-quit', (e) => {
   globalShortcut.unregisterAll()
-  if (pyProcess) pyProcess.kill('SIGTERM')
+  if (pyProcess) {
+    // Same SIGTERM → SIGKILL escalation as app-relaunch — but for the
+    // normal quit path we just send SIGTERM and trust the OS to reap
+    // (SIGKILL would interrupt the quit handler).
+    try { pyProcess.kill('SIGTERM') } catch (_) {}
+    setTimeout(() => {
+      try {
+        if (pyProcess && pyProcess.exitCode === null) {
+          pyProcess.kill('SIGKILL')
+        }
+      } catch (_) {}
+    }, 1500)
+  }
 })

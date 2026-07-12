@@ -27,6 +27,19 @@ console = Console()
 SAMPLE_RATE  = 16_000
 BLOCK_SIZE   = 512            # 32 ms per block — fast VAD / barge-in response
 
+# WebRTC VAD requires EXACTLY one of {80, 160, 240, 320, 480, 640} samples
+# per frame at 16kHz (corresponding to 10/15/20/30/40ms windows). Our
+# BLOCK_SIZE (512) doesn't match any of those, so we use the largest VAD
+# frame that fits inside one block — 30ms / 480 samples — and silently
+# discard the trailing ~2ms. This used to be hardcoded as `chunk[:480]`
+# inside _is_speech which broke if BLOCK_SIZE ever changed below 480 and
+# silently fell back to RMS on any error. Now it's a named constant and
+# the slicing is bounds-checked.
+WEBRTC_VAD_FRAME_SAMPLES = 480     # 30 ms at 16 kHz — valid for WebRTC VAD
+assert WEBRTC_VAD_FRAME_SAMPLES <= BLOCK_SIZE, (
+    f"WebRTC frame ({WEBRTC_VAD_FRAME_SAMPLES}) must fit in BLOCK_SIZE ({BLOCK_SIZE})"
+)
+
 # WebRTC VAD replaces raw RMS as the primary speech detector.
 # It's a ML model specifically trained to distinguish human speech from noise,
 # music, fan hum, phone audio, etc. — far more accurate than RMS alone.
@@ -34,7 +47,7 @@ BLOCK_SIZE   = 512            # 32 ms per block — fast VAD / barge-in response
 WEBRTC_AGGRESSIVENESS = 2     # 0=permissive … 3=aggressive noise rejection; 2 is the sweet spot
 VAD_RMS_FLOOR = 80            # absolute silence floor — skip WebRTC below this (saves CPU)
 VAD_RMS      = 210            # fallback RMS threshold if WebRTC unavailable
-VAD_ONSET    = 2              # 2 consecutive speech blocks (~64ms) before flagging speech start
+VAD_ONSET    = 1              # 1 speech block (~32ms) before flagging — was 2 (clipped first word)
 SILENCE_SECS = 0.5            # wake detection: flush after 0.5s silence
 SILENCE_BLKS = int(SILENCE_SECS * SAMPLE_RATE / BLOCK_SIZE)
 
@@ -43,7 +56,7 @@ CMD_SILENCE_BLKS = int(CMD_SILENCE_SECS * SAMPLE_RATE / BLOCK_SIZE)
 
 MAX_WAKE_SECS   = 7
 MAX_WAKE_BLKS   = int(MAX_WAKE_SECS * SAMPLE_RATE / BLOCK_SIZE)
-KEEP_BLKS       = int(0.4 * SAMPLE_RATE / BLOCK_SIZE)   # 0.4 s pre-roll
+KEEP_BLKS       = int(0.8 * SAMPLE_RATE / BLOCK_SIZE)   # 0.8s pre-roll (was 0.4s — first word kept getting clipped)
 
 MAX_CMD_SECS    = 12
 MAX_CMD_BLKS    = int(MAX_CMD_SECS * SAMPLE_RATE / BLOCK_SIZE)
@@ -53,22 +66,51 @@ CMD_TIMEOUT_BLKS = int(CMD_TIMEOUT_SECS * SAMPLE_RATE / BLOCK_SIZE)
 CONVERSE_TIMEOUT_SECS = 2     # seconds of silence before reverting to wake-word mode
 CONVERSE_TIMEOUT_BLKS = int(CONVERSE_TIMEOUT_SECS * SAMPLE_RATE / BLOCK_SIZE)
 
-BARGE_RMS_MIN  = 1400         # floor: raised so phone-call bleed through speaker won't fire barge-in
-BARGE_RMS_MAX  = 2200         # ceiling: raised to match
-BARGE_MEASURE  = 28           # blocks to sample ambient/speaker level (~896ms — long enough to capture TTS bleed)
-BARGE_FRAMES   = 25           # ~800ms of continuous loud speech needed — prevents any accidental barge-in
+BARGE_RMS_MIN  = 1800         # floor: MUST sit above JARVIS's own ElevenLabs
+                              # speaker bleed (~1500 RMS) or he self-interrupts.
+                              # Was 800 — when the ambient window happened to
+                              # sample a silent gap, the threshold floored to 800
+                              # (BELOW his own voice) and he cut himself off
+                              # mid-sentence. 1800 clears the bleed with margin
+                              # while normal near-mic speech (2000+) still trips it.
+BARGE_RMS_MAX  = 3500         # ceiling: high enough that ElevenLabs speaker bleed
+                              # (~1500 RMS) doesn't pin the threshold at the cap
+BARGE_MEASURE  = 20           # blocks to sample ambient/speaker level (~640ms)
+BARGE_FRAMES   = 15           # ~480ms — slightly longer than 380ms to avoid false trips
+                              # from JARVIS's own voice variation during ElevenLabs playback
+BARGE_MULT     = 2.5          # threshold = ambient × this. Was 2.2 — bumped for headroom.
 
 MIN_AUDIO    = int(0.20 * SAMPLE_RATE)   # skip STT if audio < 200 ms (was 350 — was dropping short commands)
 
 def _load_wake_words() -> list[str]:
-    """Comma-separated env override → fall back to defaults."""
+    """Comma-separated env override → fall back to defaults.
+
+    Includes common Whisper mistranscriptions of "JARVIS" so the wake-word
+    detector still fires even when STT mangles the name. Empirically observed
+    on MacBook Air built-in mic with Whisper small:
+      "joris", "jervis", "arvis", "yarvis", "javris", "jorvis", "jarvis"
+    Plus common compound mistakes:
+      "hate arvis" (heard "hey jarvis"), "he jarvis" (heard "hey jarvis"),
+      "hey joris", "ok arvis", etc.
+    """
     import os as _os
     raw = _os.getenv("JARVIS_WAKE_WORDS", "").strip()
     if raw:
         words = [w.strip().lower() for w in raw.split(",") if w.strip()]
         if words:
             return words
-    return ["jarvis", "hey jarvis", "ok jarvis", "yo jarvis", "okay jarvis"]
+    return [
+        # Canonical
+        "jarvis", "hey jarvis", "ok jarvis", "yo jarvis", "okay jarvis",
+        # Whisper STT mistranscriptions of "jarvis"
+        "joris", "jervis", "jorvis", "yarvis", "javris",
+        # Whisper mishears "hey" as "hate" / "he" / "hi"
+        "hate jarvis", "hate arvis", "he jarvis", "he arvis", "hi jarvis",
+        "hey joris", "hey jervis", "hey arvis", "hey yarvis",
+        "ok arvis", "okay arvis",
+        # Bare "arvis" (sometimes the "j" gets clipped)
+        "arvis",
+    ]
 
 
 WAKE_WORDS = _load_wake_words()
@@ -240,7 +282,7 @@ class AudioEngine:
         try:
             default_in = sd.query_devices(kind='input')
             console.print(f"[green]✓ Voice ready — always-on | mic: {default_in['name']}[/green]")
-            console.print(f"[dim]  No wake word needed — JARVIS hears everything[/dim]")
+            console.print("[dim]  No wake word needed — JARVIS hears everything[/dim]")
         except Exception:
             console.print("[green]✓ Voice ready — always-on[/green]")
 
@@ -260,24 +302,40 @@ class AudioEngine:
 
     def _is_speech(self, chunk: np.ndarray, rms: float) -> bool:
         """
-        Returns True if this audio block contains human speech FROM the enrolled user.
+        Returns True if this audio block contains human speech.
 
         Pipeline:
           1. Energy floor — reject absolute silence instantly
           2. WebRTC VAD — ML model rejects noise/music/fan hum/phone bleed
-          3. Voice profile check — compares speaker embedding to Dylan's voiceprint
-             (only runs when a profile is enrolled; skips if none saved)
+
+        No per-block speaker check: a 32ms chunk is far too short for
+        resemblyzer (needs ~0.5s), so it can't verify identity here. The
+        server's wake-word gate ("Hey JARVIS") is what scopes commands to Dylan.
         """
         if rms < VAD_RMS_FLOOR:
             return False
 
         # Step 1: WebRTC VAD — is this speech at all?
+        # Frame must be EXACTLY WEBRTC_VAD_FRAME_SAMPLES (480) samples and
+        # contiguous int16 PCM. If the audio block is too short (mic warm-up,
+        # stream restart, partial final block), fall back to RMS rather than
+        # silently letting WebRTC throw a misleading exception.
         is_speech = False
-        if self._webrtc_vad is not None:
+        if self._webrtc_vad is not None and len(chunk) >= WEBRTC_VAD_FRAME_SAMPLES:
             try:
-                frame = chunk[:480].astype(np.int16).tobytes()
-                is_speech = self._webrtc_vad.is_speech(frame, SAMPLE_RATE)
-            except Exception:
+                frame_int16 = np.ascontiguousarray(
+                    chunk[:WEBRTC_VAD_FRAME_SAMPLES], dtype=np.int16
+                )
+                is_speech = self._webrtc_vad.is_speech(
+                    frame_int16.tobytes(), SAMPLE_RATE
+                )
+            except Exception as exc:
+                # Genuine errors (not size-related) should be visible — they
+                # almost always mean the VAD library is in a bad state. We
+                # still fall back to RMS so the audio engine keeps working.
+                if not isinstance(exc, ValueError):
+                    print(f"[vad] unexpected error — {type(exc).__name__}: {exc}",
+                          flush=True)
                 is_speech = rms > VAD_RMS
         else:
             is_speech = rms > VAD_RMS
@@ -285,14 +343,13 @@ class AudioEngine:
         if not is_speech:
             return False
 
-        # Step 2: Voice profile check — is this speech from Dylan?
-        # Runs only if a profile is enrolled. Adds ~20ms but only reaches here
-        # after WebRTC already confirmed speech, so false positives are rare.
-        try:
-            from voice.voice_profile import is_owner
-            return is_owner(chunk)
-        except Exception:
-            return True   # profile check failed → accept (don't drop real commands)
+        # Speaker identity is NOT checked here. A per-block resemblyzer check on
+        # a single 32ms chunk can't work (it needs >= 0.5s), so the old
+        # is_owner(chunk) call always returned True — pure dead weight. WebRTC
+        # VAD above already rejects music/noise/bleed, and the server's
+        # wake-word gate ("Hey JARVIS") filters non-commands, so a block that
+        # reaches here is treated as speech.
+        return True
 
     def start_detecting(self) -> None:
         """Passive wake word scanning."""
@@ -479,11 +536,19 @@ class AudioEngine:
                 if self._barge_measure == BARGE_MEASURE:
                     avg = self._barge_rms_sum / BARGE_MEASURE
                     # Threshold = 2× the measured ambient (speaker bleed), clamped
-                    self._barge_threshold = min(BARGE_RMS_MAX, max(BARGE_RMS_MIN, avg * 2.2))
+                    self._barge_threshold = min(BARGE_RMS_MAX, max(BARGE_RMS_MIN, avg * BARGE_MULT))
                     console.print(f"[dim]barge-in threshold set: {self._barge_threshold:.0f} (ambient {avg:.0f})[/dim]")
                 return  # don't fire during measurement window
 
-            # Phase 2 — detect sustained voice above threshold
+            # Phase 2 — fire on sustained voice above the measured threshold.
+            #
+            # There is deliberately NO speaker-ID check here. During barge-in the
+            # mic is hearing JARVIS's OWN TTS bleed mixed with whatever the user
+            # says, so any resemblyzer embedding is contaminated — it can't tell
+            # "Dylan over my voice" from "my voice alone", and verifying would
+            # only add false-negatives (dropping real interruptions). The dynamic
+            # threshold (2.5× the measured bleed/ambient) is the correct and
+            # sufficient signal: only audio LOUDER than JARVIS's own bleed counts.
             if rms > self._barge_threshold:
                 self._loud_count += 1
                 if self._loud_count >= BARGE_FRAMES:
@@ -518,10 +583,21 @@ class AudioEngine:
         try:
             import whisper as _whisper
             from config import WHISPER_MODEL
-            model_name = WHISPER_MODEL if WHISPER_MODEL in ("tiny", "base", "small", "medium") else "base"
+            model_name = WHISPER_MODEL if WHISPER_MODEL in (
+                "tiny", "base", "small", "medium", "large", "large-v3", "turbo"
+            ) else "base"
             self._whisper      = _whisper.load_model(model_name)   # primary (base)
-            self._whisper_tiny = _whisper.load_model("tiny")        # fast path for short clips
-            console.print(f"[green]✓ Whisper {model_name} + tiny loaded — two-tier STT active[/green]")
+            # Load the tiny fast-path model in its OWN try — if only tiny fails,
+            # we must NOT discard the base model we just loaded (that would drop
+            # Whisper entirely and force Google STT). _transcribe already falls
+            # back to base when _whisper_tiny is None.
+            try:
+                self._whisper_tiny = _whisper.load_model("tiny")   # fast path for short clips
+                console.print(f"[green]✓ Whisper {model_name} + tiny loaded — two-tier STT active[/green]")
+            except Exception as _texc:
+                self._whisper_tiny = None
+                console.print(f"[yellow]Whisper tiny unavailable ({type(_texc).__name__}) — "
+                              f"using {model_name} for all clips[/yellow]")
         except Exception as exc:
             # Whisper failures fall into a few buckets; give the user something
             # actionable instead of just dumping the traceback.
@@ -552,20 +628,56 @@ class AudioEngine:
             try:
                 import whisper as _whisper
                 audio_f32 = audio_np.astype(np.float32) / 32768.0
-                # Pick model based on clip length
-                is_short  = len(audio_np) <= SAMPLE_RATE * 2   # ≤ 2 seconds
-                model     = getattr(self, "_whisper_tiny", None) if is_short else None
-                if model is None:
-                    model = self._whisper
+                # Use the ACCURATE model for every clip. The old two-tier path
+                # sent short (≤2s) clips to the `tiny` model to save ~0.5s — but
+                # short clips are exactly the voice COMMANDS, and mis-hearing a
+                # command (which then does the wrong thing) is far worse than a
+                # small delay. tiny is only a last-resort fallback now.
+                model = self._whisper or getattr(self, "_whisper_tiny", None)
+                # NO initial_prompt — even "Hey JARVIS, this is Dylan" caused
+                # Whisper to hallucinate that exact phrase from silence/noise.
+                # Wake-word fuzzy matcher catches transcription variants instead.
                 result = model.transcribe(
                     audio_f32,
                     language="en",
                     fp16=False,
                     condition_on_previous_text=False,
                 )
-                if result.get("no_speech_prob", 0) > 0.85:
+                # Drop transcriptions Whisper isn't confident were real speech.
+                # LOOSENED to 0.75 — Dylan was having to yell at 0.60.
+                if result.get("no_speech_prob", 0) > 0.75:
                     profiler.mark("stt_end")
                     return ""
+                # Whisper YouTube-training-data ghost phrases. These are the
+                # most common phantom outputs when fed silence/music/noise.
+                # Match by SUBSTRING so "thanks for watching, please" also gets caught.
+                _whisper_ghost_substrings = (
+                    "thanks for watching", "thank you for watching",
+                    "subscribe to", "like and subscribe", "please subscribe",
+                    "see you next time", "see you in the next video",
+                    "don't forget to subscribe", "smash that like button",
+                    "see you in the next one",
+                )
+                _text_stripped = result.get("text", "").strip().lower()
+                if any(g in _text_stripped for g in _whisper_ghost_substrings):
+                    profiler.mark("stt_end")
+                    return ""
+                # Single-word phantoms (exact match only — don't drop legit "you")
+                _whisper_ghost_exact = {
+                    "you.", "you", "thank you.", "thank you",
+                    "bye.", "bye", "goodbye.", "goodbye", "okay.", "ok.",
+                    ".", "..", "...", "♪", "♪♪",
+                }
+                if _text_stripped in _whisper_ghost_exact:
+                    profiler.mark("stt_end")
+                    return ""
+                # Drop only the WORST low-confidence guesses (was -1.0, too strict)
+                segs = result.get("segments", [])
+                if segs:
+                    avg_logprob = sum(s.get("avg_logprob", 0) for s in segs) / len(segs)
+                    if avg_logprob < -1.5:
+                        profiler.mark("stt_end")
+                        return ""
                 text = result.get("text", "").strip()
                 profiler.mark("stt_end")
                 return text
@@ -574,8 +686,22 @@ class AudioEngine:
 
         # ── Google STT fallback ───────────────────────────────────────────────
         sr = self._sr
+        if sr is None:
+            # speech_recognition wasn't importable at startup and Whisper
+            # also failed — nothing left to fall back to. Return empty
+            # instead of crashing the loop with an AttributeError.
+            profiler.mark("stt_end")
+            return ""
         r  = sr.Recognizer()
-        audio_data = sr.AudioData(audio_np.tobytes(), SAMPLE_RATE, 2)
+        # Frame width (bytes/sample) must match the actual dtype — earlier
+        # code hardcoded 2 (int16). If the audio buffer is ever float32 or
+        # int32, that constant becomes a lie and Google interprets the
+        # bytes at the wrong sample boundary, producing gibberish or
+        # silent failures. Derive from the array itself.
+        if audio_np.dtype != np.int16:
+            audio_np = audio_np.astype(np.int16)
+        frame_width = audio_np.dtype.itemsize       # 2 for int16, future-proof
+        audio_data = sr.AudioData(audio_np.tobytes(), SAMPLE_RATE, frame_width)
         try:
             return r.recognize_google(audio_data, language="en-US").strip()
         finally:
@@ -585,6 +711,19 @@ class AudioEngine:
         # Load Whisper before entering the loop
         self._load_whisper()
 
+        # Resolve `UnknownValueError` once up-front rather than evaluating
+        # `self._sr.UnknownValueError` on every except. If speech_recognition
+        # failed to import, self._sr is None and Python would raise
+        # AttributeError when parsing the except clause — crashing the STT
+        # thread on the very first iteration. Use a sentinel class that
+        # never gets raised in that case so the loop still works.
+        class _NeverRaised(Exception):
+            """Stand-in when speech_recognition is unavailable."""
+        unknown_value_error = (
+            getattr(self._sr, "UnknownValueError", _NeverRaised)
+            if self._sr is not None else _NeverRaised
+        )
+
         while True:
             item = self._audio_q.get()
             if item is None:
@@ -593,7 +732,7 @@ class AudioEngine:
             kind, audio_np = item
             try:
                 text = self._transcribe(audio_np).lower()
-            except self._sr.UnknownValueError:
+            except unknown_value_error:
                 continue
             except Exception as exc:
                 console.print(f"[dim]STT error: {exc}[/dim]")

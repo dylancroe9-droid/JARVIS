@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import threading
 import uuid
@@ -103,13 +104,21 @@ _greeting_started = False              # guard — greet only on the first ever 
 _mic_muted        = False              # True while user has manually muted the mic
 _cancelled_timers: set[str] = set()   # timer IDs cancelled by user
 
+# Lip motion gating — fed by mouth_state WebSocket messages from the renderer.
+# When face was visible and mouth was moving recently, voice commands are
+# accepted. When face visible but mouth idle, the audio is dropped (someone
+# else / a video / room voice). When no face signal at all (camera off), the
+# gate disables itself — voice profile is the only verifier.
+_last_mouth_active_at: float = 0.0      # last MAR-active timestamp
+_last_mouth_signal_at: float = 0.0      # last time renderer sent any mouth_state
+_face_visible:         bool  = False    # last reported face visibility
+
 
 def _run_health_check() -> None:
     """
     Probe real system components and update _system_status + personality.
     Runs once on startup in a background thread. Broadcasts updated status to UI.
     """
-    import time as _t
 
     def _probe_weather() -> bool:
         try:
@@ -196,6 +205,33 @@ _sleep_mode = False
 # Acknowledgment sound path — pre-rendered at startup
 _ACK_SOUND_PATH = "/tmp/jarvis_ack.aiff"
 
+# Music ducking during conversation — when a command survives the music gate,
+# we duck Apple Music so JARVIS can hear the rest of the exchange over it, and
+# restore the volume a few seconds after the conversation goes quiet. This
+# timer is reset on every command so a back-and-forth keeps the music low.
+_unduck_timer = None
+_unduck_lock = threading.Lock()
+_UNDUCK_GRACE_SEC = 10.0
+
+
+def _duck_music_for_conversation() -> None:
+    """Duck Apple Music now and (re)arm a timer to restore it after a lull."""
+    global _unduck_timer
+    try:
+        from tools.music_tools import duck_music, unduck_music
+        duck_music()
+        # Guard the timer swap — this is now called from both the request thread
+        # (music gate) and a background thread (_say), so an unguarded
+        # cancel/create/assign could leak a timer or restore at the wrong time.
+        with _unduck_lock:
+            if _unduck_timer is not None:
+                _unduck_timer.cancel()
+            _unduck_timer = threading.Timer(_UNDUCK_GRACE_SEC, unduck_music)
+            _unduck_timer.daemon = True
+            _unduck_timer.start()
+    except Exception:
+        pass
+
 
 # ── Broadcast helpers ─────────────────────────────────────────────────────────
 
@@ -214,6 +250,357 @@ def broadcast(msg: dict) -> None:
     """Thread-safe: send msg to all connected frontends."""
     if _loop and _loop.is_running():
         asyncio.run_coroutine_threadsafe(_broadcast(msg), _loop)
+
+
+# ── Music now-playing poller ────────────────────────────────────────────────
+# Polls Apple Music every 4s for current track + state and broadcasts to the
+# HUD. Auto-starts when JARVIS plays something, stops when Music is paused
+# for a while (no point polling silence forever).
+_music_poller_thread = None
+_music_poller_stop = threading.Event()
+
+# True while ANY system audio is playing (Music, Safari/Chrome video,
+# YouTube, podcasts, etc). Triggers wake-word mode on the mic so video
+# lyrics/dialogue don't get transcribed as commands.
+_music_is_playing: bool = False
+_system_audio_playing: bool = False
+
+# Notification announcement control — voice command can mute/unmute.
+_notifications_muted: bool = False
+
+# The running notification monitor, tracked at module scope so the diagnostics
+# self-fixer can stop a dead one and restart it with the REAL callback (see
+# _on_notification below). Previously the fixer couldn't reach the callback —
+# it was a nested function — so it installed a no-op and falsely reported
+# "fixed" while notifications stayed silently dead.
+_notif_mon = None
+
+# Screen-description monitor thread (started in work/watch/gaming so
+# "what am I looking at" answers from a warm cache). Kept as a module ref so
+# we never start two.
+_screen_monitor_thread: "threading.Thread | None" = None
+_screen_monitor_lock = threading.Lock()
+
+
+def _extract_artwork_from_music_app() -> str:
+    """
+    Pull current track's artwork directly from Apple Music via AppleScript.
+    Works for ANY track Apple Music can play (no iTunes Search dependency).
+    Returns a data: URL or empty string.
+    """
+    import subprocess as _sp, os as _os, base64 as _b64
+    art_path = "/tmp/jarvis_art.dat"
+    try:
+        r = _sp.run(["osascript", "-e",
+            'tell application "Music"\n'
+            '  try\n'
+            '    set theArt to raw data of artwork 1 of current track\n'
+            '    set f to (open for access POSIX file "' + art_path + '" with write permission)\n'
+            '    set eof f to 0\n'
+            '    write theArt to f\n'
+            '    close access f\n'
+            '    return "ok"\n'
+            '  on error\n'
+            '    return ""\n'
+            '  end try\n'
+            'end tell'
+        ], capture_output=True, text=True, timeout=4)
+        if (r.stdout or "").strip() != "ok" or not _os.path.exists(art_path):
+            return ""
+        size = _os.path.getsize(art_path)
+        if size < 200:
+            _os.unlink(art_path)
+            return ""
+        # Detect MIME from magic bytes (artwork can be PNG, JPEG, or TIFF)
+        with open(art_path, "rb") as f:
+            header = f.read(12)
+        if header[:8] == b"\x89PNG\r\n\x1a\n":
+            mime = "image/png"
+        elif header[:3] == b"\xff\xd8\xff":
+            mime = "image/jpeg"
+        elif header[:4] in (b"II*\x00", b"MM\x00*"):
+            mime = "image/tiff"
+        else:
+            mime = "image/jpeg"   # best guess
+        with open(art_path, "rb") as f:
+            data = _b64.b64encode(f.read()).decode("ascii")
+        _os.unlink(art_path)
+        return f"data:{mime};base64,{data}"
+    except Exception:
+        return ""
+
+
+def _get_artwork_url(title: str, artist: str, album: str = "") -> str:
+    """
+    Get current track's artwork. Tries Apple Music app first (always accurate
+    when track is present), falls back to iTunes Search API for catalog hits.
+    """
+    # Try Apple Music first — guaranteed to be the actual track's artwork
+    art = _extract_artwork_from_music_app()
+    if art:
+        return art
+    # Fall back to iTunes Search API with strict matching
+    import urllib.request, urllib.parse, json as _json, re
+    if not title or not artist:
+        return ""
+    # Strip "(feat. X)" / "[feat. X]" from the title for cleaner search hits
+    title_q = re.sub(r"\s*[\(\[]\s*feat\.?[^\)\]]*[\)\]]", "", title, flags=re.I).strip()
+    # Primary artist only (drop "& Lil Uzi Vert" type suffixes)
+    artist_q = re.split(r"\s*(?:&|feat\.?|,)\s*", artist, flags=re.I)[0].strip()
+    title_low  = title_q.lower()
+    artist_low = artist_q.lower()
+
+    def _to_500(url: str) -> str:
+        return url.replace("100x100", "500x500") if url else ""
+
+    try:
+        # Search for songs specifically (entity=song)
+        q = f"{title_q} {artist_q}".strip()
+        url = ("https://itunes.apple.com/search?"
+               + urllib.parse.urlencode({
+                   "term": q, "media": "music", "entity": "song", "limit": 25,
+               }))
+        with urllib.request.urlopen(url, timeout=4) as r:
+            data = _json.loads(r.read().decode("utf-8", "ignore"))
+        results = data.get("results") or []
+
+        # Pass 1: exact artist match + title contained in result track name
+        for hit in results:
+            ha = (hit.get("artistName") or "").lower()
+            ht = (hit.get("trackName")  or "").lower()
+            if ha == artist_low and title_low in ht:
+                return _to_500(hit.get("artworkUrl100", ""))
+
+        # Pass 2: artist substring + title substring (handles "Playboi Carti & X")
+        for hit in results:
+            ha = (hit.get("artistName") or "").lower()
+            ht = (hit.get("trackName")  or "").lower()
+            if (artist_low in ha or ha in artist_low) and title_low in ht:
+                return _to_500(hit.get("artworkUrl100", ""))
+
+        # Pass 3: exact artist match alone (track names sometimes vary)
+        for hit in results:
+            ha = (hit.get("artistName") or "").lower()
+            if ha == artist_low:
+                return _to_500(hit.get("artworkUrl100", ""))
+
+        # No good match → return empty rather than wrong art
+        return ""
+    except Exception:
+        return ""
+
+
+def _start_music_poller() -> None:
+    """
+    Background poller that mirrors Apple Music to the HUD widget AND flips
+    the mic to wake-word-required mode when music plays. Broadcasts a rich
+    payload: track + artist + album + state + position + duration + artwork.
+    """
+    global _music_poller_thread
+    if _music_poller_thread and _music_poller_thread.is_alive():
+        return
+    _music_poller_stop.clear()
+    def _loop():
+        global _music_is_playing
+        import subprocess as _sp
+        last_track = None
+        art_cache: dict = {"key": None, "data": ""}   # avoid re-pulling art unchanged
+        while not _music_poller_stop.is_set():
+            try:
+                r = _sp.run(
+                    ["osascript", "-e",
+                     'tell application "Music"\n'
+                     '  if it is running then\n'
+                     '    set s to player state as string\n'
+                     '    if s is "playing" or s is "paused" then\n'
+                     '      set n to name of current track\n'
+                     '      set a to artist of current track\n'
+                     '      set al to album of current track\n'
+                     '      set p to player position as string\n'
+                     '      set d to duration of current track as string\n'
+                     '      return s & "|" & n & "|" & a & "|" & al & "|" & p & "|" & d\n'
+                     '    else\n'
+                     '      return s & "|||||"\n'
+                     '    end if\n'
+                     '  else\n'
+                     '    return "not_running|||||"\n'
+                     '  end if\n'
+                     'end tell'],
+                    capture_output=True, text=True, timeout=3,
+                )
+                out = (r.stdout or "").strip()
+                parts = out.split("|")
+                if len(parts) >= 6:
+                    state, name, artist, album, pos, dur = parts[:6]
+                    track_key = f"{name}|{artist}|{album}"
+                    if state == "playing" and name:
+                        # Look up artwork via iTunes Search API once per track
+                        if track_key != art_cache["key"]:
+                            art_cache["key"]  = track_key
+                            art_cache["data"] = _get_artwork_url(name, artist, album)
+                        try:
+                            pos_f = float(pos) if pos else 0.0
+                            dur_f = float(dur) if dur else 0.0
+                        except Exception:
+                            pos_f = 0.0; dur_f = 0.0
+                        broadcast({
+                            "type":     "now_playing",
+                            "state":    "playing",
+                            "title":    name,
+                            "artist":   artist,
+                            "album":    album,
+                            "position": pos_f,
+                            "duration": dur_f,
+                            "artwork":  art_cache["data"],
+                        })
+                        last_track = track_key
+                        if not _music_is_playing:
+                            _music_is_playing = True
+                            try:
+                                if audio: audio.start_detecting()
+                            except Exception: pass
+                            print("[music] playing — switched to wake-word mode", flush=True)
+                    elif state in ("paused", "stopped") and last_track is not None:
+                        # Paused → hide widget AND restore conversing
+                        broadcast({"type": "now_playing", "state": "stopped"})
+                        last_track = None
+                        art_cache["key"] = None
+                        if _music_is_playing:
+                            _music_is_playing = False
+                            try:
+                                if audio and not _mic_muted: audio.start_conversing()
+                            except Exception: pass
+                            print("[music] paused — back to always-on", flush=True)
+                    else:
+                        if last_track is not None:
+                            broadcast({"type": "now_playing", "state": "stopped"})
+                            last_track = None
+                            art_cache["key"] = None
+                        if _music_is_playing:
+                            _music_is_playing = False
+                            try:
+                                if audio and not _mic_muted: audio.start_conversing()
+                            except Exception: pass
+                            print("[music] stopped — back to always-on", flush=True)
+            except Exception:
+                pass
+            _music_poller_stop.wait(2.0)
+    _music_poller_thread = threading.Thread(target=_loop, daemon=True, name="music-poller")
+    _music_poller_thread.start()
+
+
+_system_audio_thread = None
+_system_audio_stop = threading.Event()
+
+def _start_system_audio_watcher() -> None:
+    """
+    Polls CoreAudio every 2s for "is the output device running anywhere?"
+    When ANY app is producing audio (Music, video, podcast, etc.), flips
+    the mic to wake-word mode. When it stops, restores conversing.
+    """
+    global _system_audio_thread
+    if _system_audio_thread and _system_audio_thread.is_alive():
+        return
+    _system_audio_stop.clear()
+    def _loop():
+        # Only _system_audio_playing is assigned here; _music_is_playing is
+        # read-only in this scope so it doesn't need a global declaration.
+        global _system_audio_playing
+        from tools.system_audio import is_system_audio_playing
+        consecutive_off = 0
+        while not _system_audio_stop.is_set():
+            try:
+                playing = is_system_audio_playing()
+            except Exception:
+                playing = False
+            if playing:
+                consecutive_off = 0
+                if not _system_audio_playing:
+                    _system_audio_playing = True
+                    if not _music_is_playing:
+                        try:
+                            if audio: audio.start_detecting()
+                        except Exception: pass
+                        print("[audio] system audio detected — wake-word mode", flush=True)
+            else:
+                # Require 3 consecutive off readings before clearing — avoids
+                # flapping when audio momentarily dips between tracks.
+                consecutive_off += 1
+                if consecutive_off >= 3 and _system_audio_playing:
+                    _system_audio_playing = False
+                    # Only restore conversing if Apple Music isn't separately playing
+                    if not _music_is_playing:
+                        try:
+                            if audio and not _mic_muted: audio.start_conversing()
+                        except Exception: pass
+                        print("[audio] system audio stopped — back to always-on", flush=True)
+            _system_audio_stop.wait(2.0)
+    _system_audio_thread = threading.Thread(target=_loop, daemon=True, name="sys-audio-watcher")
+    _system_audio_thread.start()
+
+
+def _music_control(action: str, value: float | None = None) -> None:
+    """Execute an Apple Music control via AppleScript (from WebSocket)."""
+    import subprocess as _sp
+    cmd_map = {
+        "play":     'tell application "Music" to play',
+        "pause":    'tell application "Music" to pause',
+        "playpause":'tell application "Music" to playpause',
+        "next":     'tell application "Music" to next track',
+        "previous": 'tell application "Music" to previous track',
+    }
+    try:
+        if action in cmd_map:
+            _sp.run(["osascript", "-e", cmd_map[action]], capture_output=True, timeout=3)
+        elif action == "seek" and value is not None:
+            # Validate the seek position before embedding in AppleScript.
+            # The cmd_map keys above are static strings, but `value` flows
+            # in from a WebSocket message and must be a finite number — a
+            # malformed value could otherwise inject AppleScript fragments
+            # OR cause Music to interpret garbage (e.g., NaN) as an error.
+            try:
+                pos = float(value)
+            except (TypeError, ValueError):
+                print(f"[music] seek rejected — non-numeric value: {value!r}",
+                      flush=True)
+                return
+            import math
+            if not math.isfinite(pos) or pos < 0 or pos > 86400:
+                # 24h is well above any realistic track length; reject
+                # NaN / inf / negative / absurdly large positions.
+                print(f"[music] seek rejected — out-of-range value: {pos}",
+                      flush=True)
+                return
+            _sp.run(
+                ["osascript", "-e",
+                 f'tell application "Music" to set player position to {pos}'],
+                capture_output=True, timeout=3,
+            )
+    except Exception as exc:
+        print(f"[music] control failed: {exc}", flush=True)
+
+
+def notify(title: str, message: str, sound: bool = False, also_in_hud: bool = True) -> None:
+    """
+    Send a notification two ways:
+      - Native macOS banner (top-right corner, persists even when HUD hidden)
+      - In-HUD toast (instant, integrated with JARVIS visual)
+    sound=True adds the macOS Glass notification chime.
+    also_in_hud=False sends only the native banner.
+    """
+    # Native macOS banner — works even when JARVIS HUD is hidden / not focused.
+    try:
+        from tools.system_controls import show_notification
+        import threading as _thr
+        _thr.Thread(
+            target=show_notification, args=(title, message, sound),
+            daemon=True, name="notify-native",
+        ).start()
+    except Exception as exc:
+        print(f"[notify] native notification failed: {exc}", flush=True)
+    # In-HUD toast — pushes a proactive event the renderer renders as a toast.
+    if also_in_hud:
+        broadcast({"type": "proactive", "text": f"{title} — {message}" if title else message})
 
 
 def request_permission(message: str, timeout: float = 30.0, title: str = "") -> bool:
@@ -341,12 +728,75 @@ def _is_ambient_noise(text: str) -> bool:
     return False
 
 
+def _should_drop_for_lip_gate() -> bool:
+    """
+    NEW architecture: voice profile is the primary verifier; lip gate is only
+    consulted when the voice match is MARGINAL (could be Dylan, could be
+    someone else with a similar voice).
+
+    Decision tree:
+      1. Voice profile confidence HIGH (>= CONFIDENT_THRESHOLD)
+         → strong voice match → accept regardless of lip state.
+         (Dylan was sometimes off-camera or the lip detector missed his mouth.
+         This used to drop his real speech. Not anymore.)
+      2. Voice profile confidence MARGINAL (between PASS and CONFIDENT)
+         → consult lip gate as tiebreaker.
+         If face visible and mouth was active in the last 4s → accept.
+         If face visible and mouth idle → drop (probably a video / stranger).
+         If no face / no camera signal → accept (no backup available, give
+         the marginal voice match the benefit of the doubt).
+      3. Voice profile rejected (below PASS) → audio never reached this point;
+         it was dropped at the VAD layer.
+    """
+    import time as _t
+    import os as _os
+    if _os.environ.get("JARVIS_DISABLE_LIP_GATE", "").lower() in ("1", "true", "yes"):
+        return False
+
+    # ── Step 1: get voice profile match strength ───────────────────────────
+    try:
+        from voice.voice_profile import last_similarity, CONFIDENT_THRESHOLD
+        voice_score = last_similarity()
+    except Exception:
+        return False  # voice profile unavailable → don't gate at all
+
+    now = _t.time()
+    no_face_signal = (now - _last_mouth_signal_at > 30.0)
+
+    # ── Step 2: if FaceMesh sees Dylan's face, require mouth motion ───────
+    # This is the big rule. Even if voice profile thinks "yes that's Dylan,"
+    # if his face IS in frame but mouth isn't moving, the audio is coming
+    # from somewhere else (laptop video, room voice, music bleed).
+    if not no_face_signal and _face_visible:
+        if now - _last_mouth_active_at <= 4.0:
+            return False   # face + mouth motion = Dylan really talking
+        return True        # face + still mouth = drop (video bleed)
+
+    # ── Step 3: camera unavailable or Dylan off-camera ────────────────────
+    # No visual confirmation possible — voice profile must be confident.
+    # If voice was marginal (between PASS and CONFIDENT), drop to be safe.
+    if voice_score < CONFIDENT_THRESHOLD:
+        return True
+    return False
+
+
 def _is_echo(text: str) -> bool:
     """
     Return True if `text` looks like JARVIS picking up his own TTS output.
-    Uses word-overlap against the last spoken reply — >45% overlap = echo.
-    Also catches very short fragments that are almost certainly mic bleed.
+
+    Triggers:
+      1. Speaker is currently active (afplay running) → drop ALL transcriptions.
+         These are almost guaranteed to be JARVIS hearing himself.
+      2. Recent reply exists + short fragment (<3 words) → likely mic artifact.
+      3. Recent reply exists + heavy word overlap (>45%) → echo.
     """
+    # Most reliable guard: if afplay is mid-playback, this is JARVIS.
+    try:
+        if speaker._play_proc is not None and speaker._play_proc.poll() is None:
+            return True
+    except Exception:
+        pass
+
     if not _last_reply or not text:
         return False
     words = text.split()
@@ -387,17 +837,39 @@ def _resume_audio() -> None:
     if _study_mode:
         audio.start_study()
         return
-    if jarvis.tools_executor.media_opened:
-        jarvis.tools_executor.media_opened = False
-        # Music/media is playing through speakers — suspend mic entirely.
-        # Whisper would transcribe lyrics and music as commands otherwise.
-        # Mic resumes when pause_music() calls _resume_audio() again.
-        _media_mode_until = _t.time() + 3600.0
-        audio.suspend()
+    # Atomic test-and-clear — using a plain `if x: x = False` here lost
+    # media-open events when a tool thread set the flag between our read
+    # and our clear (race on a flag with multiple producers).
+    if jarvis.tools_executor.consume_media_opened():
+        # An app/media just opened (YouTube, music, or any open_application).
+        # Require the wake word for a SHORT window so video dialogue / song
+        # lyrics that start playing don't get transcribed as commands. The
+        # system-audio watcher (CoreAudio) takes over after this and keeps
+        # wake-word mode active for as long as real audio actually plays.
+        #
+        # This window was 3600s (1 HOUR) — a typo against the documented
+        # "60 seconds" intent below. Opening something as innocent as System
+        # Settings left JARVIS requiring "hey jarvis" before every command
+        # for a full hour, which read as "it can barely hear me". 30s is
+        # plenty to bridge the gap until CoreAudio reports real playback.
+        _media_mode_until = _t.time() + 30.0
+        # Use wake-word mode (start_detecting) rather than a full suspend —
+        # a full suspend made JARVIS completely deaf; wake-word mode still
+        # lets "hey jarvis" through during the bridge window.
+        audio.start_detecting()
         return
     if _focus_mode:
         audio.start_detecting()
         return
+    # When ANY system audio is playing (Music, video, podcast, browser),
+    # require wake word so video dialogue / song lyrics don't get
+    # transcribed as commands. Pollers flip these flags automatically.
+    if _music_is_playing or _system_audio_playing:
+        audio.start_detecting()
+        return
+    # NOTE: work mode stays in CONVERSING (always-on) — the lip-motion gate in
+    # _process_unsafe filters out video / room voices. Requiring a wake word
+    # defeats the purpose: Dylan wants to work hands-free while videos play.
     audio.start_conversing()
 
 
@@ -647,6 +1119,24 @@ _AR_EXIT_PHRASES = (
     "stop the build", "exit the build", "leave the build",
 )
 
+# Phrases that should INSTANTLY hide any overlay/blueprint/hologram on screen.
+# Hard-coded so they fire even when the LLM is rate-limited or off the rails.
+_OVERLAY_DISMISS_PHRASES = (
+    "take it down", "take that down", "take this down",
+    "get rid of it", "get rid of that", "get rid of this",
+    "get rid of the blueprint", "get rid of the overlay",
+    "get rid of the hologram", "get rid of the cards",
+    "close the blueprint", "close the overlay", "close the hologram",
+    "close the cards", "close the visual", "close the diagram",
+    "hide the blueprint", "hide the overlay", "hide the hologram",
+    "hide the cards", "hide the visual", "hide the diagram",
+    "dismiss the blueprint", "dismiss the overlay", "dismiss the hologram",
+    "remove the blueprint", "remove the overlay", "remove the hologram",
+    "clear the blueprint", "clear the overlay", "clear the hologram",
+    "blueprint off", "overlay off", "hologram off",
+    "drop the blueprint", "drop the overlay",
+)
+
 # Word-set exit check — catches any phrasing that contains both an exit verb
 # and "ar"/"build"/"hologram"/"canvas" without needing exact substring match
 _AR_EXIT_VERBS  = {"exit", "leave", "close", "stop", "end", "quit", "cancel", "disable", "turn"}
@@ -698,10 +1188,23 @@ _WORK_ENTER_PHRASES = (
     "work mode", "enter work mode", "focus mode",
     "watching mode", "ambient mode", "screen mode",
     "start work mode",
+    # Common Whisper mishearings of "work mode"
+    "work load", "workload", "work loads",
+    "work modes", "work moat", "walk mode", "wark mode",
+    "work note", "work code", "work mod",
+    "enter work load", "start work load", "into work mode",
 )
 _WORK_EXIT_PHRASES = (
     "exit work mode", "leave work mode", "stop work mode",
+    "exit work", "leave work", "stop work",
     "normal mode", "back to normal", "exit focus mode",
+    "desktop mode", "go to desktop", "back to desktop",
+    "switch to desktop", "regular mode", "go back",
+    "exit this mode", "out of work mode",
+    # Common Whisper mishearings of "exit work mode"
+    "exit work load", "exit workload", "exit work loads",
+    "leave work load", "stop work load",
+    "exit walk mode", "exit work note", "exit work code",
 )
 
 
@@ -780,13 +1283,186 @@ def _get_screen_desc() -> str:
         return ""
 
 
+def _ensure_screen_monitor() -> None:
+    """
+    Start the screen-description monitor if it isn't already running. Guarded by
+    a lock so two threads (the mode-manager poll thread and a request thread
+    both entering _on_mode_change) can't start two monitors at once.
+    """
+    global _screen_monitor_thread
+    with _screen_monitor_lock:
+        if _screen_monitor_thread is not None and _screen_monitor_thread.is_alive():
+            return
+        import threading as _thr
+        _screen_monitor_thread = _thr.Thread(
+            target=_gaming_monitor, daemon=True, name="screen-monitor")
+        _screen_monitor_thread.start()
+
+
+def _enter_work_mode(spoken: str = "I'll be here when you need me, sir.") -> None:
+    """
+    Slip into work mode: hide the big HUD (compact strip only) and start the
+    background screen monitor. Idempotent — a no-op if already in work/gaming
+    mode. Used both by the explicit "work mode" command and automatically
+    when the user asks to pull a site/app up (so the HUD gets out of the way
+    of whatever they opened).
+
+    The mechanical side-effects (flags, HUD broadcast, screen monitor) live in
+    `_on_mode_change`; this helper just pins work mode in the manager (so a 30s
+    auto-poll doesn't yank us back to normal) and speaks the custom line.
+
+    force("work") handles every starting point: from normal it switches in; from
+    watch/gaming it overrides (so "pull up github" while a video is up actually
+    moves to work and un-mutes notifications — not just speaks the work line);
+    already in work it's a no-op re-pin. We must NOT early-return on
+    `_work_mode`, because watch/gaming also set that flag.
+    """
+    try:
+        from tools.mode_manager import get_manager
+        mgr = get_manager()
+    except Exception:
+        mgr = None
+    if mgr is not None:
+        mgr.force("work")            # → _on_mode_change("work", "forced by voice")
+    elif not (_work_mode or _gaming_mode):
+        # No manager (Quartz unavailable): best-effort direct apply, only if not
+        # already in some active mode (can't reliably transition without it).
+        _on_mode_change("work", "voice")
+    if spoken:
+        _say(spoken)
+
+
+def _on_notification(app_name: str, content: str) -> None:
+    """
+    Announce an incoming Messages/Snapchat/FaceTime/etc. notification. Defined
+    at MODULE scope (not nested in startup) so `server._on_notification` is a
+    real attribute the diagnostics self-fixer can retrieve to restart the
+    monitor with the correct callback.
+    """
+    # Skip JARVIS's own notifications (avoid feedback loops)
+    if "jarvis" in (app_name or "").lower():
+        return
+    if _notifications_muted:
+        return
+    if content:
+        line = f"New {app_name} {content}"
+    else:
+        line = f"New notification from {app_name}."
+    try:
+        notify(title=f"📬 {app_name}", message=content or "New notification",
+               sound=False, also_in_hud=True)
+        # SUSPEND THE MIC while speaking the announcement. Otherwise the mic
+        # transcribes JARVIS's own "New notification from Snapchat" and processes
+        # it as a phantom command (seen live: 'notification from snapchat. why is
+        # it still running...'). stream_speak blocks until the audio finishes, so
+        # the mic stays closed for the whole announcement; the finally resumes it
+        # (even on error) so the mic can never get stuck deaf.
+        if audio:
+            audio.suspend()
+        speaker.stream_speak(iter([line]))
+    except Exception as exc:
+        print(f"[notif] speak error: {exc}", flush=True)
+    finally:
+        if audio:
+            import time as _t
+            _t.sleep(0.4)   # let the announcement's audio tail die out
+            _resume_audio()
+
+
+def _start_notif_monitor() -> bool:
+    """
+    Start (or restart) the notification monitor with the real callback. Stops
+    any existing monitor first so we never leak its `log stream` child or run
+    two. Returns True if a monitor thread is alive afterward.
+    """
+    global _notif_mon
+    try:
+        from tools.notification_monitor import NotificationMonitor
+        if _notif_mon is not None:
+            try:
+                _notif_mon.stop()
+            except Exception:
+                pass
+        _notif_mon = NotificationMonitor(on_notification=_on_notification,
+                                         cooldown_sec=8.0)
+        _notif_mon.start()
+        return True
+    except Exception as exc:
+        print(f"[notif] monitor failed to start: {exc}", flush=True)
+        return False
+
+
+def _on_mode_change(mode: str, reason: str) -> None:
+    """
+    Apply a mode detected by the ModeManager. Runs on the mode-manager thread.
+      watch  → mute notifications, compact HUD (ad-skip is always armed in the
+               screen watcher, so YouTube ads get skipped automatically here)
+      gaming → mute notifications, compact HUD, remind how to exit
+      work   → compact HUD, notifications stay on
+      normal → full HUD, notifications on
+    """
+    global _notifications_muted, _work_mode, _gaming_mode
+    # Tell the brain its own current mode so it can answer "what mode are you in
+    # / why did you switch" truthfully instead of denying or guessing.
+    try:
+        from brain.personality import set_current_mode
+        set_current_mode(mode, reason)
+    except Exception:
+        pass
+    try:
+        if mode in ("watch", "gaming", "work"):
+            _work_mode = True
+            _gaming_mode = True   # compact corner HUD
+            try:
+                from brain.personality import set_work_mode
+                set_work_mode(True)
+            except Exception:
+                pass
+            broadcast({"type": "gaming_mode_enter", "mode": mode})
+            # Keep the screen-description cache warm so "what am I looking at"
+            # answers instantly in any active mode.
+            _ensure_screen_monitor()
+            # Silence notifications while watching or gaming (not for work).
+            _notifications_muted = mode in ("watch", "gaming")
+            # Announcements are deliberately minimal so JARVIS isn't chatty as
+            # the screen changes:
+            #   gaming → announce once (sticky; user needs to know how to exit)
+            #   watch  → SILENT (the whole point is to be quiet; the WATCH badge
+            #            and the muted notifications are the feedback). The
+            #            pull-up path says its own "Opening X…" line separately.
+            #   work   → SILENT/ambient; the explicit "work mode" / pull-up path
+            #            speaks its own line via _enter_work_mode.
+            if mode == "gaming":
+                _say("Gaming mode, sir. Say 'exit gaming mode' when you're done.")
+        else:  # normal
+            _work_mode = False
+            _gaming_mode = False
+            _notifications_muted = False
+            try:
+                from brain.personality import set_work_mode
+                set_work_mode(False)
+            except Exception:
+                pass
+            broadcast({"type": "gaming_mode_exit"})
+        broadcast({"type": "mode_status", "mode": mode, "reason": reason})
+    except Exception as exc:
+        print(f"[mode] apply failed: {exc}", flush=True)
+
+
 def _gaming_monitor() -> None:
-    """Background thread: capture + describe screen every 30 s in work mode."""
+    """
+    Background thread: keep a FRESH screenshot cached every 30s while any active
+    mode is on, so an on-demand "what am I looking at" has a recent frame ready.
+
+    It deliberately does NOT run the vision model here. Describing the screen
+    every 30s would fire a Groq vision call ~120×/hour — pointlessly narrating a
+    movie the user is just watching and draining the same rate limit that caused
+    the old 47s hangs. Vision runs only when the user actually asks (the
+    _SCREEN_DESC_PHRASES path calls _get_screen_desc on demand).
+    """
     import time as _t
     while _gaming_mode:
-        if _capture_screen():
-            # Pre-fetch description now so it's cached when user speaks
-            _get_screen_desc()
+        _capture_screen()
         # 30 s in 0.5 s ticks so thread exits promptly on mode-off
         for _ in range(60):
             if not _gaming_mode:
@@ -814,7 +1490,7 @@ def _parse_ar_command(text: str) -> list[dict] | None:
                        "combine them", "merge the", "merge them", "make one item",
                        "make them one item", "one item", "link the", "link them")
     if any(t in low for t in _group_triggers):
-        from tools.ar_builder_tool import get_scene as _gs, apply_operations as _ao
+        from tools.ar_builder_tool import get_scene as _gs
         scene = _gs()
         if not scene["shapes"]:
             return None
@@ -1068,13 +1744,46 @@ def _say(msg: str) -> None:
     speaker.resume()
     if audio:
         audio.suspend()
+    # If music is playing, duck it (in the background so it doesn't delay
+    # speech) so the mic hears the user's reply/interrupt over a quieter bed.
+    # Reuses the conversation ducker, which restores itself after a short grace.
+    if _music_is_playing:
+        threading.Thread(target=_duck_music_for_conversation, daemon=True).start()
     broadcast({"type": "chunk", "text": msg})
     broadcast({"type": "done",  "full_text": msg})
-    speaker.stream_speak(iter([msg]))
-    set_state("idle")
+    try:
+        speaker.stream_speak(iter([msg]))
+    finally:
+        # ALWAYS resume the mic — even if TTS raised. Otherwise a throw here
+        # (this runs on request AND background threads, e.g. the mode manager)
+        # would leave the mic suspended and JARVIS deaf until the next restart.
+        set_state("idle")
+        if audio:
+            _t.sleep(0.5)
+            _resume_audio()
+
+
+def _speak_gated(text: str) -> None:
+    """
+    Speak `text` with the mic SUSPENDED for the duration, then resume it.
+
+    Use this for intercepts that already broadcast their own chunk/done and
+    just need the audio spoken — it stops JARVIS from hearing his own reply and
+    transcribing it as a phantom command (the same feedback loop the
+    notification path had). stream_speak blocks until the audio finishes, and
+    the finally always resumes the mic, so it can never be left deaf. Safe to
+    use even where a resume already follows — _resume_audio just re-selects the
+    current mode.
+    """
+    import time as _t
     if audio:
-        _t.sleep(0.5)
-        _resume_audio()
+        audio.suspend()
+    try:
+        speaker.stream_speak(iter([text]))
+    finally:
+        if audio:
+            _t.sleep(0.4)   # let the audio tail die out before reopening the mic
+            _resume_audio()
 
 
 def process(text: str, skip_echo: bool = False) -> None:
@@ -1147,8 +1856,8 @@ def process(text: str, skip_echo: bool = False) -> None:
         msg = forget_fact(keyword) if keyword else "What should I forget? Try: 'forget my gym schedule'."
         _say(msg); return
 
-    # ── Declare globals before any read/write of them ────────────────────────
-    global _gaming_mode, _work_mode
+    # NOTE: _gaming_mode / _work_mode are only READ in this function now — all
+    # writes live in _on_mode_change / the mode helpers — so no `global` needed.
 
     # ── Work mode: screen description shortcut ───────────────────────────────
     # Bypass LLM entirely — capture fresh frame, run vision, speak result.
@@ -1181,37 +1890,885 @@ def process(text: str, skip_echo: bool = False) -> None:
             _say("Screen capture isn't ready yet — give me a second and ask again.")
         return
 
-    # ── Gaming Mode — compact HUD, no screen watching ────────────────────────
-    if any(p in low for p in _GAMING_ENTER_PHRASES) and not _gaming_mode and not _work_mode:
-        _gaming_mode = True
-        broadcast({"type": "gaming_mode_enter"})
-        _say("Gaming mode. I'm here.")
+    # ── Mode voice overrides — route through the ModeManager so it pins the
+    # mode and stops auto-switching until the user exits. If the manager isn't
+    # available (Quartz missing), fall back to applying the mode directly.
+    def _force_mode(mode: str) -> None:
+        # _on_mode_change speaks the mode's own announcement (e.g. the gaming
+        # line), so this helper never speaks itself.
+        try:
+            from tools.mode_manager import get_manager
+            mgr = get_manager()
+        except Exception:
+            mgr = None
+        if mgr is not None:
+            mgr.force(mode)          # fires _on_mode_change (which announces)
+        else:
+            _on_mode_change(mode, "voice")
+
+    def _exit_mode() -> None:
+        # exit_forced() reliably drops to normal (pinned to the current app so it
+        # won't flip back), so the result is always normal — one honest line.
+        try:
+            from tools.mode_manager import get_manager
+            mgr = get_manager()
+        except Exception:
+            mgr = None
+        if mgr is not None:
+            mgr.exit_forced()
+        else:
+            _on_mode_change("normal", "voice")
+        _say("Back to normal, sir.")
+
+    # ── Guard: a QUESTION about a mode must not TRIGGER the mode command ──────
+    # "why did you go back to desktop mode" contains "desktop mode"/"back to
+    # desktop" (exit triggers). Asking ABOUT a mode should get an ANSWER from
+    # the LLM, not silently execute a switch. Skip the mode intercepts for
+    # anything that reads as a question.
+    _mode_q = (low.rstrip().endswith("?") or low.startswith((
+        "why", "what", "how", "when", "who", "which", "whats", "what's",
+        "did you", "do you", "are you", "were you", "can you tell",
+        "tell me why", "tell me what", "explain", "i asked",
+    )))
+
+    # ── Auto-mode global on/off ──────────────────────────────────────────────
+    # Lets Dylan stop JARVIS from auto-switching modes based on his screen.
+    _AUTO_OFF_PHRASES = (
+        "stop auto mode", "turn off auto mode", "disable auto mode",
+        "stop switching modes", "stop changing modes",
+        "quit auto mode", "auto mode off", "stop auto switching",
+    )
+    _AUTO_ON_PHRASES = (
+        "resume auto mode", "turn on auto mode", "enable auto mode",
+        "start auto mode", "auto mode on", "watch my screen again",
+    )
+    if any(p in low for p in _AUTO_OFF_PHRASES) and not _mode_q:
+        try:
+            from tools.mode_manager import get_manager
+            mgr = get_manager()
+            if mgr is not None:
+                mgr.set_auto(False)
+        except Exception:
+            pass
+        _say("Auto mode off, sir. I'll stay put until you turn it back on.")
         return
-    if any(p in low for p in _GAMING_EXIT_PHRASES) and _gaming_mode:
-        _gaming_mode = False
-        broadcast({"type": "gaming_mode_exit"})
-        _say("Back to normal.")
+    if any(p in low for p in _AUTO_ON_PHRASES) and not _mode_q:
+        try:
+            from tools.mode_manager import get_manager
+            mgr = get_manager()
+            if mgr is not None:
+                mgr.set_auto(True)
+        except Exception:
+            pass
+        _say("Auto mode on, sir. I'll adjust as your screen changes.")
+        return
+
+    # ── Gaming Mode ──────────────────────────────────────────────────────────
+    if any(p in low for p in _GAMING_EXIT_PHRASES) and _gaming_mode and not _mode_q:
+        _exit_mode()
+        return
+    if any(p in low for p in _GAMING_ENTER_PHRASES) and not _gaming_mode and not _mode_q:
+        _force_mode("gaming")
         return
 
     # ── Work Mode — compact HUD + 24/7 screen watching ───────────────────────
-    if any(p in low for p in _WORK_ENTER_PHRASES) and not _work_mode and not _gaming_mode:
-        _work_mode = True
-        _gaming_mode = True   # reuse the same compact HUD
-        from brain.personality import set_work_mode
-        set_work_mode(True)
-        broadcast({"type": "gaming_mode_enter"})
-        import threading as _thr
-        _thr.Thread(target=_gaming_monitor, daemon=True, name="screen-monitor").start()
-        _say("Work mode. I'm watching your screen.")
+    # EXIT check runs FIRST. Otherwise "exit work load" matches both lists
+    # (because "work load" is in ENTER as a Whisper-mishearing alias) and the
+    # ENTER branch fires first, re-entering work mode instead of leaving.
+    if any(p in low for p in _WORK_EXIT_PHRASES) and _work_mode and not _mode_q:
+        _exit_mode()
         return
-    if any(p in low for p in _WORK_EXIT_PHRASES) and _work_mode:
-        _work_mode = False
-        _gaming_mode = False
-        from brain.personality import set_work_mode
-        set_work_mode(False)
-        broadcast({"type": "gaming_mode_exit"})
-        _say("Back to normal.")
+    if any(p in low for p in _WORK_ENTER_PHRASES) and not _work_mode and not _gaming_mode and not _mode_q:
+        _enter_work_mode("Work mode. I'll be here when you need me, sir.")
         return
+    # NOTE: a second `if _WORK_EXIT_PHRASES` block lived here previously —
+    # it was an exact duplicate of the one above (lines ~1649-1656). The
+    # top block always returns first, so this was unreachable. Removed.
+
+    # ── Normalize for hard-coded intercepts ───────────────────────────────────
+    # Whisper outputs U+2019 (curly apostrophe) and U+201C/D (curly quotes),
+    # which never match our ASCII-apostrophe trigger phrases. Normalize once
+    # so 'what's on my calendar' (curly) matches "what's on my calendar" (straight).
+    _norm = low.replace("’", "'").replace("‘", "'") \
+               .replace("“", '"').replace("”", '"')
+
+    # ── Music routing (hard-coded — LLM kept inventing fake queries) ──────────
+    # Maps verbal vibes to Dylan's ACTUAL Apple Music playlists. If he just
+    # says "play music" with no vibe, it defaults to "Good rap" (his pick).
+    _MUSIC_VIBE_MAP = (
+        # Order matters — most specific first
+        (("chill rock", "chill rocks"),                        "Chill rock"),
+        (("chill", "relax", "low key", "lo-fi", "lofi", "ambient"), "Chill songs"),
+        (("late night", "nighttime", "tonight", "going to sleep"), "Late night"),
+        (("house music", "house", "edm", "electronic", "dance"),  "House"),
+        (("rap", "hip hop", "hiphop"),                          "Good rap"),
+        (("rock",),                                             "Rock"),
+        (("beach", "summer", "pool"),                           "Beach music"),
+        (("acoustic", "campfire", "guitar"),                    "Campfire songs"),
+        (("spanish", "latin", "reggaeton"),                     "Spanish shit"),
+        (("favorites", "my favorites", "favorite"),             "Favorite Songs"),
+        (("jeep", "driving"),                                   "Jeep"),
+    )
+    _MUSIC_BARE_PHRASES = (
+        "play me some music", "play some music", "play music",
+        "play me something", "play something",  "put on some music",
+        "put on music", "put music on", "play a song", "play me a song",
+        "play any music", "shuffle music", "shuffle some music",
+        "just play something", "play me anything",
+        # Vibe-only variations (e.g. "put on some house music")
+        "put on some rap", "put on some rock", "put on some house",
+        "put on some chill", "put on some lofi", "put on some late night",
+        "play me some rap", "play me some rock", "play me some house",
+        "play me some chill", "play me some lofi",
+    )
+    # Catch-all: "play <something>" or "put on <music vibe>" combined with a known vibe
+    _has_vibe_keyword = any(
+        w in _norm for vw, _ in _MUSIC_VIBE_MAP for w in vw
+    )
+    _has_play_intent = (
+        " play " in f" {_norm} " or _norm.startswith("play ")
+        or "put on " in _norm or "shuffle" in _norm
+    )
+    # ── Music taste scan (one-time learn — saves to memory.txt) ──────────────
+    _SCAN_TASTE_PHRASES = (
+        "scan my music", "learn my music", "learn my music taste",
+        "learn my taste", "study my music", "build my music profile",
+        "figure out my music", "analyze my music",
+        "know my music", "know what i like",
+    )
+    if any(p in _norm for p in _SCAN_TASTE_PHRASES):
+        _say("Scanning your playlists. Give me a minute.")
+        try:
+            from tools.playlist_tool import scan_music_taste
+            summary = scan_music_taste()
+            # Append to memory.txt
+            mem_path = os.path.join(JARVIS_DIR, "memory.txt")
+            with open(mem_path, "a", encoding="utf-8") as f:
+                from datetime import date as _d
+                f.write(f"\n- [{_d.today().isoformat()}] {summary}\n")
+            broadcast({"type": "chunk", "text": summary})
+            broadcast({"type": "done", "full_text": summary})
+            _say("Got it. I've got a feel for your music now.")
+        except Exception as exc:
+            _say(f"Couldn't scan — {type(exc).__name__}.")
+        return
+
+    # ── System volume controls (no LLM — instant response) ───────────────────
+    # Affects the whole Mac (macOS system output volume), not just Apple Music.
+    _VOL_UP_PHRASES = (
+        "volume up", "turn volume up", "turn it up", "louder",
+        "turn up the volume", "raise the volume", "raise volume",
+        "make it louder", "crank it up", "crank it", "louder please",
+    )
+    _VOL_DOWN_PHRASES = (
+        "volume down", "turn volume down", "turn it down", "quieter",
+        "turn down the volume", "lower the volume", "lower volume",
+        "make it quieter", "less loud", "softer",
+    )
+    _MUTE_PHRASES = (
+        "mute volume", "mute the volume", "mute the audio",
+        "mute everything", "silent mode",
+    )
+    _UNMUTE_PHRASES = (
+        "unmute volume", "unmute the volume", "unmute the audio",
+        "turn sound back on", "audio back on",
+    )
+    # "Set volume to X" — extract number
+    _vol_set_match = re.match(r'.*?(?:set\s+)?(?:the\s+)?volume\s+(?:to\s+|at\s+)?(\d{1,3})\s*(?:percent|%)?\s*$', _norm)
+    if _vol_set_match:
+        try:
+            level = int(_vol_set_match.group(1))
+            from tools.music_tools import set_volume
+            result = set_volume(level)
+            _say(f"Volume at {max(0, min(100, level))} percent.")
+        except Exception:
+            _say("Couldn't set volume.")
+        return
+    if any(p in _norm for p in _VOL_UP_PHRASES):
+        try:
+            import subprocess as _sp
+            # Get current volume, add 10, cap at 100
+            r = _sp.run(["osascript", "-e", "output volume of (get volume settings)"],
+                        capture_output=True, text=True, timeout=3)
+            cur = int((r.stdout or "50").strip())
+            new = min(100, cur + 10)
+            _sp.run(["osascript", "-e", f"set volume output volume {new}"], capture_output=True, timeout=3)
+            _say(f"Volume at {new}.")
+        except Exception:
+            _say("Couldn't change volume.")
+        return
+    if any(p in _norm for p in _VOL_DOWN_PHRASES):
+        try:
+            import subprocess as _sp
+            r = _sp.run(["osascript", "-e", "output volume of (get volume settings)"],
+                        capture_output=True, text=True, timeout=3)
+            cur = int((r.stdout or "50").strip())
+            new = max(0, cur - 10)
+            _sp.run(["osascript", "-e", f"set volume output volume {new}"], capture_output=True, timeout=3)
+            _say(f"Volume at {new}.")
+        except Exception:
+            _say("Couldn't change volume.")
+        return
+    if any(p in _norm for p in _MUTE_PHRASES):
+        try:
+            import subprocess as _sp
+            _sp.run(["osascript", "-e", "set volume with output muted"], capture_output=True, timeout=3)
+            _say("Muted.")
+        except Exception:
+            _say("Couldn't mute.")
+        return
+    if any(p in _norm for p in _UNMUTE_PHRASES):
+        try:
+            import subprocess as _sp
+            _sp.run(["osascript", "-e", "set volume without output muted"], capture_output=True, timeout=3)
+            _say("Unmuted.")
+        except Exception:
+            _say("Couldn't unmute.")
+        return
+
+    # ── Direct music controls (no LLM — instant response) ────────────────────
+    # Catches common Whisper mishearings so weird phrasings still work.
+    _PAUSE_PHRASES = (
+        "pause music", "pause the music", "pause song", "pause the song",
+        "pause it", "pause", "stop music", "stop the music",
+        # mishearings
+        "paws music", "paws the music", "paws it",
+    )
+    _PLAY_RESUME_PHRASES = (
+        # Explicit resume verbs — never ambiguous
+        "unpause", "un pause", "un-pause", "on pause", "in pause", "an pause",
+        "resume", "resume music", "resume the music", "resume song",
+        "keep playing", "continue music", "continue the music",
+        "press play", "hit play",
+        # mishearings of "unpause"
+        "umpause", "unpaws", "on paws",
+        # NOTE: "play music" / "play the music" removed — those fall to
+        # the playlist intercept below which starts the default playlist.
+    )
+    _NEXT_PHRASES = (
+        "next song", "next track", "skip song", "skip track", "skip this",
+        "skip this song", "skip this track", "next one", "skip it",
+        "next", "skip", "skip ahead",
+    )
+    _PREV_PHRASES = (
+        "previous song", "previous track", "last song", "last track",
+        "go back a song", "previous one", "back a song", "back a track",
+        "play the last song",
+    )
+    # Distinguish pause vs resume by checking music state
+    if any(p == _norm.strip() or _norm.endswith(p) or p in _norm.split() for p in _NEXT_PHRASES) \
+        or any(p in _norm for p in ("next song", "next track", "skip song", "skip track", "skip this")):
+        try:
+            import subprocess as _sp
+            _sp.run(["osascript", "-e", 'tell application "Music" to next track'], capture_output=True, timeout=3)
+            _say("Skipped.")
+        except Exception:
+            _say("Couldn't skip.")
+        return
+    if any(p in _norm for p in _PREV_PHRASES):
+        try:
+            import subprocess as _sp
+            _sp.run(["osascript", "-e", 'tell application "Music" to previous track'], capture_output=True, timeout=3)
+            _say("Going back.")
+        except Exception:
+            _say("Couldn't go back.")
+        return
+    # Resume check runs FIRST. "unpause" contains "pause" as substring,
+    # so without this order PAUSE would fire on "unpause my music".
+    if any(p in _norm for p in _PLAY_RESUME_PHRASES):
+        try:
+            import subprocess as _sp
+            _sp.run(["osascript", "-e", 'tell application "Music" to play'], capture_output=True, timeout=3)
+            _say("Playing.")
+        except Exception:
+            _say("Couldn't resume.")
+        return
+    # PAUSE check uses word boundaries to be safe — even though RESUME runs
+    # first, this prevents weird inputs like "pause-button" from matching.
+    if re.search(r'\b(pause|stop)\b', _norm) and any(p in _norm for p in _PAUSE_PHRASES):
+        try:
+            import subprocess as _sp
+            _sp.run(["osascript", "-e", 'tell application "Music" to pause'], capture_output=True, timeout=3)
+            _say("Paused.")
+        except Exception:
+            _say("Couldn't pause.")
+        return
+
+    if any(p in _norm for p in _MUSIC_BARE_PHRASES) or (_has_vibe_keyword and _has_play_intent and "music" in _norm):
+        # No vibe — default to his go-to playlist
+        _picked_playlist = "Good rap"
+        for vibe_words, pl_name in _MUSIC_VIBE_MAP:
+            if any(w in _norm for w in vibe_words):
+                _picked_playlist = pl_name
+                break
+        _say(f"{_picked_playlist} coming up.")
+        try:
+            from tools.playlist_tool import play_playlist
+            play_playlist(_picked_playlist, shuffle=True)
+            broadcast({"type": "now_playing", "text": f"{_picked_playlist} playlist"})
+            _start_music_poller()
+        except Exception as exc:
+            _say(f"Couldn't start music — {type(exc).__name__}.")
+        return
+
+    # ── Catch-all: "play [song/artist]" → direct Apple Music search ──────────
+    # Catches "play wagon wheel", "play drake", "play sicko mode", etc. The
+    # LLM was slow and sometimes routed weirdly; this is instant and reliable.
+    _play_match = re.match(r'^(?:hey jarvis[,\.]?\s+)?(?:can you\s+)?(?:please\s+)?(play|put on)\s+(.+?)[\.\?!]*$', _norm)
+    if _play_match and not any(p in _norm for p in (
+        # Exclude the cases already handled above
+        "play music", "play the music", "play something", "play me",
+        "play any music", "press play", "hit play", "play a song",
+    )):
+        query = _play_match.group(2).strip()
+        if query and len(query) > 1:
+            _say(f"Looking for {query}.")
+            try:
+                from tools.music_tools import play_music
+                play_music(query=query)
+                _start_music_poller()
+            except Exception as exc:
+                _say(f"Couldn't play that — {type(exc).__name__}.")
+            return
+
+    # ── Notification controls (hard-coded) ────────────────────────────────────
+    _NOTIF_OFF_PHRASES = (
+        "stop reading notifications", "stop reading my notifications",
+        "stop my notifications", "mute notifications", "quiet notifications",
+        "no more notifications", "shut up notifications",
+        "stop announcing notifications",
+    )
+    _NOTIF_ON_PHRASES = (
+        "read my notifications", "start reading notifications",
+        "turn notifications back on", "resume notifications",
+        "notifications on", "announce notifications",
+    )
+    if any(p in _norm for p in _NOTIF_OFF_PHRASES):
+        global _notifications_muted
+        _notifications_muted = True
+        _say("Notifications muted.")
+        return
+    if any(p in _norm for p in _NOTIF_ON_PHRASES):
+        _notifications_muted = False
+        _say("Reading notifications again.")
+        return
+
+    # ── Screen watcher pause/resume (auto-skip ads, dismiss banners) ──────────
+    _WATCHER_OFF_PHRASES = (
+        "stop watching my screen", "stop the screen watcher", "disable auto skip",
+        "stop auto skip", "don't skip ads", "pause screen watcher",
+    )
+    _WATCHER_ON_PHRASES = (
+        "watch my screen", "resume screen watcher", "enable auto skip",
+        "skip ads for me", "start watching my screen",
+    )
+    if any(p in _norm for p in _WATCHER_OFF_PHRASES):
+        try:
+            from tools.screen_watcher import get_watcher
+            get_watcher().pause()
+        except Exception: pass
+        _say("Screen watcher paused.")
+        return
+    if any(p in _norm for p in _WATCHER_ON_PHRASES):
+        try:
+            from tools.screen_watcher import get_watcher
+            w = get_watcher()
+            if not w.running: w.start()
+            else: w.resume()
+        except Exception: pass
+        _say("Watching your screen, sir.")
+        return
+
+    # ── System diagnostics ────────────────────────────────────────────────────
+    # Voice command runs the full health check on the sphere overlay,
+    # narrates each failure with its behavioral impact, and tries auto-fixes.
+    _DIAG_PHRASES = (
+        # diagnostic noun — include SINGULAR "diagnostic" forms. "run a full
+        # system diagnostic" matched none of the old phrases (they were all
+        # plural "diagnostics" or lacked the word "system"), so it fell through
+        # to the LLM and got answered with a battery check.
+        "run diagnostics", "run a diagnostic", "run a full diagnostic",
+        "system diagnostics", "systems diagnostics", "full diagnostic",
+        "system diagnostic", "full system diagnostic", "run a system diagnostic",
+        "run a full system diagnostic",
+        "diagnostic check", "diagnostics on yourself", "diagnose yourself",
+        # check noun (singular AND plural — "systems check" was missing)
+        "system check", "systems check",
+        "run a system check", "run a systems check",
+        "system status check", "systems status check",
+        # self check
+        "self check", "self-check", "check yourself",
+        # imperative
+        "check your systems", "check your system", "check all systems",
+        # status query
+        "are you healthy", "are you ok", "are you okay", "everything good",
+        "all systems nominal", "system status",
+    )
+    # ── Deep scan (line-by-line code review) ─────────────────────────────────
+    # Runs in a background thread so the user can keep talking to JARVIS.
+    # Streams progress events to a bottom-of-screen loading bar; native
+    # notification + voice line fire when complete; user can then ask
+    # "what did the scan find" to see the results panel.
+    _DEEPSCAN_PHRASES = (
+        "deep scan", "deep diagnostic", "scan every line",
+        "scan my code", "scan your code", "scan all your code",
+        "scan the codebase", "scan everything",
+        "run a deep scan", "do a deep scan",
+        "review every line", "review all your code",
+        "full code review", "deep code scan",
+        "scan all of you", "scan all of yourself",
+        # "deep system search/scan" — these were mis-routing to
+        # open_application("System Settings") because "system search"
+        # reads like a Mac command. Catch them here first.
+        "deep system search", "deep system scan", "deep system check",
+        "system search", "search every line", "search your code",
+        "search the codebase", "search all your code",
+        "scan your whole system", "scan the whole system",
+        "search your whole system",
+    )
+    if any(p in _norm for p in _DEEPSCAN_PHRASES):
+        _say("Starting a deep scan. First a fast pass for syntax and hygiene, "
+             "then I'll actually read every line and reason about real bugs — "
+             "that part takes a few minutes. I'll keep talking while it runs.")
+        def _drive_deep_scan() -> None:
+            from tools.deep_scan import run_deep_scan
+            try:
+                for event in run_deep_scan(deep=True):
+                    broadcast(event)
+            except Exception as exc:
+                broadcast({"type": "deep_scan_error",
+                           "message": f"{type(exc).__name__}: {exc}"})
+                print(f"[deep-scan] crashed: {exc}", flush=True)
+                return
+            # Speak a tight summary + push native notif when complete.
+            # Distinguish the AI-found semantic bugs (category ai:*) from the
+            # mechanical hygiene findings so the user knows which is which.
+            try:
+                from tools.deep_scan import get_last_scan_summary, get_last_findings
+                s = get_last_scan_summary()
+                bs = s["by_severity"]
+                total = s["total"]
+                ai_findings = [f for f in get_last_findings()
+                               if str(f.get("category", "")).startswith("ai:")]
+                n_ai = len(ai_findings)
+                n_ai_high = sum(1 for f in ai_findings if f["severity"] == "high")
+                if total == 0:
+                    line = "Deep scan complete. No issues found, sir."
+                else:
+                    pieces = []
+                    if bs["high"]:   pieces.append(f"{bs['high']} high")
+                    if bs["medium"]: pieces.append(f"{bs['medium']} medium")
+                    if bs["low"]:    pieces.append(f"{bs['low']} low")
+                    ai_note = ""
+                    if n_ai:
+                        ai_note = (f" {n_ai} of those came from actually reading "
+                                   f"the code")
+                        if n_ai_high:
+                            ai_note += f", including {n_ai_high} high-severity"
+                        ai_note += "."
+                    line = (f"Deep scan complete. {total} issue"
+                            f"{'s' if total != 1 else ''} found — "
+                            + ", ".join(pieces) + "."
+                            + ai_note
+                            + " Say 'show me the scan results' to see them.")
+                speaker.stream_speak(iter([line]))
+                notify("Deep scan complete",
+                       f"{total} issue(s) found ({n_ai} from AI review). "
+                       f"Ask JARVIS to show them.",
+                       sound=False, also_in_hud=False)
+            except Exception as exc:
+                print(f"[deep-scan] summary failed: {exc}", flush=True)
+        threading.Thread(target=_drive_deep_scan, daemon=True,
+                         name="deep-scan").start()
+        return
+
+    # ── Show deep scan results ───────────────────────────────────────────────
+    _SHOW_DEEPSCAN_PHRASES = (
+        "show me the scan results", "show me the scan",
+        "show the scan results", "show scan results",
+        "what did the scan find", "what did the deep scan find",
+        "open the scan results", "show me the deep scan",
+        "show me the findings", "show me what's broken",
+        "what's broken", "scan results",
+    )
+    if any(p in _norm for p in _SHOW_DEEPSCAN_PHRASES):
+        try:
+            from tools.deep_scan import get_last_findings, get_last_scan_summary
+            findings = get_last_findings()
+            summary = get_last_scan_summary()
+            if not findings:
+                _say("No recent deep scan findings, sir — run one first.")
+            else:
+                broadcast({
+                    "type": "deep_scan_show_results",
+                    "findings": findings,
+                    "summary": summary,
+                })
+                _say(f"Showing {len(findings)} finding{'s' if len(findings) != 1 else ''}.")
+        except Exception as exc:
+            _say(f"Couldn't pull the findings — {type(exc).__name__}.")
+        return
+
+    # ── Fix the confirmed bugs from the last scan ────────────────────────────
+    # Every fix is proven against the test suite AND re-reviewed before it
+    # sticks; anything that fails is auto-reverted. Only AI-confirmed findings
+    # are attempted (the hygiene stuff isn't worth an LLM patch).
+    _FIX_PHRASES = (
+        "fix the bugs", "fix what you found", "fix those bugs",
+        "fix the issues", "fix them", "go fix them", "fix the findings",
+        "fix what's broken", "fix whats broken", "patch the bugs",
+        "fix the code", "fix yourself",
+    )
+    if any(p in _norm for p in _FIX_PHRASES):
+        try:
+            from tools.deep_scan import get_last_findings
+            ai_findings = [f for f in get_last_findings()
+                           if str(f.get("category", "")).startswith("ai:")]
+            if not ai_findings:
+                _say("No confirmed bugs to fix — run a deep scan first, sir.")
+                return
+        except Exception:
+            _say("Couldn't read the last scan.")
+            return
+        _say(f"Working on {len(ai_findings)} confirmed bug"
+             f"{'s' if len(ai_findings) != 1 else ''}. Every fix has to pass "
+             f"my tests before it sticks — I'll revert anything that doesn't.")
+        def _drive_fixes() -> None:
+            try:
+                from tools.self_fix import fix_findings
+                results = fix_findings(ai_findings, max_fixes=5)
+                applied = [r for r in results if r.get("fix_status") == "applied"]
+                rejected = [r for r in results if r.get("fix_status") != "applied"]
+                broadcast({"type": "self_fix_results", "results": results})
+                if applied:
+                    lines = [f"Fixed {len(applied)} bug{'s' if len(applied)!=1 else ''} — "
+                             f"all tests still pass."]
+                    for r in applied[:3]:
+                        lines.append(f"{r['file']} line {r['line']}: "
+                                     f"{r.get('fix_explanation','')}")
+                    if rejected:
+                        lines.append(f"{len(rejected)} couldn't be fixed safely — "
+                                     f"I left those alone. Restart to load the fixes.")
+                    else:
+                        lines.append("Restart me to load the fixes.")
+                    speaker.stream_speak(iter([" ".join(lines)]))
+                else:
+                    speaker.stream_speak(iter([
+                        "I couldn't safely fix any of them — every patch either "
+                        "failed the tests or didn't hold up on review, so I reverted "
+                        "them all. Nothing changed."
+                    ]))
+            except Exception as exc:
+                _say(f"Fix run crashed — {type(exc).__name__}. Nothing changed.")
+        threading.Thread(target=_drive_fixes, daemon=True, name="self-fix").start()
+        return
+
+    # Dismiss the diagnostic overlay (voice-driven)
+    _DIAG_DISMISS_PHRASES = (
+        "close diagnostics", "close the diagnostics", "close diagnostic",
+        "dismiss diagnostics", "dismiss diagnostic", "hide diagnostics",
+        "hide the diagnostic", "close that overlay", "dismiss that",
+        "ok close that", "okay close that", "that's all jarvis",
+        "thanks jarvis that's it",
+    )
+    if any(p in _norm for p in _DIAG_DISMISS_PHRASES):
+        broadcast({"type": "diagnostic_dismiss"})
+        _say("Closed.")
+        return
+
+    if any(p in _norm for p in _DIAG_PHRASES):
+        _say("Running a full diagnostic now.")
+        def _drive_diagnostic() -> None:
+            from tools.diagnostics import run_full_diagnostic
+            try:
+                last_done = None
+                for event in run_full_diagnostic():
+                    broadcast(event)
+                    etype  = event.get("type")
+                    if etype == "done":
+                        last_done = event
+                        continue
+                    if etype != "step":
+                        continue
+                    if event.get("status") == "running":
+                        continue
+                    label  = event.get("label", "")
+                    status = event.get("status")
+                    impact = event.get("impact", "")
+                    if status == "fail":
+                        msg = f"{label} failed. {impact}"
+                        if event.get("fix_attempted") and not event.get("fix_succeeded"):
+                            msg += " Auto-repair didn't take."
+                        speaker.stream_speak(iter([msg]))
+                    elif status == "fixed":
+                        speaker.stream_speak(iter([
+                            f"{label} was down. I restored it."
+                        ]))
+                if last_done:
+                    p = last_done.get("passed", 0)
+                    fx = last_done.get("fixed", 0)
+                    f  = last_done.get("failed", 0)
+                    if f == 0 and fx == 0:
+                        summary = f"Diagnostics complete. All {p} systems nominal, sir."
+                    elif f == 0:
+                        summary = (f"Diagnostics complete. {p} systems nominal, "
+                                   f"{fx} restored automatically.")
+                    else:
+                        bits = [f"{p} nominal"]
+                        if fx: bits.append(f"{fx} restored")
+                        bits.append(f"{f} still degraded")
+                        summary = "Diagnostics complete. " + ", ".join(bits) + "."
+                    speaker.stream_speak(iter([summary]))
+            except Exception as exc:
+                _say(f"Diagnostic crashed — {type(exc).__name__}.")
+        threading.Thread(target=_drive_diagnostic, daemon=True,
+                         name="diagnostic-runner").start()
+        return
+
+    # ── Self-inspection question intercept ───────────────────────────────────
+    # When Dylan asks "why did X fail", "explain that failure", "look at your
+    # code", etc. — pre-load relevant evidence (recent diagnostic findings or
+    # nothing if no diagnostic was run) into the text before brain dispatch.
+    # Does NOT bypass the brain — just enriches its context so the answer is
+    # grounded in real evidence instead of a fresh LLM guess.
+    _INVESTIGATE_PHRASES = (
+        # explicit self-question phrasings. Bare why-are-you / why-did-you are
+        # intentionally NOT here: they false-positive on flattery and on
+        # general clarifying questions. The regex below catches genuine
+        # failure-style questions even without these short prefixes.
+        "what went wrong", "what's wrong with", "whats wrong with",
+        "what is wrong with", "what happened with", "what happened to",
+        "explain that failure", "explain the failure", "explain that",
+        "look at your code", "look at your own code",
+        "check your code", "check your own code",
+        "show me your code", "show me your own code",
+        "read your own code", "read your code",
+        "what does your", "how does your",
+    )
+    # Catch "why X fail/failed/broken/down/off/stop/stopped" with anything in
+    # between — covers "why the render connection failed", "why did the music
+    # gate drop me", "why is my screen watcher off", etc.
+    _INVESTIGATE_FAIL_RE = re.compile(
+        r'\b(?:why|how)\s+(?:\w+\s+){0,6}'
+        r'(?:fail|failed|failing|broke|broken|down|off|wrong|stop|stopped|drop|dropped|crash|crashed)\b',
+        re.IGNORECASE,
+    )
+    # Phrases that prove the user is asking about JARVIS's *own* behavior,
+    # not a generic "why did" question. Used to decide whether to speak the
+    # "Let me check" acknowledgement and to filter out unrelated matches.
+    _SELF_REFERENTIAL_HINTS = (
+        "your code", "your own code", "your log", "your logs",
+        "your state", "your behavior", "your behaviour",
+        "you fail", "you failing", "you broke", "you crashed",
+        "you down", "you off", "you just did", "you do that",
+        "yourself", "explain that failure", "explain the failure",
+        "what went wrong", "what happened with", "your music gate",
+        "your gate", "your watcher", "your monitor", "your poller",
+    )
+    # Defensive trigger detection — if the regex or list operation ever
+    # crashes (corrupt phrase list, bad import), don't take down the whole
+    # _process_unsafe call. Fall through to normal brain dispatch instead.
+    try:
+        _phrase_hit = any(p in _norm for p in _INVESTIGATE_PHRASES)
+        _regex_hit  = bool(_INVESTIGATE_FAIL_RE.search(_norm))
+    except Exception as _trig_exc:
+        print(f"[self-inspect-intercept] trigger detection failed: "
+              f"{_trig_exc}", flush=True)
+        _phrase_hit = False
+        _regex_hit  = False
+    if _phrase_hit or _regex_hit:
+        try:
+            from tools.diagnostics import get_last_investigations, CHECKS
+            findings = get_last_investigations()
+            matched = None
+            if findings:
+                for chk in CHECKS:
+                    if chk.name not in findings:
+                        continue
+                    kws = {chk.name.lower()}
+                    kws |= {w.lower() for w in chk.label.split() if len(w) > 3}
+                    if any(kw in _norm for kw in kws):
+                        matched = chk.name
+                        break
+            self_referential = (
+                matched is not None
+                or any(h in _norm for h in _SELF_REFERENTIAL_HINTS)
+            )
+            if self_referential:
+                # ── DIRECT-ANSWER FAST PATH ─────────────────────────────
+                # If we matched a specific check AND have stashed evidence,
+                # answer from the evidence directly. No brain round-trip,
+                # no token-budget blow-up, no fallback-to-8b risk.
+                if matched and matched in findings:
+                    f = findings[matched]
+                    label  = f["label"]
+                    impact = ""
+                    for chk in CHECKS:
+                        if chk.name == matched:
+                            impact = chk.impact
+                            break
+                    log_evidence = ""
+                    if f.get("log_matches"):
+                        snippet = f["log_matches"][0].strip()
+                        if len(snippet) > 140:
+                            snippet = snippet[:140] + "…"
+                        log_evidence = f" The log showed: {snippet}."
+                    if impact:
+                        answer = f"{label} failed.{log_evidence} {impact}"
+                    else:
+                        answer = f"{label} failed.{log_evidence}"
+                    # Optional file pointer for follow-up questions
+                    if f.get("source_files"):
+                        files = f["source_files"][:2]
+                        answer += f" The code lives in {', '.join(files)}."
+                    print(f"[self-inspect-direct] answered {matched} from "
+                          f"stashed evidence — bypassed brain", flush=True)
+                    _say(answer)
+                    return    # ← skip brain entirely
+
+                # ── COMPACT CONTEXT FALLBACK ──────────────────────────
+                # No matched check or no findings — defer to the brain but
+                # with a minimal context block (≤ 40 tokens vs ≥ 100 before)
+                # so the 8b fallback doesn't blow the 6000 TPM limit.
+                if findings:
+                    names = ", ".join(findings.keys())
+                    context_block = (
+                        f" [Self-Q: recent diag has findings: {names}. "
+                        f"Use get_last_diagnostic_findings or read_my_logs. "
+                        f"NEVER web_search. Brackets are internal.]"
+                    )
+                else:
+                    context_block = (
+                        " [Self-Q: no recent diag. Use read_my_logs / "
+                        "read_my_code / search_my_code. NEVER web_search. "
+                        "Brackets are internal.]"
+                    )
+                text = text + context_block
+                _say("Let me check, sir.")
+            # If not self-referential, just fall through silently — no context
+            # injection, no acknowledgement; the brain handles it normally.
+        except Exception as exc:
+            print(f"[self-inspect-intercept] error: {exc}", flush=True)
+        # Fall through to normal brain dispatch (with or without enrichment)
+
+    # ── Overlay / blueprint dismiss (hard-coded, no LLM needed) ───────────────
+    # This fires BEFORE the brain so it works even when Groq is rate-limited.
+    if any(p in _norm for p in _OVERLAY_DISMISS_PHRASES):
+        broadcast({"type": "overlay_close"})
+        broadcast({"type": "hide_overlay"})
+        _say("Done.")
+        return
+
+    # ── Calendar visual read (hard-coded — LLM kept ignoring the new tool) ────
+    _CAL_VISUAL_TRIGGERS = (
+        "next event", "next meeting",   # short bare matches catch most variants
+        "coming up", "what's coming up", "whats coming up",
+        "what's on my calendar", "whats on my calendar", "what is on my calendar",
+        "what's my schedule", "whats my schedule", "what is my schedule",
+        "anything tomorrow", "anything this week", "anything coming up",
+        "do i have anything", "what do i have today", "what do i have tomorrow",
+        "show me my calendar", "show me my schedule",
+        "read my calendar", "check my calendar", "open my calendar",
+        "pull up my calendar", "pull up the calendar",
+        "calendar today", "calendar this week", "calendar tomorrow",
+        "on my calendar", "my schedule today", "my schedule tomorrow",
+    )
+    if any(p in _norm for p in _CAL_VISUAL_TRIGGERS):
+        # Pick view based on what the question is asking about
+        if any(w in _norm for w in (" today", "right now", "today?")):
+            cal_view = "day"; cal_range_label = "Today"
+        elif any(w in _norm for w in (
+            "this week", "tomorrow", "next week",
+            "monday", "tuesday", "wednesday", "thursday",
+            "friday", "saturday", "sunday",
+        )):
+            cal_view = "week"; cal_range_label = "This Week"
+        else:
+            cal_view = "month"; cal_range_label = "This Month"
+        _say("Pulling up your calendar.")
+        try:
+            from tools.calendar_tool import read_calendar_visually
+            result = read_calendar_visually(view=cal_view)
+
+            # ── Pop-up: rich calendar info card ──────────────────────────
+            # Parse the vision-model output into bullet-point facts so the
+            # card lists each event cleanly.
+            _facts = []
+            for ln in result.splitlines():
+                ln = ln.strip().lstrip("•-*0123456789. ")
+                if ln and len(ln) < 200:
+                    _facts.append(ln)
+                if len(_facts) >= 8:
+                    break
+            broadcast({
+                "type":   "info_card",
+                "title":  f"Calendar — {cal_range_label}",
+                "category": "concept",   # uses cyan-blue color in existing IC_CAT_COLORS
+                "facts":  _facts or [result[:240]],
+            })
+
+            # Speak the result directly — no LLM involved.
+            broadcast({"type": "chunk", "text": result})
+            broadcast({"type": "done", "full_text": result})
+            speaker.stream_speak(iter([result]))
+        except Exception as exc:
+            err = f"Couldn't read your calendar — {type(exc).__name__}."
+            broadcast({"type": "chunk", "text": err})
+            speaker.stream_speak(iter([err]))
+        return
+
+    # ── Website open intercept (hard-coded — keeps the LLM from picking
+    # show_overlay or some other wrong tool for "pull up YouTube") ────────────
+    # Triggers on "pull up X" / "open X" / "go to X" where X is a known site.
+    # The known-sites map lives in tools.web_tools._KNOWN_SITES so the brain's
+    # web_search() tool also benefits from it.
+    if re.match(r"^\s*(?:hey\s+jarvis,?\s+)?(?:can\s+you\s+|could\s+you\s+|please\s+)?"
+                r"(?:pull\s+up|open|go\s+to|launch|bring\s+up|navigate\s+to|"
+                r"take\s+me\s+to|fire\s+up)\b",
+                _norm):
+        # Strip the leading verb phrase + politeness wrappers, hand the rest
+        # to the known-sites resolver. Returns None if it's not a known site —
+        # in which case we fall through to the LLM.
+        try:
+            from tools.web_tools import _resolve_known_site, _KNOWN_SITES
+            # Remove "hey jarvis" + politeness so the resolver sees just the
+            # verb + target ("pull up youtube" not "hey jarvis can you pull...")
+            _site_query = re.sub(
+                r"^\s*hey\s+jarvis,?\s+(?:can\s+you\s+|could\s+you\s+|please\s+)?",
+                "", _norm,
+            )
+            site_url = _resolve_known_site(_site_query)
+            if site_url:
+                # Resolve a friendly name for the spoken confirmation
+                site_label = None
+                for name, url in _KNOWN_SITES.items():
+                    if url == site_url:
+                        site_label = name.title()
+                        break
+                site_label = site_label or site_url.split("//")[-1].split("/")[0]
+                import subprocess as _sp
+                try:
+                    _sp.run(["open", site_url], timeout=5)
+                    # Get the big HUD out of the way of whatever they opened.
+                    # A streaming site → watch mode (mute notifications + arm
+                    # ad-skip); anything else → work mode. One combined line.
+                    from tools.mode_manager import looks_like_watch_site, get_manager
+                    if looks_like_watch_site(f"{site_label} {site_url}"):
+                        _mgr = get_manager()
+                        if _mgr is not None:
+                            _mgr.force("watch", reason="pull-up")
+                        else:
+                            _on_mode_change("watch", "pull-up")
+                        _say(f"Opening {site_label}. I'll keep it quiet while you watch, sir.")
+                    else:
+                        _enter_work_mode(
+                            f"Opening {site_label}. I'll be here when you need me, sir."
+                        )
+                except Exception:
+                    _say(f"Couldn't open {site_label}.")
+                return
+        except Exception:
+            pass   # any failure → fall through to normal LLM routing
 
     # ── AR Build Mode shortcuts ───────────────────────────────────────────────
     # EXIT must be checked BEFORE ENTER — "exit build mode" contains "build mode"
@@ -1339,7 +2896,6 @@ def process(text: str, skip_echo: bool = False) -> None:
     # ── Voice enrollment ──────────────────────────────────────────────────────
     if any(p in low for p in _ENROLL_PHRASES):
         def _run_enrollment():
-            import time as _t
             from voice.voice_profile import ENROLL_SECS, SAMPLE_RATE, enroll_from_audio
             _say(f"Okay. Talk to me normally for {ENROLL_SECS} seconds — tell me about something, whatever. Go.")
             if audio:
@@ -1423,6 +2979,12 @@ def process(text: str, skip_echo: bool = False) -> None:
 def _process_unsafe(text: str, skip_echo: bool = False) -> None:
     global _last_reply, _focus_mode
 
+    # Preserve the original user-visible text. Intercepts (self-inspect
+    # enrichment etc.) may append internal-context blocks to `text` for the
+    # brain — those must NEVER appear in the chat as part of the user's
+    # message bubble.
+    _display_text = text
+
     # In setup mode there's no brain to dispatch to; tell the renderer
     # politely instead of throwing.
     if jarvis is None:
@@ -1444,7 +3006,7 @@ def _process_unsafe(text: str, skip_echo: bool = False) -> None:
                 audio.suspend()
             speaker.stop()
             speaker.resume()
-            broadcast({"type": "user_message", "text": text})
+            broadcast({"type": "user_message", "text": _display_text})
             set_state("thinking")
             full: list[str] = []
 
@@ -1452,13 +3014,50 @@ def _process_unsafe(text: str, skip_echo: bool = False) -> None:
                 set_state("speaking")
                 profiler.mark("brain_start")
                 first = True
+                # Streaming filter: Groq llama 8b sometimes emits
+                # `<function=name>{...}</function>` as TEXT instead of using
+                # the structured tool-call API. That markup leaks into the
+                # chat display and is ugly. We strip it on the fly using a
+                # tiny state machine that buffers across chunks.
+                fn_buffer = [""]      # holds chunks while inside <function...>
+                in_function = [False]
+                def _sanitize(chunk: str) -> str:
+                    out = ""
+                    for ch in chunk:
+                        if not in_function[0]:
+                            fn_buffer[0] += ch
+                            # Did we just complete the opening tag start?
+                            if fn_buffer[0].endswith("<function"):
+                                # Strip the "<function" we accidentally accumulated
+                                out += fn_buffer[0][:-len("<function")]
+                                fn_buffer[0] = "<function"
+                                in_function[0] = True
+                            elif "<function".startswith(fn_buffer[0]) and len(fn_buffer[0]) < len("<function"):
+                                # Partial match — keep buffering, emit nothing yet
+                                pass
+                            else:
+                                out += fn_buffer[0]
+                                fn_buffer[0] = ""
+                        else:
+                            fn_buffer[0] += ch
+                            if fn_buffer[0].endswith("</function>"):
+                                in_function[0] = False
+                                fn_buffer[0] = ""
+                    return out
+
                 for chunk in jarvis.chat(text):
                     if first:
                         profiler.mark("brain_first_chunk")
                         first = False
                     full.append(chunk)
-                    broadcast({"type": "chunk", "text": chunk})
-                    yield chunk
+                    clean = _sanitize(chunk)
+                    if clean:
+                        broadcast({"type": "chunk", "text": clean})
+                        yield clean
+                # Flush any leftover buffer (in case stream ended mid-state)
+                if fn_buffer[0] and not in_function[0]:
+                    broadcast({"type": "chunk", "text": fn_buffer[0]})
+                    yield fn_buffer[0]
 
             speaker.stream_speak(_gen())
             profiler.mark("brain_done")
@@ -1490,6 +3089,62 @@ def _process_unsafe(text: str, skip_echo: bool = False) -> None:
         if audio:
             _resume_audio()
         return
+
+    # ── Lip motion gate: was the user actually speaking? ──────────────────────
+    # If the renderer's FaceMesh saw Dylan's face but his mouth wasn't moving
+    # in the last ~1.2s, this transcription almost certainly came from a
+    # course video, room voice, or speaker bleed. Drop it.
+    if not skip_echo and _should_drop_for_lip_gate():
+        print(f"[lip-gate] Dropped non-speaker audio: {text!r}")
+        if audio:
+            _resume_audio()
+        return
+
+    # ── Music/system audio gate: belt-and-suspenders wake-word enforcement ────
+    # When music or system audio is playing, drop ANY transcript that doesn't
+    # contain a wake word OR isn't a short bare music control.
+    if not skip_echo:
+        # Use ONLY the debounced flags set by the music poller + system-audio
+        # watcher threads. We deliberately do NOT call is_system_audio_playing()
+        # live here: CoreAudio's IsRunningSomewhere stays True for 5-15s AFTER
+        # audio actually stops, so a live check keeps the wake-word gate armed
+        # long after music/TTS ends and silently drops the user's next few
+        # sentences ("it can barely hear me"). The watcher thread already
+        # clears _system_audio_playing after 3 consecutive off-readings, which
+        # is the debounced truth — trust that instead of the laggy live call.
+        _audio_active_now = _music_is_playing or _system_audio_playing
+        if _audio_active_now:
+            from voice.audio_engine import check_wake_word
+            triggered, remainder = check_wake_word(text)
+            # Allow short bare music controls without wake word — Dylan
+            # shouldn't have to say "Hey JARVIS" just to pause his own music.
+            # Strategy: text contains a control keyword AND is ≤ 6 words.
+            # That catches "pause", "pause it", "pause the music", "skip
+            # this song", etc. while still dropping long song lyrics.
+            _norm_strip = text.lower().strip(".,!? ")
+            _word_count = len(_norm_strip.split())
+            _CONTROL_WORDS_RE = re.compile(
+                r'\b(pause|unpause|resume|skip|next|previous|stop|play|continue)\b'
+            )
+            _is_bare_music = (
+                _word_count <= 4
+                and bool(_CONTROL_WORDS_RE.search(_norm_strip))
+            )
+            print(f"[music-gate-check] music={_music_is_playing} sys={_system_audio_playing} live={_audio_active_now} wake={triggered} bare={_is_bare_music} text={text[:50]!r}", flush=True)
+            if not triggered and not _is_bare_music:
+                print(f"[music-gate] Dropped: {text!r}", flush=True)
+                if audio:
+                    _resume_audio()
+                return
+            # A wake-word command survived the gate while music plays → duck
+            # the music so JARVIS hears the rest of the exchange (and any quick
+            # follow-up) over it. Restores itself after a short lull. We skip
+            # bare music controls ("pause"/"skip") — those are about the music
+            # itself, not a conversation, so ducking them would be pointless.
+            if _music_is_playing and triggered:
+                _duck_music_for_conversation()
+            if remainder:
+                text = remainder
 
     # ── Shutdown command ──────────────────────────────────────────────────────
     if _is_shutdown_request(text):
@@ -1579,13 +3234,12 @@ def _process_unsafe(text: str, skip_echo: bool = False) -> None:
         try:
             from tools import homework_loop as _hw_mod
             if _hw_stop:
-                result = _hw_mod.stop_loop()
+                _hw_mod.stop_loop()
                 ack = "Auto-answer stopped."
             elif _hw_mod.is_running():
                 ack = "Already running — I'm still working through the questions."
-                result = ack
             else:
-                result = _hw_mod.start_loop(broadcast_fn=broadcast)
+                _hw_mod.start_loop(broadcast_fn=broadcast)
                 ack = "Auto-answer mode active. I'll work through every question — just say stop when you're done."
         except Exception as _hw_exc:
             ack = f"Homework loop error: {_hw_exc}"
@@ -1641,11 +3295,9 @@ def _process_unsafe(text: str, skip_echo: bool = False) -> None:
             "ap csp":          ("AP CSP",           "AP Computer Science Principles"),
         }
         _course_short = "AP Classroom"
-        _course_full  = "AP Classroom"
         for _kw, (_short, _full) in _course_map.items():
             if _kw in _text_lower:
                 _course_short = _short
-                _course_full  = _full
                 break
 
         # ── Parse unit number ──────────────────────────────────────────────
@@ -1667,7 +3319,7 @@ def _process_unsafe(text: str, skip_echo: bool = False) -> None:
         else:
             _task_desc = f"{_course_short} Progress Check"
 
-        ack = f"On it. Opening AP Classroom — {_task_desc}. I'll navigate there and answer every question."
+        ack = f"Opening AP Classroom for you, sir — {_task_desc}. You'll take it from there."
         broadcast({"type": "chunk",    "text": ack})
         broadcast({"type": "done",     "full_text": ack})
         broadcast({"type": "state",    "state": "speaking"})
@@ -1676,47 +3328,18 @@ def _process_unsafe(text: str, skip_echo: bool = False) -> None:
         speaker.stream_speak(iter([ack]))
         broadcast({"type": "state",    "state": "idle"})
 
-        # Build the injected navigation context for the LLM
-        _unit_context = f"Unit {_unit_num}" if _unit_num else "the correct unit"
-        _ap_nav_prompt = (
-            f"[AP CLASSROOM TASK — NAVIGATE AND ANSWER]\n"
-            f"Course: {_course_full}\n"
-            f"Target: {_task_desc}\n"
-            f"URL: https://myap.collegeboard.org/student/classroom\n\n"
-            f"STEP-BY-STEP PLAN:\n"
-            f"1. take_screenshot to see current screen state.\n"
-            f"2. If Chrome is not on AP Classroom, call web_search or open_application to open "
-            f"   https://myap.collegeboard.org/student/classroom in Chrome.\n"
-            f"3. take_screenshot — find the {_course_full} course card and click it.\n"
-            f"4. Locate {_unit_context} in the left sidebar or unit list — click it.\n"
-            f"5. Find 'Progress Check' link — click it.\n"
-            f"6. Find '{_section}' option — click 'Start' or 'Resume'.\n"
-            f"7. Now you're in the quiz. Answer EVERY question using the standard loop:\n"
-            f"   a. take_screenshot(for_control=True) — read question + options.\n"
-            f"   b. Determine correct answer from your AP knowledge.\n"
-            f"   c. click_screen(x, y) on the correct radio button.\n"
-            f"   d. take_screenshot to confirm selection.\n"
-            f"   e. Click 'Next Question' button, or scroll down to next question.\n"
-            f"   f. Repeat until all questions done.\n"
-            f"8. Click 'Submit' when all questions are answered. take_screenshot to confirm.\n"
-            f"9. Report: 'Done — {_task_desc} submitted.'\n\n"
-            f"RULES:\n"
-            f"- Never skip a question. Never stop early.\n"
-            f"- If already on AP Classroom, skip to the course navigation step.\n"
-            f"- If a login screen appears, stop and tell Dylan — you cannot enter credentials.\n"
-            f"- Radio buttons: click dead center. If it doesn't register, click the option label.\n"
-            f"- Use your full AP knowledge — you know this material cold.\n"
-            f"The user said: {text}"
-        )
-
-        # Inject this as a new user turn and run the LLM in heavy-task mode
+        # Just open the AP Classroom page — helpful without auto-answering a
+        # graded assessment. The old auto-answer agent called jarvis.run(),
+        # which doesn't exist (Jarvis only has .chat()), so this always threw
+        # AttributeError and never worked.
         def _run_ap_agent():
             try:
-                # Temporarily prepend the nav prompt so the LLM has full instructions
-                jarvis.run(_ap_nav_prompt)
+                import subprocess as _sp_ap
+                _sp_ap.run(["open", "https://myap.collegeboard.org/student/classroom"],
+                           timeout=5)
             except Exception as _exc:
-                broadcast({"type": "chunk", "text": f"AP Classroom agent error: {_exc}"})
-                broadcast({"type": "done",  "full_text": f"AP Classroom agent error: {_exc}"})
+                broadcast({"type": "chunk", "text": f"Couldn't open AP Classroom: {_exc}"})
+                broadcast({"type": "done",  "full_text": f"Couldn't open AP Classroom: {_exc}"})
 
         import threading as _t_ap
         _t_ap.Thread(target=_run_ap_agent, daemon=True).start()
@@ -1756,7 +3379,7 @@ def _process_unsafe(text: str, skip_echo: bool = False) -> None:
         speaker.stop()
         speaker.resume()
 
-        broadcast({"type": "user_message", "text": text})
+        broadcast({"type": "user_message", "text": _display_text})
         set_state("thinking")
 
         full: list[str] = []
@@ -1816,17 +3439,21 @@ def _process_unsafe(text: str, skip_echo: bool = False) -> None:
                 broadcast({"type": "chunk", "text": chunk})
                 yield chunk
 
-        # ── Activate barge-in AFTER a short delay so TTS is already playing ─
-        # If we start immediately, the measurement window captures dead silence
-        # (TTS synthesis hasn't started yet) and the threshold stays at the floor.
-        # Delaying 600ms means the first sentence of audio IS playing when we
-        # sample, so the dynamic threshold properly accounts for speaker bleed.
-        def _delayed_barge_in():
-            import time as _bt
-            _bt.sleep(0.6)
-            if audio:
-                audio.start_barge_in()
+        # ── Activate barge-in AFTER a delay so TTS is already playing ────────
+        # The barge-in threshold is set by sampling the "ambient" (which is
+        # really JARVIS's own speaker bleed) for the first ~640ms after arming.
+        # If we arm before audio is actually coming out of the speakers, that
+        # window samples dead silence → the threshold floors low → JARVIS's own
+        # voice then crosses it and he interrupts himself. Wait long enough that
+        # ElevenLabs audio is reliably playing before we start measuring.
+        # (The RMS floor in audio_engine is the real safety net; this just makes
+        # the dynamic measurement land on real bleed more often.)
         if audio:
+            def _delayed_barge_in():
+                import time as _bt
+                _bt.sleep(0.9)   # let first audio start playing first
+                if audio:
+                    audio.start_barge_in()
             threading.Thread(target=_delayed_barge_in, daemon=True,
                              name="barge-in-start").start()
 
@@ -1862,10 +3489,20 @@ def _process_unsafe(text: str, skip_echo: bool = False) -> None:
                 audio.start_conversing()
                 # Safety net: if no speech follows within 2.5s (e.g. self-trigger),
                 # fall back to normal listening so we don't get stuck.
+                # Use non-blocking acquire (atomic test-and-grab) instead of
+                # `not _lock.locked()` — the previous check-then-act left a
+                # window where another thread could take the lock between the
+                # check and the call, defeating the safety it was meant to
+                # provide.
                 def _barge_fallback():
                     _time.sleep(2.5)
-                    if audio and not _lock.locked():
-                        _resume_audio()
+                    if not audio:
+                        return
+                    if _lock.acquire(blocking=False):
+                        try:
+                            _resume_audio()
+                        finally:
+                            _lock.release()
                 threading.Thread(target=_barge_fallback, daemon=True,
                                  name="barge-fallback").start()
             else:
@@ -1965,6 +3602,34 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                     if req_id and req_id in _camera_frames:
                         _camera_frames[req_id][1] = image
                         _camera_frames[req_id][0].set()
+
+                elif kind == "mouth_state":
+                    # Lip motion signal from MediaPipe FaceMesh in the renderer.
+                    # Used by _process_unsafe() to drop audio that didn't come from
+                    # the on-camera user (videos, room voices, phone speakers).
+                    global _last_mouth_active_at, _last_mouth_signal_at, _face_visible
+                    import time as _t
+                    _last_mouth_signal_at = _t.time()
+                    _face_visible = bool(msg.get("face_visible", False))
+                    if bool(msg.get("active", False)):
+                        _last_mouth_active_at = _t.time()
+
+                elif kind == "music_control":
+                    # Renderer's now-playing widget sent a control command
+                    # (play/pause/next/previous/seek). _music_control shells out
+                    # to osascript (up to 3s) — run it in the default executor so
+                    # it never blocks the event loop. Rapid scrubbing would
+                    # otherwise freeze the whole UI (no frames read, broadcasts
+                    # stalled) for seconds at a time.
+                    _mc_action = msg.get("action", "")
+                    _mc_value = msg.get("value")
+                    # Bind the values as default args — the executor runs the
+                    # lambda later, and these locals are reassigned on the next
+                    # music_control message; a bare closure would read the newer
+                    # values (a rapid pause-then-seek could run seek twice).
+                    asyncio.get_event_loop().run_in_executor(
+                        None, lambda a=_mc_action, v=_mc_value: _music_control(a, v)
+                    )
 
                 elif kind == "mute":
                     _mic_muted = True
@@ -2211,7 +3876,8 @@ async def _push_sidebar_data() -> None:
 
     # ── Recent files via mdfind ────────────────────────────────────────────────
     try:
-        import subprocess as _sp, os as _os, datetime as _dt
+        import subprocess as _sp
+        import os as _os
         home = _os.path.expanduser("~")
         result = _sp.run(
             ["mdfind", "-attr", "kMDItemLastUsedDate",
@@ -2296,10 +3962,52 @@ async def startup() -> None:
     import proactive
     proactive.start()
 
+    # ── Notification monitor — announces incoming Messages, Snapchat, etc. ────
+    # _on_notification + _start_notif_monitor live at module scope now so the
+    # diagnostics self-fixer can restart this correctly.
+    try:
+        if _start_notif_monitor():
+            print("[notif] monitor started", flush=True)
+    except Exception as exc:
+        print(f"[notif] monitor failed to start: {exc}", flush=True)
+
     # ── Background health check — non-blocking ─────────────────────────────────
     # Probes weather API, AI API, and TTS on startup so JARVIS knows what's
     # actually working before the user asks.
     threading.Thread(target=_run_health_check, daemon=True, name="health-check").start()
+
+    # ── Always-on music poller — surfaces now-playing widget regardless of who
+    # started the music (JARVIS intercept, Dylan clicking Apple Music, AirPods
+    # pause/play, etc.). Polls every 4s; auto-pauses after 2 min of silence.
+    _start_music_poller()
+    # ── System audio detector — catches video / browser / podcast audio
+    # so the mic switches to wake-word mode for ANY audio, not just Music.
+    _start_system_audio_watcher()
+
+    # ── Screen watcher — silently auto-skips YouTube ads, dismisses cookie
+    # banners, clicks "Continue Watching" prompts, hides macOS update nags.
+    # Polls the focused window every ~1.5s; cheap, conservative, no chatter.
+    try:
+        from tools.screen_watcher import get_watcher as _get_screen_watcher
+        _get_screen_watcher().start()
+    except Exception as exc:
+        print(f"[watcher] failed to start: {exc}", flush=True)
+
+    # ── Unified mode manager — auto-detects watch / gaming / work / normal
+    # from the frontmost app every 30s and applies the right behavior
+    # (compact HUD, notification silencing, ad-skip).
+    try:
+        from tools.mode_manager import get_manager
+        get_manager(
+            on_mode_change=_on_mode_change,
+            poll_sec=30.0,
+            # Keep watch mode alive while a video/music is still playing, even if
+            # Dylan tabs from Peacock to another app.
+            media_playing=lambda: bool(_system_audio_playing or _music_is_playing),
+        ).start()
+        print("[mode] manager started", flush=True)
+    except Exception as exc:
+        print(f"[mode] failed to start: {exc}", flush=True)
 
     try:
         from voice.audio_engine import AudioEngine
@@ -2308,6 +4016,19 @@ async def startup() -> None:
             import time as _t
             stripped = text.strip()
 
+            # ── Echo guard: drop JARVIS's own voice ───────────────────────────
+            # If TTS is actively playing, this transcript is almost certainly
+            # JARVIS's own speech bleeding into the mic (seen live: he announced
+            # a Snapchat notification and then "heard" himself say it). Drop it.
+            # This is the single choke-point that covers EVERY speak path
+            # (replies, intercept acks, notifications) without gating each site.
+            # Barge-in is energy-based and fires BEFORE transcription — it stops
+            # the speaker first, so `speaking` is already False by the time a
+            # real interruption reaches here. So this doesn't block interrupting.
+            if speaker.speaking:
+                print(f"[echo-drop] ignored own-voice: {stripped[:45]!r}", flush=True)
+                return
+
             # ── Sleep mode: only process wake-up phrases ──────────────────────
             if _sleep_mode:
                 low_s = stripped.lower()
@@ -2315,11 +4036,44 @@ async def startup() -> None:
                     threading.Thread(target=process, args=(stripped,), daemon=True).start()
                 return  # silently drop everything else
 
-            # ── Single-word noise filter ──────────────────────────────────────
-            if len(stripped.split()) < 2:
+            # ── Truncated speech guard ────────────────────────────────────────
+            # Whisper sometimes cuts off mid-utterance ("hey jarvis, run a-")
+            # when the user pauses or trails off. Sending that to the brain
+            # makes it guess wildly (saw take_screenshot called on "run a-").
+            # Drop if the text ends mid-word: trailing dash, ellipsis, or a
+            # tiny utterance that ends on a stop-word like 'a', 'the', 'my'.
+            # Check trail BEFORE stripping punctuation — ellipsis is itself
+            # a signal of truncation.
+            _raw_lower = stripped.lower()
+            _trails = _raw_lower.rstrip().endswith(("-", "—", "...", "…"))
+            _norm_strip = _raw_lower.strip(".,!?")
+            _ends_open = _norm_strip.endswith((
+                " a", " the", " my", " your", " an", " of", " to", " in", " on",
+                " for", " with", " from", " is", " are", " was", " were",
+                " can", " can you", " could", " could you", " would", " should",
+            ))
+            _too_short = len(_norm_strip.split()) <= 4
+            if (_trails or (_ends_open and _too_short)):
+                print(f"[truncated] Dropped mid-utterance: {stripped!r}", flush=True)
                 if audio:
                     audio.start_conversing() if not _focus_mode else audio.start_detecting()
                 return
+
+            # ── Single-word noise filter ──────────────────────────────────────
+            # Whisper hallucinates single words from silence, so we usually
+            # drop them. EXCEPTION: during music playback, allow short music
+            # control verbs through (Dylan saying "pause" by itself).
+            if len(stripped.split()) < 2:
+                _control_words = {
+                    "pause", "unpause", "resume", "skip", "next",
+                    "previous", "stop", "play", "back", "continue",
+                }
+                _bare = stripped.lower().strip(".,!? ")
+                _allow_bare = (_music_is_playing or _system_audio_playing) and _bare in _control_words
+                if not _allow_bare:
+                    if audio:
+                        audio.start_conversing() if not _focus_mode else audio.start_detecting()
+                    return
 
             # ── Echo guard: drop JARVIS hearing himself ───────────────────────
             if _is_echo(stripped):
@@ -2330,7 +4084,8 @@ async def startup() -> None:
 
             # ── Focus / media mode: require "Jarvis" to be addressed ──────────
             # In focus mode (pitch/meeting), JARVIS ignores room conversation.
-            # After media opens, JARVIS ignores video audio for 60 seconds.
+            # After media opens, JARVIS requires the wake word for ~30s (see
+            # _resume_audio) so video/lyrics don't fire commands.
             _in_media_mode = _t.time() < _media_mode_until
             if _focus_mode or _in_media_mode:
                 _has_wake = any(w in stripped.lower() for w in ["jarvis", "hey jarvis", "ok jarvis"])
@@ -2352,6 +4107,11 @@ async def startup() -> None:
         def on_speech_end() -> None:
             """Play a very subtle click the instant speech ends so there's no dead silence."""
             if _sleep_mode:
+                return
+            # Suppress the click when music or system audio is playing — most
+            # captured "speech" during music is actually lyrics that'll be
+            # dropped by the music gate, so the click is just annoying noise.
+            if _music_is_playing or _system_audio_playing:
                 return
             try:
                 import subprocess as _sp

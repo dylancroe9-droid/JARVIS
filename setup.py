@@ -8,7 +8,7 @@ Run automatically by chat.py on first launch, or manually: python setup.py
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from brain.memory import save_fact, load_memory, MEMORY_FILE
+from brain.memory import save_fact
 from rich.console import Console
 
 console = Console()
@@ -67,9 +67,9 @@ def run_setup(speaker=None) -> None:
             fact = f"{label}: {answer}"
             save_fact(fact)
             saved.append(fact)
-            console.print(f"[dim]  ✓ Saved[/dim]\n")
+            console.print("[dim]  ✓ Saved[/dim]\n")
         else:
-            console.print(f"[dim]  — Skipped[/dim]\n")
+            console.print("[dim]  — Skipped[/dim]\n")
 
     # Mark setup complete
     open(SETUP_FLAG, "w").close()

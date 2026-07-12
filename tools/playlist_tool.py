@@ -30,6 +30,76 @@ def _esc(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
+# ── Music taste profiling ────────────────────────────────────────────────────
+
+def scan_music_taste(per_playlist_limit: int = 10) -> str:
+    """
+    Read Dylan's playlists, sample tracks from each, build a music profile.
+    Returns a string summary suitable to save to memory.txt.
+    """
+    res = _run('''
+tell application "Music"
+    set output to ""
+    set pls to (every user playlist whose special kind is none)
+    repeat with pl in pls
+        set output to output & (name of pl) & "\\n"
+    end repeat
+    return output
+end tell
+''')
+    if res.startswith("__error__"):
+        return f"Couldn't list playlists: {res}"
+    playlists = [l.strip() for l in res.splitlines() if l.strip()]
+
+    all_artists: dict[str, int] = {}
+    playlist_summary: list[str] = []
+
+    for pl_name in playlists:
+        if "Untitled" in pl_name or "Test" in pl_name:
+            continue
+        tracks_raw = _run(f'''
+tell application "Music"
+    set output to ""
+    set i to 0
+    repeat with t in tracks of user playlist "{_esc(pl_name)}"
+        if i ≥ {per_playlist_limit} then exit repeat
+        set output to output & (artist of t) & "|" & (name of t) & "
+"
+        set i to i + 1
+    end repeat
+    return output
+end tell
+''', timeout=20)
+        if tracks_raw.startswith("__error__"):
+            continue
+        local_counts: dict[str, int] = {}
+        for ln in tracks_raw.splitlines():
+            if "|" not in ln:
+                continue
+            artist, _ = ln.split("|", 1)
+            artist = artist.strip()
+            if not artist:
+                continue
+            all_artists[artist] = all_artists.get(artist, 0) + 1
+            local_counts[artist] = local_counts.get(artist, 0) + 1
+        top3 = sorted(local_counts.items(), key=lambda x: -x[1])[:3]
+        if top3:
+            playlist_summary.append(
+                f"  {pl_name}: " + ", ".join(a for a, _ in top3)
+            )
+
+    top10 = sorted(all_artists.items(), key=lambda x: -x[1])[:10]
+    lines = [
+        "DYLAN'S MUSIC TASTE (auto-scanned from Apple Music):",
+        "Top artists across all playlists: "
+        + ", ".join(a for a, _ in top10) if top10 else "(no data)",
+        "",
+        "Per-playlist signature:",
+        *playlist_summary,
+    ]
+    return "\n".join(lines)
+
+
 # ── List ──────────────────────────────────────────────────────────────────────
 
 def list_playlists() -> str:
@@ -56,26 +126,43 @@ end tell
 
 def play_playlist(name: str, shuffle: bool = True) -> str:
     """
-    Play a playlist by name. Fuzzy matches — 'gym' finds 'Gym' or 'gym music'.
+    Play a playlist by name. Matching priority:
+      1. EXACT case-insensitive match (so "rock" → "Rock", not "Chill rock")
+      2. Substring fallback (so "iron" → "Iron Man Workout")
+    Also stops current playback first to prevent the previous playlist
+    from resuming after a small playlist finishes.
     """
     esc_name = _esc(name.lower())
     result = _run(f'''
 tell application "Music"
     activate
-    -- Try exact match first
     set matchedPL to missing value
     set pls to (every playlist whose special kind is none)
+    -- PASS 1: exact name match (case-insensitive)
     repeat with pl in pls
         set n to name of pl
-        -- case-insensitive contains
-        if (do shell script "echo " & quoted form of n & " | tr A-Z a-z") contains "{esc_name}" then
+        set nLower to (do shell script "echo " & quoted form of n & " | tr A-Z a-z")
+        if nLower is equal to "{esc_name}" then
             set matchedPL to pl
             exit repeat
         end if
     end repeat
+    -- PASS 2: substring fallback only if exact failed
+    if matchedPL is missing value then
+        repeat with pl in pls
+            set n to name of pl
+            set nLower to (do shell script "echo " & quoted form of n & " | tr A-Z a-z")
+            if nLower contains "{esc_name}" then
+                set matchedPL to pl
+                exit repeat
+            end if
+        end repeat
+    end if
     if matchedPL is missing value then
         return "not found"
     end if
+    -- Stop current playback so the previous playlist doesn't resume later
+    stop
     set shuffle enabled to {str(shuffle).lower()}
     play matchedPL
     delay 1

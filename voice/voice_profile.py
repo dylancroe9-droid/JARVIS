@@ -24,9 +24,19 @@ import numpy as np
 # ── Config ────────────────────────────────────────────────────────────────────
 
 PROFILE_PATH       = Path.home() / ".jarvis_voice_profile.npy"
-SIMILARITY_THRESHOLD = 0.72    # cosine similarity floor — tune up for stricter, down for looser
+# Voice-as-primary, lip-as-backup architecture:
+#   PASS_THRESHOLD (0.55) — below this, audio is rejected at VAD level
+#   CONFIDENT_THRESHOLD (0.80) — when off-camera, voice match must be THIS high
+#                                 to accept. Tightened from 0.68 — videos with
+#                                 similar voices were sneaking through.
+#   Between the two — marginal match. Lip gate decides (when face is visible).
+SIMILARITY_THRESHOLD = 0.55
+CONFIDENT_THRESHOLD  = 0.80
 ENROLL_SECS        = 12        # seconds of speech to capture during enrollment
 SAMPLE_RATE        = 16_000
+
+# Emergency bypass — when voice profile keeps rejecting valid speech.
+DISABLED = os.environ.get("JARVIS_DISABLE_VOICE_PROFILE", "").lower() in ("1", "true", "yes")
 
 # ── Module-level encoder (loaded once, reused) ────────────────────────────────
 
@@ -114,6 +124,17 @@ def embed(audio_np: np.ndarray) -> Optional[np.ndarray]:
 
 # ── Similarity check ──────────────────────────────────────────────────────────
 
+# Track the most recent similarity score so the server can decide whether to
+# use the lip gate as a backup. Updated every is_owner() call. 1.0 means
+# "no profile / accepted with full confidence" so the server skips lip check.
+_last_similarity: float = 1.0
+_last_similarity_lock = threading.Lock()
+
+def last_similarity() -> float:
+    """Return the cosine-similarity score from the most recent is_owner() call."""
+    with _last_similarity_lock:
+        return _last_similarity
+
 def is_owner(audio_np: np.ndarray) -> bool:
     """
     Returns True if this audio chunk sounds like the enrolled user, OR if no
@@ -121,27 +142,42 @@ def is_owner(audio_np: np.ndarray) -> bool:
 
     Called once per audio chunk AFTER WebRTC VAD confirms speech.
     Adds ~20ms overhead on MacBook; negligible.
+
+    Side effect: updates _last_similarity so the server can decide whether
+    to consult the lip-gate backup. last_similarity() returns the score.
     """
+    global _last_similarity
+
+    if DISABLED:
+        with _last_similarity_lock:
+            _last_similarity = 1.0
+        return True
+
     with _profile_lock:
         profile = _profile_embedding
 
     if profile is None:
-        # Try lazy-loading from disk (handles case where load_profile() was
-        # called before file existed, but user has since enrolled)
+        # Lazy-load from disk
         if PROFILE_PATH.exists():
             load_profile()
             with _profile_lock:
                 profile = _profile_embedding
 
     if profile is None:
-        return True  # no profile → accept everything
+        with _last_similarity_lock:
+            _last_similarity = 1.0
+        return True
 
     emb = embed(audio_np)
     if emb is None:
-        return True  # too short or encoder error → accept
+        # Too short — pass through with full confidence so lip gate is skipped
+        with _last_similarity_lock:
+            _last_similarity = 1.0
+        return True
 
-    # Cosine similarity: dot product of unit vectors
     sim = float(np.dot(emb, profile) / (np.linalg.norm(emb) * np.linalg.norm(profile) + 1e-9))
+    with _last_similarity_lock:
+        _last_similarity = sim
     return sim >= SIMILARITY_THRESHOLD
 
 
