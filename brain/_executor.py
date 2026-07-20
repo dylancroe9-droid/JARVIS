@@ -1220,5 +1220,24 @@ class ToolsExecutor:
                 f"Here's your {title}. Click any card to hear it."
             )
 
+        # ── Practice tests ───────────────────────────────────────────────
+        elif name == "create_practice_test":
+            try:
+                from tools.practice_test import create_practice_test
+            except ImportError as exc:
+                return f"Practice test tool unavailable: {exc}"
+            return create_practice_test(
+                topic=args.get("topic", ""),
+                count=args.get("count", 8),
+                difficulty=args.get("difficulty", "AP level"),
+            )
+
+        elif name == "show_test_answers":
+            try:
+                from tools.practice_test import show_test_answers
+            except ImportError as exc:
+                return f"Practice test tool unavailable: {exc}"
+            return show_test_answers()
+
         else:
             return f"Unknown tool: {name}"

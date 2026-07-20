@@ -716,6 +716,35 @@ TOOL_DEFINITIONS = [
     {"name": "stop_study_mode", "description": "Stop study mode and summarize what was captured.",
      "input_schema": {"type": "object", "properties": {}, "required": []}},
 
+    # ── Practice tests ────────────────────────────────────────────────────
+    {"name": "create_practice_test",
+     "description": (
+         "Generate a practice test on a topic and open it in the browser, ready to take. "
+         "Use when Dylan says 'quiz me on X', 'make me a practice test', 'test me on X', "
+         "'give me practice questions', or is studying for something specific. "
+         "Every answer key is independently re-solved before the test is shown, and any "
+         "question whose key doesn't hold up is discarded — so never claim an answer is "
+         "right that the check threw out. "
+         "Pick `count` from what he asked for; default 8. Set `difficulty` to match his "
+         "course (e.g. 'AP Calculus BC level', 'honors chemistry')."
+     ),
+     "input_schema": {"type": "object", "properties": {
+         "topic": {"type": "string", "description": "What to test on — as specific as he gave you, e.g. 'related rates' not 'calculus'"},
+         "count": {"type": "integer", "default": 8, "description": "Number of questions (1-25)"},
+         "difficulty": {"type": "string", "default": "AP level"},
+     }, "required": ["topic"]}},
+
+    {"name": "show_test_answers",
+     "description": (
+         "Reveal the worked answer key for the practice test currently open, and score "
+         "whatever he already picked. Use for 'show the answers', 'how did I do', "
+         "'what did I get wrong', or 'just answer it for me'. "
+         "This works on tests JARVIS generated. It is NOT for filling in a real graded "
+         "assignment, a school portal, or a test being administered — if that's what he's "
+         "pointing at, help him work through it instead."
+     ),
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
+
     # ── Camera vision ─────────────────────────────────────────────────────
     {"name": "read_camera",
      "description": (
