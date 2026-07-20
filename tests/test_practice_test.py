@@ -160,3 +160,62 @@ class TestRendering:
         assert "__AUTO__=true" not in pt._render()
         pt._STATE["revealed"] = True
         assert "__AUTO__=true" in pt._render()
+
+
+class TestTruncationSalvage:
+    """
+    A whole-array json.loads is all-or-nothing. One live run hit the output cap
+    mid-array and lost all 6 questions — $0.12 and 79 seconds for nothing.
+    """
+
+    def test_recovers_questions_from_a_truncated_array(self):
+        full = json.dumps([_q("A"), _q("B"), _q("C")])
+        truncated = full[: full.rindex("}") ]      # cut mid-way, no closing ]
+        got = pt._parse_questions(truncated)
+        assert len(got) == 2, "should keep the questions that completed"
+
+    def test_still_prefers_the_clean_whole_array(self):
+        assert len(pt._parse_questions(json.dumps([_q(), _q()]))) == 2
+
+    def test_salvage_skips_invalid_objects(self):
+        txt = ('[{"question":"q","choices":{"A":"1"},"answer":"A"},'
+               + json.dumps(_q("B"))[0:] )
+        assert all(set("ABCD") <= set(q["choices"]) for q in pt._parse_questions(txt))
+
+    def test_empty_on_junk(self):
+        assert pt._parse_questions("I'm afraid I can't do that") == []
+
+    def test_token_budget_scales_with_count(self, monkeypatch):
+        seen = {}
+        class C:
+            def __init__(self): self.messages = self
+            def create(self, **kw):
+                seen["max"] = kw["max_tokens"]
+                return SimpleNamespace(content=[SimpleNamespace(type="text", text="[]")])
+        monkeypatch.setattr(pt, "_claude", lambda: (C(), "m"))
+        pt._generate("t", 6, "AP")
+        big = seen["max"]
+        pt._generate("t", 1, "AP")
+        assert big > seen["max"], "more questions must get more headroom"
+
+
+class TestToolDescription:
+    """
+    Live run: "quiz me on the quadratic formula, 4 questions" got a clarifying
+    question back ("one at a time or all at once?") instead of a test. Asking
+    someone who is studying to negotiate the format first is exactly the friction
+    that makes a tool not get used.
+    """
+
+    def _desc(self, name):
+        from brain.tools import TOOL_DEFINITIONS
+        return next(t for t in TOOL_DEFINITIONS if t["name"] == name)["description"]
+
+    def test_generation_is_told_not_to_ask_first(self):
+        d = self._desc("create_practice_test").lower()
+        assert "immediately" in d
+        assert "do not ask" in d
+
+    def test_reveal_is_scoped_to_generated_tests(self):
+        d = self._desc("show_test_answers").lower()
+        assert "graded assignment" in d or "school portal" in d

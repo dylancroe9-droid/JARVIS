@@ -53,7 +53,12 @@ _TOOL_SEARCH_BETA = "advanced-tool-use-2025-11-20"
 # "what is the answer to this?" shares no words with "take_screenshot", so BM25
 # cannot retrieve it — measured 1/6 deferred vs 6/6 resident, with no reflexive
 # screenshots on plain conversation (6/6 clean).
-_CORE_TOOL_NAMES = {"take_screenshot", "play_music", "pause_music", "set_mode"}
+# create_practice_test must be resident for the same reason take_screenshot is:
+# a deferred tool only gets used if Claude thinks to search for it, and "quiz me on
+# X" is answerable from knowledge, so he just types questions into chat instead —
+# no verified keys, no page, no scoring. Measured: 0 tool calls when deferred.
+_CORE_TOOL_NAMES = {"take_screenshot", "play_music", "pause_music", "set_mode",
+                    "create_practice_test", "show_test_answers"}
 
 # Computed once and reused: the text must be byte-identical every turn or the tool
 # array shifts and takes the cached system prefix down with it.

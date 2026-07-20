@@ -47,9 +47,11 @@ Rules:
 - Keep each stem under 120 words.
 - Vary what is tested across the set; do not ask the same idea four ways.
 
+Keep "why" to ONE sentence — the key step, not a full derivation.
+
 Return ONLY a JSON array, no prose:
 [{{"question": "...", "choices": {{"A": "...", "B": "...", "C": "...", "D": "..."}},
-   "answer": "A", "why": "one or two sentences of worked reasoning"}}]"""
+   "answer": "A", "why": "one sentence of worked reasoning"}}]"""
 
 _VERIFY_PROMPT = """Solve this multiple-choice question independently.
 
@@ -69,26 +71,60 @@ def _claude():
     return anthropic.Anthropic(api_key=ANTHROPIC_API_KEY), ANTHROPIC_MODEL
 
 
+def _valid(q) -> bool:
+    return (isinstance(q, dict)
+            and {"question", "choices", "answer"} <= q.keys()
+            and q.get("answer") in ("A", "B", "C", "D")
+            and isinstance(q.get("choices"), dict)
+            and all(k in q["choices"] for k in "ABCD"))
+
+
+def _parse_questions(txt: str) -> list:
+    """
+    Pull questions out of the model's reply, tolerating a truncated array.
+
+    A whole-array json.loads is all-or-nothing: one run hit the output cap
+    mid-array and every question was thrown away, costing $0.12 and 79 seconds to
+    return nothing. Falling back to decoding object-by-object keeps the questions
+    that did come through complete.
+    """
+    start = txt.find("[")
+    if start >= 0:
+        end = txt.rfind("]") + 1
+        if end > start:
+            try:
+                whole = json.loads(txt[start:end])
+                if isinstance(whole, list):
+                    return [q for q in whole if _valid(q)]
+            except json.JSONDecodeError:
+                pass          # truncated or malformed — salvage below
+    out, dec, i = [], json.JSONDecoder(), max(start, 0)
+    while True:
+        i = txt.find("{", i)
+        if i < 0:
+            break
+        try:
+            obj, endpos = dec.raw_decode(txt, i)
+        except json.JSONDecodeError:
+            i += 1
+            continue
+        if _valid(obj):
+            out.append(obj)
+        i = endpos
+    return out
+
+
 def _generate(topic: str, n: int, level: str) -> list:
     client, model = _claude()
+    # Headroom so a full set isn't cut off mid-array; _parse_questions salvages
+    # whatever completed if it still is.
     r = client.messages.create(
-        model=model, max_tokens=8000,
+        model=model, max_tokens=min(2000 + 900 * n, 16000),
         messages=[{"role": "user",
                    "content": _GEN_PROMPT.format(n=n, topic=topic, level=level)}],
     )
     txt = "".join(b.text for b in r.content if b.type == "text")
-    start, end = txt.find("["), txt.rfind("]") + 1
-    if start < 0 or end <= start:
-        return []
-    try:
-        qs = json.loads(txt[start:end])
-    except json.JSONDecodeError:
-        return []
-    return [q for q in qs
-            if isinstance(q, dict)
-            and {"question", "choices", "answer"} <= q.keys()
-            and q.get("answer") in ("A", "B", "C", "D")
-            and all(k in (q.get("choices") or {}) for k in "ABCD")]
+    return _parse_questions(txt)
 
 
 def _verify(questions: list) -> tuple:

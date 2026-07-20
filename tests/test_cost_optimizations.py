@@ -152,3 +152,23 @@ class TestSystemBlocks:
         # The cache prefix is tools -> system -> messages, so a volatile system
         # block poisons the history cache behind it. State goes on the last message.
         assert len(_system_blocks("character")) == 1
+
+
+class TestPracticeTestToolsAreResident:
+    """
+    Deferred tools only get used if Claude thinks to SEARCH for them. "Quiz me on
+    X" is answerable from knowledge, so with these deferred he typed questions
+    into chat instead of generating a real test — measured 0 tool calls, meaning
+    no verified answer keys, no page, no scoring. Same failure mode as
+    take_screenshot.
+    """
+
+    def test_create_practice_test_is_resident(self):
+        assert "create_practice_test" in _CORE_TOOL_NAMES
+
+    def test_show_test_answers_is_resident(self):
+        assert "show_test_answers" in _CORE_TOOL_NAMES
+
+    def test_resident_set_stays_small(self):
+        # Every resident tool is billed on every single turn. This is the budget.
+        assert len(_CORE_TOOL_NAMES) <= 8
