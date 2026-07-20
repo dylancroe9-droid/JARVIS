@@ -977,6 +977,14 @@ class ToolsExecutor:
                 mgr.set_auto(False); return "Auto mode off, sir."
             if mode == "normal":
                 mgr.exit_forced();   return "Back to normal, sir."
+            if mode == "study":
+                # Entering study is what LOADS the schoolwork tools — outside this
+                # mode take_screenshot and the practice-test tools aren't even sent
+                # to the model, so homework behaviour can't leak into ordinary
+                # desktop use.
+                mgr.force(mode)
+                return ("Study mode, sir. Screen's mine when you need a problem read, "
+                        "and I can build you a practice test on anything.")
             if mode in ("gaming", "work", "watch"):
                 mgr.force(mode);     return f"{mode.title()} mode, sir."
             return f"I don't have a '{mode}' mode."

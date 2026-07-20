@@ -150,12 +150,19 @@ _MODE_EXPLAIN = {
     "watch":  "a video is playing, so you've gone quiet and compact and silenced notifications",
     "gaming": "a game is running, so you're compact and silent until told 'exit gaming mode'",
     "work":   "a work app (editor/terminal/docs) is focused, so you're a compact corner HUD",
+    "study":  "Dylan is doing schoolwork, so you're reading his screen for problems, "
+              "quizzing him, and staying out of the way otherwise",
     "normal": "the normal desktop view with the full HUD",
 }
 
 def set_current_mode(mode: str, reason: str = "") -> None:
     _current_state["mode"] = mode or "normal"
     _current_state["reason"] = reason or ""
+
+def get_current_mode() -> str:
+    """The mode JARVIS is in right now. Used to decide which tools stay resident."""
+    return _current_state.get("mode", "normal") or "normal"
+
 
 def set_screen_context(desc: str) -> None:
     _current_state["screen"] = (desc or "").strip()

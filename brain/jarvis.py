@@ -19,7 +19,7 @@ from datetime import datetime
 from config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL, GROQ_API_KEY, GROQ_MODEL, OLLAMA_URL, OLLAMA_MODEL, USER_NAME
 from brain.personality import (
     get_system_prompt, get_fast_prompt, get_mid_prompt,
-    get_stable_prompt, get_volatile_prompt,
+    get_stable_prompt, get_volatile_prompt, get_current_mode,
 )
 from brain.tools import TOOL_DEFINITIONS, get_openai_tools, get_core_tools, get_8b_tools
 
@@ -53,12 +53,32 @@ _TOOL_SEARCH_BETA = "advanced-tool-use-2025-11-20"
 # "what is the answer to this?" shares no words with "take_screenshot", so BM25
 # cannot retrieve it — measured 1/6 deferred vs 6/6 resident, with no reflexive
 # screenshots on plain conversation (6/6 clean).
-# create_practice_test must be resident for the same reason take_screenshot is:
-# a deferred tool only gets used if Claude thinks to search for it, and "quiz me on
-# X" is answerable from knowledge, so he just types questions into chat instead —
-# no verified keys, no page, no scoring. Measured: 0 tool calls when deferred.
-_CORE_TOOL_NAMES = {"take_screenshot", "play_music", "pause_music", "set_mode",
-                    "create_practice_test", "show_test_answers"}
+# Tools resident on EVERY turn, in every mode. Keep this tiny — each one is billed
+# on every single request.
+_BASE_TOOL_NAMES = {"play_music", "pause_music", "set_mode"}
+
+# Schoolwork tools. Resident only in STUDY mode.
+#
+# They have to be resident to work at all: a deferred tool is only used if Claude
+# thinks to SEARCH for it, and both of these cover things he can fake from memory
+# — he'll type quiz questions into chat, or answer "what do I do?" as life advice
+# without ever looking at the screen. Measured 0 tool calls when deferred.
+#
+# But resident everywhere is wrong too. take_screenshot is deliberately tuned to
+# treat a dangling "this"/"that" as a screen reference, which is right when Dylan
+# is on a problem set and wrong the rest of the time — asking "what do I do?" while
+# browsing should not silently screenshot his desktop. Gating on mode is what keeps
+# homework behaviour inside homework.
+_STUDY_TOOL_NAMES = {"take_screenshot", "create_practice_test", "show_test_answers"}
+
+_CORE_TOOL_NAMES = _BASE_TOOL_NAMES | _STUDY_TOOL_NAMES
+
+
+def _resident_tools_for_mode(mode: str) -> set:
+    """Which tools stay loaded, given the mode JARVIS is currently in."""
+    if (mode or "normal").lower() == "study":
+        return _BASE_TOOL_NAMES | _STUDY_TOOL_NAMES
+    return _BASE_TOOL_NAMES
 
 # Computed once and reused: the text must be byte-identical every turn or the tool
 # array shifts and takes the cached system prefix down with it.
@@ -135,7 +155,7 @@ def _system_blocks(stable: str) -> list:
              "cache_control": {"type": "ephemeral", "ttl": "1h"}}]
 
 
-def _search_tools(tools: list) -> list:
+def _search_tools(tools: list, mode: str = "") -> list:
     """
     Return `tools` rewritten for Anthropic tool search: core tools stay resident,
     the rest are marked defer_loading so their schemas are fetched only when Claude
@@ -151,6 +171,7 @@ def _search_tools(tools: list) -> list:
     """
     if not tools or len(tools) < 20:
         return tools
+    resident = _resident_tools_for_mode(mode)
     addenda = _tool_addenda()
     out = []
     for t in tools:
@@ -158,7 +179,7 @@ def _search_tools(tools: list) -> list:
         extra = addenda.get(name)
         # Guidance lifted out of the system prompt rides on the tool it belongs to.
         t = {**t, "description": f"{t['description']}\n\n{extra}"} if extra else t
-        out.append(t if name in _CORE_TOOL_NAMES else {**t, "defer_loading": True})
+        out.append(t if name in resident else {**t, "defer_loading": True})
     # BM25 ranks by relevance and beat regex 7/8 vs 5/8 on real phrasings.
     out.append({"type": "tool_search_tool_bm25_20251119", "name": "tool_search_tool_bm25"})
     return out
@@ -1068,7 +1089,7 @@ class Jarvis:
                     thinking={"type": "disabled"},
                     system=_system_blocks(_stable),
                     messages=self._claude_messages(volatile=system),
-                    tools=_search_tools(_active_tools),
+                    tools=_search_tools(_active_tools, get_current_mode()),
                     tool_choice=_overlay_tool_choice,
                     max_tokens=_loop_max_tokens,
                     betas=[_TOOL_SEARCH_BETA],
@@ -1302,7 +1323,7 @@ class Jarvis:
                 thinking={"type": "disabled"},   # keep voice replies instant (see _claude_chat)
                 system=system,
                 messages=self._claude_messages(volatile=volatile),
-                tools=_search_tools(TOOL_DEFINITIONS),
+                tools=_search_tools(TOOL_DEFINITIONS, get_current_mode()),
                 tool_choice={"type": "none"},
                 max_tokens=max_tokens,
                 betas=[_TOOL_SEARCH_BETA],

@@ -579,10 +579,18 @@ TOOL_DEFINITIONS = [
                      "screen' → normal; 'stop switching modes' → auto_off; "
                      "'watch my screen again' → auto_on. gaming=compact+silent, "
                      "watch=compact+silent (video), work=compact HUD, "
-                     "normal=full HUD."),
+                     "normal=full HUD.\n"
+                     "STUDY — 'help me study', 'doing homework', 'study mode', "
+                     "'quiz me', 'I have a problem set'. This is the ONLY mode in "
+                     "which JARVIS reads the screen for problems or builds practice "
+                     "tests: those tools are not even loaded outside it, so switch "
+                     "to study FIRST when he wants schoolwork help. Keeping them out "
+                     "of the other modes is deliberate — otherwise a casual 'what do "
+                     "I do?' while browsing makes JARVIS screenshot the desktop."),
      "input_schema": {"type": "object", "properties": {
          "mode": {"type": "string",
-                  "enum": ["gaming", "work", "watch", "normal", "auto_on", "auto_off"]}
+                  "enum": ["gaming", "work", "watch", "study", "normal",
+                           "auto_on", "auto_off"]}
      }, "required": ["mode"]}},
 
     {"name": "watch_movie",

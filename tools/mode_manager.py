@@ -91,7 +91,7 @@ _NORMAL_APPS = (
 # be saying so too.
 #
 # Watch stays non-sticky: it IS auto-detected, and it should follow the media.
-_STICKY_MODES = frozenset({"gaming", "work"})
+_STICKY_MODES = frozenset({"gaming", "work", "study"})
 
 
 def _frontmost() -> tuple[str, str]:
@@ -379,7 +379,7 @@ class ModeManager:
             # mode?!"). Work is now VOICE-ONLY ("work mode" / set_mode). Auto-switching
             # still handles the immersive states that actually benefit: watch (a video
             # is playing) and gaming (a game is fullscreen).
-            if m == "work":
+            if m in ("work", "study"):
                 m, r = "normal", app
             # Keep watch mode while a video/music is still playing, even if you
             # tabbed away from Peacock to a normal/work app (e.g. Claude) — don't

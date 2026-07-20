@@ -33,7 +33,10 @@ class TestToolSearch:
         assert len(deferred) > 100
 
     def test_core_tools_stay_resident(self):
-        out = _search_tools(TOOL_DEFINITIONS)
+        # Residency is per-mode now (see test_study_mode.py): the schoolwork tools
+        # only load in study mode so homework behaviour can't leak into ordinary
+        # desktop use. In study mode the whole core set must be present.
+        out = _search_tools(TOOL_DEFINITIONS, "study")
         for t in out:
             if t.get("name") in _CORE_TOOL_NAMES:
                 assert not t.get("defer_loading"), f"{t['name']} must stay resident"
