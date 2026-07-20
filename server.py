@@ -755,7 +755,14 @@ def _should_drop_for_lip_gate() -> bool:
 
     # ── Step 1: get voice profile match strength ───────────────────────────
     try:
-        from voice.voice_profile import last_similarity, CONFIDENT_THRESHOLD
+        from voice.voice_profile import (last_similarity, similarity_is_fresh,
+                                         CONFIDENT_THRESHOLD)
+        # A score that no verification produced is a placeholder, not evidence.
+        # is_owner() used to be called from nowhere, so this sat at its 1.0
+        # default and every sound in the room read as confidently-Dylan — that is
+        # how a fragment off a video became a command JARVIS answered on screen.
+        if not similarity_is_fresh():
+            return False
         voice_score = last_similarity()
     except Exception:
         return False  # voice profile unavailable → don't gate at all

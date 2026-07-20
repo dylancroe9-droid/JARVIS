@@ -127,13 +127,31 @@ def embed(audio_np: np.ndarray) -> Optional[np.ndarray]:
 # Track the most recent similarity score so the server can decide whether to
 # use the lip gate as a backup. Updated every is_owner() call. 1.0 means
 # "no profile / accepted with full confidence" so the server skips lip check.
+# 1.0 = "perfect match". This is the value callers see BEFORE any verification has
+# run, and server.py's lip gate reads it as gospel: a stale 1.0 meant every sound in
+# the room passed as confidently-Dylan. is_owner() is wired into the audio flush now,
+# so this is refreshed per utterance — but the default still matters for the window
+# before the first one, and for any path that reads it without verifying.
 _last_similarity: float = 1.0
+_last_similarity_verified: bool = False
 _last_similarity_lock = threading.Lock()
 
+
 def last_similarity() -> float:
-    """Return the cosine-similarity score from the most recent is_owner() call."""
+    """Cosine similarity from the most recent is_owner() call."""
     with _last_similarity_lock:
         return _last_similarity
+
+
+def similarity_is_fresh() -> bool:
+    """
+    False until is_owner() has actually scored something.
+
+    Callers that gate on identity must check this: acting on last_similarity()
+    when nothing has been verified is acting on a placeholder, not a measurement.
+    """
+    with _last_similarity_lock:
+        return _last_similarity_verified
 
 def is_owner(audio_np: np.ndarray) -> bool:
     """
@@ -146,11 +164,12 @@ def is_owner(audio_np: np.ndarray) -> bool:
     Side effect: updates _last_similarity so the server can decide whether
     to consult the lip-gate backup. last_similarity() returns the score.
     """
-    global _last_similarity
+    global _last_similarity, _last_similarity_verified
 
     if DISABLED:
         with _last_similarity_lock:
             _last_similarity = 1.0
+            _last_similarity_verified = True
         return True
 
     with _profile_lock:
@@ -166,6 +185,7 @@ def is_owner(audio_np: np.ndarray) -> bool:
     if profile is None:
         with _last_similarity_lock:
             _last_similarity = 1.0
+            _last_similarity_verified = True
         return True
 
     emb = embed(audio_np)
@@ -173,11 +193,13 @@ def is_owner(audio_np: np.ndarray) -> bool:
         # Too short — pass through with full confidence so lip gate is skipped
         with _last_similarity_lock:
             _last_similarity = 1.0
+            _last_similarity_verified = True
         return True
 
     sim = float(np.dot(emb, profile) / (np.linalg.norm(emb) * np.linalg.norm(profile) + 1e-9))
     with _last_similarity_lock:
         _last_similarity = sim
+        _last_similarity_verified = True
     return sim >= SIMILARITY_THRESHOLD
 
 

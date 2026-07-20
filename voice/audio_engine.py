@@ -567,6 +567,18 @@ class AudioEngine:
         if self._frames and self._speech_started:
             audio = np.concatenate(self._frames)
             if len(audio) >= MIN_AUDIO:
+                # Verify the speaker BEFORE transcribing.
+                #
+                # is_owner() existed but was called from nowhere, so
+                # last_similarity() sat at its 1.0 default forever and the lip
+                # gate in server.py read every sound in the room as a perfect
+                # match for Dylan. A stray fragment off a video ("...for sexual
+                # assault.") went straight in as a command and JARVIS answered it
+                # on screen. Failing OPEN on identity is the wrong direction for
+                # an always-on mic in someone's bedroom.
+                if not self._speaker_ok(audio):
+                    self._reset()
+                    return
                 # Fire ack callback immediately — before Whisper even starts.
                 # User hears acknowledgment sound ~instant, not after the 1-2s LLM delay.
                 if self._on_speech_end and kind == "command":
@@ -575,6 +587,31 @@ class AudioEngine:
                     ).start()
                 self._audio_q.put_nowait((kind, audio))
         self._reset()
+
+    def _speaker_ok(self, audio) -> bool:
+        """
+        True if this audio sounds like the enrolled owner.
+
+        Permissive by design when there is nothing to compare against: with no
+        enrolled profile, or if resemblyzer is unavailable, we accept — refusing
+        to listen at all is a worse failure than the occasional stray pickup.
+        But once a profile EXISTS, a clear mismatch is dropped.
+        """
+        try:
+            from voice.voice_profile import has_profile, is_owner
+        except Exception:
+            return True
+        try:
+            if not has_profile():
+                return True
+            if is_owner(audio):
+                return True
+        except Exception:
+            return True          # verification broke — don't go deaf over it
+        from voice.voice_profile import last_similarity
+        console.print(f"[dim]\\[voice] dropped — not the owner "
+                      f"(similarity {last_similarity():.2f})[/dim]")
+        return False
 
     # ── STT thread ────────────────────────────────────────────────────────────
 
