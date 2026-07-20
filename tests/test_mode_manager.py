@@ -202,17 +202,44 @@ def test_forced_work_holds_while_same_app(monkeypatch):
     assert mgr.mode == "work"
 
 
-def test_forced_work_releases_on_app_change(monkeypatch):
+def test_forced_work_holds_across_app_change(monkeypatch):
+    # Work is sticky. It used to release on the first app change, which dated from
+    # when auto-detection could re-enter work on its own: switch to Slack → normal,
+    # switch back to the editor → auto-detect → work again. Auto-entry into work is
+    # gone now (it kept flipping the HUD unprompted), so releasing the pin no longer
+    # hands off to anything — work mode just died on the first window switch, i.e.
+    # the moment you did any work. Voice is the only way in, so voice is the only
+    # way out.
     _front(monkeypatch, "Google Chrome", "CNN - Breaking News")
     mgr, events = _mk_manager()
     mgr.force("work")
     events.clear()
-    # User switches to Slack (classifies normal) → work pin releases.
     _front(monkeypatch, "Slack", "")
     mgr._poll_once()
-    assert events == [("normal", "Slack")]
+    assert events == []
+    assert mgr.mode == "work"
+    assert mgr._forced == "work"
+
+
+def test_forced_work_survives_a_video_being_open(monkeypatch):
+    # The live failure: asked for work mode with YouTube open in another window,
+    # and auto-detection dragged it into watch mode seconds later.
+    _front(monkeypatch, "Code", "main.py")
+    mgr, events = _mk_manager()
+    mgr.force("work")
+    events.clear()
+    _front(monkeypatch, "Google Chrome", "https://www.youtube.com/watch?v=go4O3F1L")
+    mgr._poll_once()
+    assert mgr.mode == "work", "a video in another window must not cancel work mode"
+
+
+def test_exit_forced_still_leaves_work(monkeypatch):
+    # Sticky must not mean trapped — "exit work mode" has to work.
+    _front(monkeypatch, "Code", "main.py")
+    mgr, events = _mk_manager()
+    mgr.force("work")
+    mgr.exit_forced()
     assert mgr.mode == "normal"
-    assert mgr._forced is None
 
 
 def test_forced_gaming_holds_across_app_change(monkeypatch):
@@ -322,15 +349,17 @@ def test_watch_still_switches_to_gaming_over_media(monkeypatch):
     assert mgr.mode == "gaming"   # explicit gaming context overrides
 
 
-def test_work_tracks_screen(monkeypatch):
+def test_work_does_not_auto_trigger(monkeypatch):
+    # Work mode is VOICE-ONLY now — a frontmost editor/terminal (e.g. the Terminal
+    # you launch JARVIS from) must NOT auto-flip the HUD to work. Watch and gaming,
+    # the immersive states, still auto-switch.
     mgr, events = _mk_manager()
     _front(monkeypatch, "Code", "server.py")
     mgr._poll_once()
-    assert mgr.mode == "work"
-    assert mgr._forced is None
+    assert mgr.mode == "normal"          # NOT "work" — auto-work removed
     _front(monkeypatch, "Safari", "YouTube")
     mgr._poll_once()
-    assert mgr.mode == "watch"
+    assert mgr.mode == "watch"           # immersive auto-detection still works
 
 
 def test_set_auto_off_returns_to_normal_and_pauses(monkeypatch):
@@ -360,11 +389,11 @@ def test_set_auto_off_when_already_normal_is_silent(monkeypatch):
 def test_set_auto_on_resumes_detection(monkeypatch):
     mgr, events = _mk_manager()
     mgr.set_auto(False)
-    _front(monkeypatch, "Code", "server.py")
+    _front(monkeypatch, "Safari", "YouTube")   # a WATCH app — work no longer auto-triggers
     mgr.set_auto(True)
     assert mgr.paused is False
     mgr._poll_once()
-    assert mgr.mode == "work"
+    assert mgr.mode == "watch"
 
 
 def test_fire_skips_superseded_transition():

@@ -3112,7 +3112,13 @@ def _process_unsafe(text: str, skip_echo: bool = False) -> None:
         # sentences ("it can barely hear me"). The watcher thread already
         # clears _system_audio_playing after 3 consecutive off-readings, which
         # is the debounced truth — trust that instead of the laggy live call.
-        _audio_active_now = _music_is_playing or _system_audio_playing
+        # Only require a wake word when JARVIS is playing MUSIC. General system
+        # audio — a video, a browser sound, and ESPECIALLY JARVIS's own TTS (which
+        # keeps CoreAudio "running" for 5–15s after it finishes) — was arming this
+        # gate and silently dropping Dylan's very next command, again and again
+        # ("I had to type half the shit"). JARVIS hearing its own voice is already
+        # handled by the echo guard, so system audio must NOT gate his commands.
+        _audio_active_now = _music_is_playing
         if _audio_active_now:
             from voice.audio_engine import check_wake_word
             triggered, remainder = check_wake_word(text)
@@ -4228,20 +4234,17 @@ def _startup_speak() -> None:
     if voice is False:
         issues.append("microphone unavailable")
 
-    # ── Build greeting ─────────────────────────────────────────────────────────
-    if not issues:
-        greeting = f"{tod}, {USER_ADDRESS}. The time is {hhmm}. All systems operational."
-    elif len(issues) == 1:
-        greeting = (
-            f"{tod}, {USER_ADDRESS}. The time is {hhmm}. "
-            f"One issue: {issues[0]}."
-        )
-    else:
-        issue_list = "; ".join(issues)
-        greeting = (
-            f"{tod}, {USER_ADDRESS}. The time is {hhmm}. "
-            f"{len(issues)} issues detected: {issue_list}."
-        )
+    # ── Build greeting — fresh & casual every launch (AI-generated, varied) ─────
+    # Old behaviour was a canned "Good evening, Mr. Roe. The time is X. All systems
+    # operational." — robotic text, and 3 sentences = dead pauses between clips.
+    # Now the brain writes ONE flowing line that's different each time; if something
+    # is actually broken it still gets surfaced.
+    try:
+        greeting = jarvis.startup_greeting(tod, issues)
+    except Exception as exc:
+        print(f"[startup] greeting gen error: {exc}")
+        greeting = ("Hey — what's on the agenda?" if not issues
+                    else f"Hey — heads up, {issues[0]}.")
 
     print(f"[startup] greeting: {greeting!r}")
     broadcast({"type": "chunk",    "text": greeting})

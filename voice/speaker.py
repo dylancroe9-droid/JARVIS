@@ -42,7 +42,7 @@ _SENTENCE_END = re.compile(
 # Short sentences get bundled together to reduce TTS calls → fewer gaps.
 # Each TTS call = one afplay invocation with ~100-150ms startup. Bigger chunks =
 # fewer audible pauses between sentences.
-_MIN_CHUNK = 200
+_MIN_CHUNK = 260
 
 # Abbreviations that ElevenLabs treats as sentence ends because of the period —
 # convert them so TTS doesn't pause mid-phrase.
@@ -113,6 +113,15 @@ def _find_say_voice() -> str:
 
 _eleven_client = _find_eleven_client()
 
+# ── Preferred engine ──────────────────────────────────────────────────────────
+# Dylan chose the free edge-tts voice "Andrew" (warm, natural, young American).
+# Force the edge path even though an ElevenLabs key exists — its free account ran
+# out of credits and was silently falling back to a robotic voice mid-sentence.
+# To return to ElevenLabs later: set TTS_ENGINE=elevenlabs in .env (and top up).
+_TTS_ENGINE = os.getenv("TTS_ENGINE", "edge").lower()
+if _TTS_ENGINE == "edge" and _edge_tts_available():
+    _eleven_client = None   # disable ElevenLabs → free edge-tts becomes primary
+
 _ELEVEN_VOICE      = os.getenv("ELEVEN_VOICE", "JBFqnCBsd6RMkjVDRZzb")   # default: George (British, warm captivating storyteller — closest to movie JARVIS)
 _ELEVEN_MODEL      = "eleven_turbo_v2_5"   # turbo = fastest model, lowest latency
 # Tuned for calm, even delivery (was "aggressive" — too much punch/emphasis):
@@ -126,9 +135,9 @@ _ELEVEN_SAMPLERATE = 22_050                # pcm_22050 — better quality than 1
 _ELEVEN_LATENCY    = 4                     # optimize_streaming_latency 0-4, 4=fastest
 
 _USE_EDGE   = not _eleven_client and _edge_tts_available()
-_EDGE_VOICE = "en-GB-RyanNeural"
-_EDGE_RATE  = "+14%"   # slightly faster → shorter sentences → tighter gaps
-_EDGE_PITCH = "-8Hz"   # slight depth — natural, not over-processed
+_EDGE_VOICE = os.getenv("EDGE_VOICE", "en-US-AndrewNeural")  # warm, natural, young American (Dylan's pick)
+_EDGE_RATE  = os.getenv("EDGE_RATE", "+6%")    # natural pace — matches the chosen sample
+_EDGE_PITCH = os.getenv("EDGE_PITCH", "+0Hz")  # no pitch shift — Andrew is already natural
 
 # Whether to use ffmpeg to strip leading silence from each TTS audio chunk.
 # Cuts the ~80–150ms dead air at the start of every edge-tts mp3.

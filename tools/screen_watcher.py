@@ -80,7 +80,14 @@ def _get_focused_window() -> Optional[FocusedWindow]:
     try:
         opts = Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements
         windows = Quartz.CGWindowListCopyWindowInfo(opts, Quartz.kCGNullWindowID) or []
-        # Frontmost normal-level window (level 0) — skip menubar/dock/HUD overlays
+        # Collect every plausible layer-0 window, then pick the LARGEST rather than
+        # the first. Chrome publishes several layer-0 windows for one browser window
+        # — a 41px strip, an 81px strip, a 166px panel, and only then the real 920px
+        # window carrying the page title. Taking the first match over 200x150 picked
+        # the 166px panel, so the watcher OCR'd a thin band across the top of the
+        # screen and never saw the video player. That silently disabled every
+        # pattern: Skip Ad, cookie banners, "still watching", all of it.
+        candidates = []
         for w in windows:
             if w.get("kCGWindowLayer", 0) != 0:
                 continue
@@ -95,10 +102,51 @@ def _get_focused_window() -> Optional[FocusedWindow]:
             if "Electron" in app or "JARVIS" in app:
                 continue
             title = w.get("kCGWindowName", "") or ""
+            candidates.append((width * height, bool(title), x, y, width, height, app, title))
+        if candidates:
+            # Largest area wins; a real title breaks ties, since the helper panels
+            # are all untitled while the true window carries the page name.
+            _, _, x, y, width, height, app, title = max(
+                candidates, key=lambda c: (c[0], c[1])
+            )
             return FocusedWindow(app_name=app, title=title, x=x, y=y, w=width, h=height)
     except Exception as e:
         print(f"[watcher] window probe failed: {e}", flush=True)
     return None
+
+
+def _visible_rect(x: int, y: int, w: int, h: int) -> tuple[int, int, int, int]:
+    """
+    Clamp a window rect to the displays it actually appears on.
+
+    `screencapture -R` silently clips to the display and returns only the visible
+    intersection — no padding. If OCR is then told the UNCLIPPED size, every
+    normalized box is mis-scaled, pushing detections toward the lower-right. That is
+    worse than missing the button: the region gates get MORE likely to pass, so the
+    watcher clicks a corrupted coordinate — on YouTube that means toggling playback
+    instead of skipping. Only matters when a window overhangs a screen edge (a window
+    sized on a since-disconnected external display, say), but the failure is silent.
+    """
+    if not _DEPS_OK:
+        return x, y, w, h
+    try:
+        err, ids, cnt = Quartz.CGGetActiveDisplayList(16, None, None)
+        rects = [Quartz.CGDisplayBounds(d) for d in ids[:cnt]]
+        if not rects:
+            return x, y, w, h
+        left = min(r.origin.x for r in rects)
+        top = min(r.origin.y for r in rects)
+        right = max(r.origin.x + r.size.width for r in rects)
+        bottom = max(r.origin.y + r.size.height for r in rects)
+    except Exception:
+        return x, y, w, h
+    nx = max(x, int(left))
+    ny = max(y, int(top))
+    nw = min(x + w, int(right)) - nx
+    nh = min(y + h, int(bottom)) - ny
+    if nw <= 0 or nh <= 0:
+        return x, y, w, h
+    return nx, ny, nw, nh
 
 
 def _screencap_region(x: int, y: int, w: int, h: int) -> Optional[str]:
@@ -188,7 +236,7 @@ def _click(x: int, y: int) -> None:
             ev = Quartz.CGEventCreateMouseEvent(
                 None, evt_type, pos, Quartz.kCGMouseButtonLeft,
             )
-            Quartz.CGEventPost(Quartz.kCGHIDEventTapLocation, ev)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
             time.sleep(0.02)
     except Exception as e:
         print(f"[watcher] click failed: {e}", flush=True)
@@ -196,6 +244,15 @@ def _click(x: int, y: int) -> None:
 
 # ── Pattern detectors ─────────────────────────────────────────────────────────
 # Each returns the click target (screen px) if it fired, else None.
+
+# Apple's Vision OCR reports ~0.5 for short, stylised strings — a real "Skip ad >"
+# measured EXACTLY 0.50, which a strict `> 0.5` discarded. The button was found,
+# correctly located, and correctly matched, then thrown away on the boundary, so ad
+# skipping never fired once. Inclusive, and low enough to absorb that jitter while
+# still rejecting genuine OCR noise (~0.3). The strict text match plus the geometry
+# gates carry the real precision here.
+_MIN_OCR_CONF = 0.45
+
 
 def _detect_youtube_skip(boxes: list[OCRBox], win: FocusedWindow) -> Optional[tuple[int, int]]:
     """
@@ -209,10 +266,15 @@ def _detect_youtube_skip(boxes: list[OCRBox], win: FocusedWindow) -> Optional[tu
     right_third_x = win.x + int(win.w * 0.55)
     lower_half_y  = win.y + int(win.h * 0.40)
     for b in boxes:
-        t = b.text.strip().lower()
-        if t in ("skip", "skip ad", "skip ads", "skip >", "skip »") or \
-           t.startswith("skip ad") or t.startswith("skip ads"):
-            if b.cx >= right_third_x and b.cy >= lower_half_y and b.confidence > 0.5:
+        # Exact match after stripping trailing chevrons — NOT startswith. An
+        # unanchored `startswith("skip ad")` also matches "Skip ads with YouTube
+        # Premium", the upsell YouTube renders in that exact corner, so the watcher
+        # would click it and navigate Dylan to the Premium purchase page mid-video.
+        # The chevron strip still covers the "Skip >" / "Skip ad >" variants that the
+        # prefix test was there for.
+        t = b.text.strip().lower().rstrip(" >»›").strip()
+        if t in ("skip", "skip ad", "skip ads"):
+            if b.cx >= right_third_x and b.cy >= lower_half_y and b.confidence >= _MIN_OCR_CONF:
                 return (b.cx, b.cy)
     return None
 
@@ -288,8 +350,32 @@ def _detect_macos_update(boxes: list[OCRBox], win: FocusedWindow) -> Optional[tu
     return None
 
 
+# Streaming skip buttons — Netflix / Hulu / Prime / Peacock / Disney+ / Max.
+# "Skip Intro / Recap / Credits / Ad" and "Next Episode" all sit in the lower
+# ~65% of the player. Exact-phrase + region + confidence gates keep it from
+# firing on the word "skip" buried in ordinary page text.
+_STREAM_SKIP_BUTTONS = (
+    "skip intro", "skip recap", "skip credits", "skip preview", "skip trailer",
+    "skip ad", "skip ads", "skip advert", "skip advertisement",
+    "next episode", "play next episode", "play next",
+)
+_STREAM_APPS = ("Chrome", "Safari", "Arc", "Brave", "Firefox", "Netflix", "TV")
+
+def _detect_streaming_skip(boxes: list[OCRBox], win: FocusedWindow) -> Optional[tuple[int, int]]:
+    """Auto-click Skip Intro/Recap/Credits/Ad and Next-Episode across streaming sites."""
+    if not any(a in win.app_name for a in _STREAM_APPS):
+        return None
+    lower_y = win.y + int(win.h * 0.35)   # player controls live in the bottom ~65%
+    for b in boxes:
+        t = b.text.strip().lower().rstrip(" >»").strip()
+        if t in _STREAM_SKIP_BUTTONS and b.confidence >= _MIN_OCR_CONF and b.cy >= lower_y:
+            return (b.cx, b.cy)
+    return None
+
+
 _PATTERNS = [
     Pattern("youtube_skip_ad",  True,  _detect_youtube_skip,    cooldown_sec=4.0),
+    Pattern("streaming_skip",   True,  _detect_streaming_skip,  cooldown_sec=3.0),
     Pattern("cookie_banner",    True,  _detect_cookie_banner,   cooldown_sec=15.0),
     Pattern("still_watching",   True,  _detect_still_watching,  cooldown_sec=30.0),
     Pattern("macos_update",     True,  _detect_macos_update,    cooldown_sec=60.0),
@@ -352,10 +438,12 @@ class ScreenWatcher:
         win = _get_focused_window()
         if not win:
             return
-        path = _screencap_region(win.x, win.y, win.w, win.h)
+        # Capture and OCR must agree on the SAME rect — see _visible_rect.
+        rx, ry, rw, rh = _visible_rect(win.x, win.y, win.w, win.h)
+        path = _screencap_region(rx, ry, rw, rh)
         if not path:
             return
-        boxes = _ocr(path, (win.x, win.y), (win.w, win.h))
+        boxes = _ocr(path, (rx, ry), (rw, rh))
         if not boxes:
             return
         now = time.time()

@@ -16,8 +16,11 @@ from rich.console import Console
 
 from datetime import datetime
 
-from config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL, GROQ_API_KEY, GROQ_MODEL, OLLAMA_URL, OLLAMA_MODEL
-from brain.personality import get_system_prompt, get_fast_prompt, get_mid_prompt
+from config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL, GROQ_API_KEY, GROQ_MODEL, OLLAMA_URL, OLLAMA_MODEL, USER_NAME
+from brain.personality import (
+    get_system_prompt, get_fast_prompt, get_mid_prompt,
+    get_stable_prompt, get_volatile_prompt,
+)
 from brain.tools import TOOL_DEFINITIONS, get_openai_tools, get_core_tools, get_8b_tools
 
 console = Console()
@@ -36,6 +39,160 @@ def _clean_text(text: str) -> str:
 # Only use Claude if the key looks like a real Anthropic key — guards against
 # placeholder values like "YOUR_KEY_HERE" causing failed API calls on every request.
 _USE_CLAUDE = ANTHROPIC_API_KEY.startswith("sk-ant-")
+
+
+# Anthropic beta flag required for defer_loading + the tool-search server tool.
+_TOOL_SEARCH_BETA = "advanced-tool-use-2025-11-20"
+
+# Tools kept resident in the prompt on every turn.  Everything else is deferred and
+# reached through tool search.  Keep this list SHORT and free of generic catch-alls:
+# a visible do-anything tool (web_search) shadows the specialists, and Claude stops
+# searching — measured 2/6 correct with web_search resident vs 7/6 without.
+#
+# take_screenshot MUST stay resident.  Deferring it breaks homework help outright:
+# "what is the answer to this?" shares no words with "take_screenshot", so BM25
+# cannot retrieve it — measured 1/6 deferred vs 6/6 resident, with no reflexive
+# screenshots on plain conversation (6/6 clean).
+_CORE_TOOL_NAMES = {"take_screenshot", "play_music", "pause_music", "set_mode"}
+
+# Computed once and reused: the text must be byte-identical every turn or the tool
+# array shifts and takes the cached system prefix down with it.
+_TOOL_ADDENDA_CACHE: dict | None = None
+
+
+def _tool_addenda() -> dict:
+    global _TOOL_ADDENDA_CACHE
+    if _TOOL_ADDENDA_CACHE is None:
+        from brain.personality import get_tool_addenda
+        try:
+            _TOOL_ADDENDA_CACHE = get_tool_addenda()
+        except Exception as exc:      # never let prompt slimming break tool use
+            console.print(f"[yellow]tool addenda unavailable: {exc}[/yellow]")
+            _TOOL_ADDENDA_CACHE = {}
+    return _TOOL_ADDENDA_CACHE
+
+
+# Running total for the process, so cost is observable instead of asserted.
+_COST_TOTAL = {"usd": 0.0, "turns": 0}
+
+# $ per MILLION tokens. cache read is 0.1x input; a 1h-TTL write is 2x.
+_PRICES = {
+    "claude-sonnet-5":  (3.00, 15.00),
+    "claude-haiku-4-5": (1.00,  5.00),
+    "claude-opus-4-8":  (15.00, 75.00),
+}
+
+
+def _log_cost(usage, model: str) -> None:
+    """
+    Print what the turn actually cost, straight off the wire.
+
+    This exists because "it's cheaper now" is worthless as a claim you can't see.
+    cache_read should be large and steady; cache_write should be near zero after
+    the first turn. If write stays high, something is changing the prefix between
+    turns and the caching is silently doing nothing.
+    """
+    try:
+        i_rate, o_rate = _PRICES.get(model, (3.00, 15.00))
+        billed = getattr(usage, "input_tokens", 0) or 0
+        write  = getattr(usage, "cache_creation_input_tokens", 0) or 0
+        read   = getattr(usage, "cache_read_input_tokens", 0) or 0
+        out    = getattr(usage, "output_tokens", 0) or 0
+        usd = (billed * i_rate + write * i_rate * 2.0 + read * i_rate * 0.1
+               + out * o_rate) / 1e6
+        _COST_TOTAL["usd"] += usd
+        _COST_TOTAL["turns"] += 1
+        # Escape the tag — rich parses a bare [cost] as markup and swallows it.
+        console.print(
+            f"[dim]\\[cost] in={billed:,} write={write:,} read={read:,} out={out:,} "
+            f"→ ${usd:.4f}  (session ${_COST_TOTAL['usd']:.3f} over "
+            f"{_COST_TOTAL['turns']} calls)[/dim]"
+        )
+    except Exception:
+        pass          # cost telemetry must never break a reply
+
+
+def _system_blocks(stable: str) -> list:
+    """
+    The character prompt as a single cached system block.
+
+    Per-turn state does NOT go here.  The cache prefix runs tools → system →
+    messages, so a volatile system block poisons everything after it: with the clock
+    in block two, the conversation history could never cache and was re-written at 2x
+    every turn (measured $38.52/user/mo vs $28.96 doing nothing).  Volatile state is
+    appended to the final message instead — see _claude_messages.
+
+    1-hour TTL, not the 5-minute default: JARVIS is spoken to in bursts, and a gap
+    longer than the window turns every turn into a fresh write at 1.25x — measurably
+    worse than not caching at all.
+    """
+    return [{"type": "text", "text": stable,
+             "cache_control": {"type": "ephemeral", "ttl": "1h"}}]
+
+
+def _search_tools(tools: list) -> list:
+    """
+    Return `tools` rewritten for Anthropic tool search: core tools stay resident,
+    the rest are marked defer_loading so their schemas are fetched only when Claude
+    searches for them.  Sending all 118 schemas cost 19,175 tokens on EVERY turn;
+    deferring costs ~1,900 — the same 118 tools remain callable.
+
+    Restricted sets (forced show_overlay, etc.) are passed through untouched: they
+    are already small, and deferring a tool we are about to force would strand it.
+
+    No cache_control here — the API rejects deferred tools carrying a cache
+    breakpoint.  The system block holds the breakpoint instead, which caches the
+    tools+system prefix together anyway.
+    """
+    if not tools or len(tools) < 20:
+        return tools
+    addenda = _tool_addenda()
+    out = []
+    for t in tools:
+        name = t.get("name")
+        extra = addenda.get(name)
+        # Guidance lifted out of the system prompt rides on the tool it belongs to.
+        t = {**t, "description": f"{t['description']}\n\n{extra}"} if extra else t
+        out.append(t if name in _CORE_TOOL_NAMES else {**t, "defer_loading": True})
+    # BM25 ranks by relevance and beat regex 7/8 vs 5/8 on real phrasings.
+    out.append({"type": "tool_search_tool_bm25_20251119", "name": "tool_search_tool_bm25"})
+    return out
+
+
+# ── Startup greeting pool ───────────────────────────────────────────────────────
+# Fallback when Claude can't generate one live. Casual, varied, ONE flowing line
+# each — never the old robotic "all systems operational" template.
+_GREETING_POOL = [
+    "Hey — what's on the agenda today?",
+    "Back at it. What are we getting into?",
+    "Alright, I'm up. What's the move?",
+    "What are we feeling — work, or something fun?",
+    "Ready when you are. Wanna knock something out, or just chill?",
+    "Yo. What's the plan, sir?",
+    "I'm here — watch something, get some work done, or just talk?",
+    "What's good? What are we doing today?",
+    "Up and running. Where do you wanna start?",
+    "Alright, hit me — what's first?",
+    "Wanna throw something on, or get to work?",
+    "What are we building today?",
+    "Let's do something. What's it gonna be?",
+    "I'm around. What do you need?",
+]
+
+# A random angle is injected per greeting so Claude doesn't fall into the same
+# structure every launch — forces genuine variety.
+_GREETING_ANGLES = [
+    "Ask what's on the agenda today.",
+    "Suggest putting something on to watch.",
+    "Nudge him toward getting some work done.",
+    "Just a low-key hello — ask what he needs.",
+    "Riff lightly on the time of day.",
+    "Ask what he feels like building or working on.",
+    "Be playful — tease him a little, warmly.",
+    "Offer a couple of options: chill, work, or watch something.",
+    "Ask how he's doing, genuinely, in one line.",
+    "Just say you're here and ready — short and easy.",
+]
 
 # ── Music intent keywords ──────────────────────────────────────────────────────
 _MUSIC_PLAY_WORDS  = frozenset({"play", "music", "song", "track", "spotify",
@@ -126,18 +283,18 @@ _OVERLAY_VISUAL_WORDS = frozenset({"visual", "diagram", "concept map"})
 # Designed to be CONVERSATIONAL — user should not need magic words.
 _BLUEPRINT_TRIGGER_PHRASES = frozenset({
     # Direct show commands
-    "show me the ", "show me a ", "show me an ",
-    "show the ", "show a ", "show an ",
-    "show it", "show that",
+    
+    
+    
     # Pull up / bring up
     "pull up the ", "pull up a ", "pull up an ",
-    "pull it up", "pull that up",
-    "bring up the ", "bring up a ", "bring it up", "bring that up",
+    
+    
     # Display / render / visualize
-    "display the ", "display a ", "display an ",
+    
     "render the ", "render a ", "render an ",
     "visualize the ", "visualize a ",
-    "put up a ", "put up the ",
+    
     # Blueprint / specs explicit — "blueprint the/a/an/of/for/on X"
     "blueprint the ", "blueprint a ", "blueprint an ",
     "blueprint of", "blueprint for", "blueprint on",
@@ -148,23 +305,24 @@ _BLUEPRINT_TRIGGER_PHRASES = frozenset({
     "create a blueprint", "generate a blueprint",
     # Want to see
     "i want to see the ", "i want to see a ", "i want to see an ",
-    "i wanna see the ", "i wanna see a ", "i wanna see it",
+    
     "let me see the ", "let me see a ", "let me see an ",
     "want to see the ", "want to see a ", "want to see an ",
     "i'd like to see ", "i would like to see ",
-    "show me what ", "let me look at ",
+    
     # Can you / could you
-    "can you show me the ", "can you show me a ", "can you show me an ",
-    "can you show me what ",
+    
+    
     "can you pull up", "can you bring up",
     "can you display", "can you render",
-    # Look at
-    "look at the ", "look at a ", "look at an ",
-    "take a look at ", "let's look at ",
-    # What does X look like
-    "what does the ", "what does a ", "what does an ",
-    "what do the ", "what do a ",
-    "what's the ", "what's a ",     # "what's the bugatti chiron" in context
+    # NOTE — deliberately absent: "what's the ", "what's a ", "look at the ",
+    # "take a look at ", "let me look at ", "what does the ", "show me what ".
+    # These match ordinary English, and a match here FORCES the tool array down to
+    # show_overlay alone, so JARVIS physically cannot look at the screen or use any
+    # other tool. "what's the answer to this?" drew a Bugatti blueprint; "take a
+    # look at this problem" — a screen request — did the same. A specific noun below
+    # ("the bugatti", "the f-22") already carries the real signal, so "show me the
+    # Bugatti" still triggers without dragging every question in English along.
     # Hologram / 3D
     "hologram of", "hologram for",
     "3d model of", "3d model for",
@@ -173,18 +331,20 @@ _BLUEPRINT_TRIGGER_PHRASES = frozenset({
     "model of the ", "model of a ",
     # Anatomy / science
     "anatomy of", "diagram of", "structure of",
+    "the solar system", "the milky way", "planet earth",
+    "the human dna", "double helix",
     "what does a human ", "what does the human ",
-    "show me how ", "show me what a ",
+    
     # "put it on screen", "throw it up"
-    "put it on", "throw it up", "project the ", "project a ",
+    
     # Build / design mode activators (mode-word triggers — conversational phrases
     # like "build me a X" are now routed to 3D build canvas in server.py first)
     "build mode", "design mode", "architect mode",
-    "design a ", "design the ",
-    "architect a ", "draft a ", "sketch a ",
+    
+    
     # Specific objects people naturally say
-    "i'm talking about the ", "i'm thinking about the ",
-    "you know the ", "you know that ",
+    
+    
     # Brand / object shortcuts — vehicles
     "the bugatti", "the ferrari", "the lamborghini", "the porsche",
     "the falcon 9", "the starship", "the f-22", "the f-35",
@@ -195,8 +355,8 @@ _BLUEPRINT_TRIGGER_PHRASES = frozenset({
     "the eiffel tower", "the empire state", "the burj khalifa",
     "the pyramids", "the colosseum", "the space needle",
     # Nature / science
-    "the solar system", "the milky way", "planet earth", "the moon",
-    "the heart", "the brain", "the lungs", "the spine", "the dna",
+    
+    
     "human heart", "human brain", "human lungs", "human skull", "human body",
     "the human heart", "the human brain", "the human lungs", "the human skull",
     "a human heart", "a human brain",
@@ -327,6 +487,16 @@ _COMPUTER_AGENT_PHRASES = frozenset({
     "click that", "click the button", "click on",
     "scroll down for me", "scroll the page",
     "copy and paste", "select all", "highlight",
+    # Picking an answer on a multiple-choice test. "select it" is the natural way to
+    # ask for this and matched nothing here, so it fell through to a plain spoken
+    # reply and the bubble never got clicked.
+    "select it", "select this", "select that", "select the answer", "select the right",
+    "select b", "select c", "select d", "select a",
+    "pick it", "pick that", "pick the answer", "pick the right",
+    "choose it", "choose that", "choose the answer", "choose the right",
+    "mark it", "mark that", "bubble it", "bubble in",
+    "answer and select", "answer it and select", "select it for me", "pick it for me",
+    "choose it for me", "click it", "click it for me", "click the answer",
     # Natural "stepping away" phrases — "I'll be right back, finish this"
     "be right back", "brb", "i'll be back", "i will be back",
     "finish this for me", "finish it for me", "can you finish",
@@ -426,7 +596,7 @@ def _extract_blueprint_subject(msg: str) -> str:
 # Context-only trigger words — if the user says one of these SHORT phrases AND
 # the conversation recently mentioned a vehicle/object, treat it as a blueprint request.
 _BLUEPRINT_CONTEXT_TRIGGERS = frozenset({
-    "pull it up", "show it", "show that", "bring it up", "pull that up",
+    "pull it up",  "bring it up", "pull that up",
     "yes", "yeah", "yep", "do it", "go ahead",
     "show me", "let me see it", "let me see that",
     "make it 3d", "make it a hologram", "render it", "visualize it",
@@ -529,7 +699,13 @@ class Jarvis:
         except AttributeError:
             pass
         self.messages.append({"role": "user", "content": _clean_input})
-        if len(self.messages) > 40:   # tighter cap — 60 was too many with tool results
+        # Trim in chunks, not one message per turn.  Dropping the oldest message on
+        # every turn shifts the start of the conversation every turn, and prompt
+        # caching matches on a *prefix* — so a sliding window meant history could
+        # never cache and was re-sent at full price forever.  Letting it run to 56
+        # and then cutting back to 40 keeps the prefix byte-stable for ~16 turns,
+        # which is long enough to actually get cache hits.  Same ceiling on context.
+        if len(self.messages) > 56:
             self.messages = self.messages[-40:]
 
         if _USE_CLAUDE:
@@ -547,6 +723,50 @@ class Jarvis:
                 yield from self._plain_stream(model=GROQ_MODEL)
             else:
                 yield from self._stream_with_tools()
+
+    def startup_greeting(self, tod: str, issues=None) -> str:
+        """
+        A fresh, casual, single-line greeting for when Dylan opens the app —
+        written by Claude so it's different every launch (no canned template, no
+        robotic 'all systems operational', no clock announcement).  Still honest:
+        if something is actually broken it works that in.  Falls back to a varied
+        pool if Claude is unavailable.
+        """
+        import random
+        issues = issues or []
+        if _USE_CLAUDE and getattr(self, "_claude", None):
+            try:
+                angle = random.choice(_GREETING_ANGLES)
+                sys = (
+                    "You are JARVIS. Dylan just opened the app — greet him with ONE short, "
+                    "casual, natural spoken line in your voice: warm, easy, a little playful. "
+                    f"It's {tod.lower()}. THIS TIME take this angle: {angle} "
+                    "Vary the opener — do NOT always start with 'Evening' or his name. Use 'sir' "
+                    "only once in a while. NEVER announce the clock time, NEVER say 'all systems "
+                    "operational' or 'welcome back'. One flowing sentence, no lists. "
+                    "Reply with ONLY the line, no quotes."
+                )
+                if issues:
+                    sys += f" Also work in, casually, that there's a problem: {issues[0]}."
+                r = self._claude.messages.create(
+                    model=self.model,
+                    thinking={"type": "disabled"},
+                    max_tokens=90,
+                    system=sys,
+                    messages=[{"role": "user", "content": "(the app just opened)"}],
+                )
+                line = "".join(
+                    b.text for b in r.content if getattr(b, "type", "") == "text"
+                ).strip().strip('"').strip()
+                if line:
+                    return line
+            except Exception as exc:
+                console.print(f"[dim]greeting gen failed: {exc}[/dim]")
+        # Fallback: varied casual pool
+        line = random.choice(_GREETING_POOL)
+        if issues:
+            line = line.rstrip(".?! ") + f" — though heads up, {issues[0]}."
+        return line
 
     def reset(self) -> None:
         self.messages.clear()
@@ -712,8 +932,12 @@ class Jarvis:
           3. Stream the final conversational response
         Up to 4 rounds. Falls back to Groq if Claude errors out.
         """
+        # `system` is the VOLATILE half only — the character half is held apart in
+        # _stable so it stays byte-identical and caches.  Every mode note below
+        # appends to `system`, which is correct: those are per-turn instructions.
+        _stable = get_stable_prompt()
         system = (
-            get_system_prompt()
+            get_volatile_prompt()
             + self._get_proactive_context()
             + self._get_recent_replies_note()
         )
@@ -816,22 +1040,51 @@ class Jarvis:
             )
         else:
             _overlay_tool_choice = {"type": "auto"}
+            # Tool set is deliberately identical on every turn.  The cache prefix is
+            # tools → system, so a tool array that changes shape between turns also
+            # invalidates the cached system prompt.  The old keyword vision gate did
+            # exactly that; Sonnet 5 declines to screenshot plain conversation on its
+            # own (measured 6/6 clean), so the gate is no longer earning its cost.
             _active_tools = TOOL_DEFINITIONS
 
         for _round in range(_MAX_ROUNDS):
+            _streamed_text = False
             try:
-                response = self._claude.messages.create(
+                # STREAM the turn so a conversational reply starts speaking within a
+                # beat instead of after the whole thought is generated (the old
+                # non-streaming create() made JARVIS wait for the full answer, then
+                # dump it all at once — that was the "crazy slow" lag).  Text deltas
+                # are yielded live to TTS; tool_use blocks are collected and handled
+                # after via get_final_message().  A pure command emits only a tool_use
+                # (no text), so nothing is spoken before the action.
+                # thinking disabled = no pre-answer pause (Sonnet 5 defaults to adaptive).
+                with self._claude.beta.messages.stream(
                     model=self.model,
-                    system=system,
-                    messages=self._claude_messages(),
-                    tools=_active_tools,
+                    thinking={"type": "disabled"},
+                    system=_system_blocks(_stable),
+                    messages=self._claude_messages(volatile=system),
+                    tools=_search_tools(_active_tools),
                     tool_choice=_overlay_tool_choice,
                     max_tokens=_loop_max_tokens,
-                )
+                    betas=[_TOOL_SEARCH_BETA],
+                ) as stream:
+                    for event in stream:
+                        if (event.type == "content_block_delta"
+                                and getattr(event.delta, "type", "") == "text_delta"
+                                and event.delta.text):
+                            _streamed_text = True
+                            yield event.delta.text
+                    response = stream.get_final_message()
+                _log_cost(response.usage, self.model)
                 # After first round, stop forcing (let Claude continue naturally)
                 _overlay_tool_choice = {"type": "auto"}
                 _active_tools        = TOOL_DEFINITIONS
             except Exception as exc:
+                # If we already streamed part of the answer, don't fall back and
+                # repeat it — just end cleanly.
+                if _streamed_text:
+                    console.print(f"[yellow]Claude stream cut off: {exc}[/yellow]")
+                    return
                 console.print(f"[yellow]Claude error ({type(exc).__name__}): {exc}[/yellow]")
                 exc_str = str(exc).lower()
                 # Auth / billing errors — tell the user exactly what's wrong
@@ -876,9 +1129,10 @@ class Jarvis:
                 if text:
                     self._append_assistant_text(text)
                     self._recent_replies.append(text[:60])
-                    yield text
+                    if not _streamed_text:      # already spoken live during the stream
+                        yield text
                 else:
-                    yield from self._claude_final_stream(system, max_tokens=budget)
+                    yield from self._claude_final_stream(_system_blocks(_stable), system, max_tokens=budget)
                 return
 
             # ── Has tool calls ────────────────────────────────────────────────
@@ -891,7 +1145,7 @@ class Jarvis:
 
             # Speak before the first tool runs
             first_ack = _TOOL_ACKS.get(tool_uses[0].name, "")
-            if first_ack:
+            if first_ack and not _streamed_text:
                 yield first_ack + " "
 
             for tu in tool_uses:
@@ -901,14 +1155,22 @@ class Jarvis:
                     result = self.tools_executor.execute(tu.name, dict(tu.input))
                 except Exception as exc:
                     result = f"Tool error: {exc}"
-                content = (
-                    str(result) if not isinstance(result, list)
-                    else "\n".join(
-                        b.get("text", "")
-                        for b in result
-                        if isinstance(b, dict) and b.get("type") == "text"
+                # If a tool returned image blocks (e.g. take_screenshot on the Claude
+                # brain), forward them straight into the tool_result so Claude SEES the
+                # screen with its own vision — critical for reading math/diagrams. Else
+                # collapse to text as before.
+                if isinstance(result, list) and any(
+                        isinstance(b, dict) and b.get("type") == "image" for b in result):
+                    content = result
+                else:
+                    content = (
+                        str(result) if not isinstance(result, list)
+                        else "\n".join(
+                            b.get("text", "")
+                            for b in result
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        )
                     )
-                )
                 tool_results.append({
                     "type":        "tool_result",
                     "tool_use_id": tu.id,
@@ -944,7 +1206,7 @@ class Jarvis:
             # Music play → short streaming comment (what's now playing)
             if executed & {"play_music", "play_playlist", "list_playlists",
                             "add_to_playlist", "create_playlist"}:
-                yield from self._claude_final_stream(system, max_tokens=120)
+                yield from self._claude_final_stream(_system_blocks(_stable), system, max_tokens=120)
                 return
 
             # ── Overlay research pipeline fix ────────────────────────────────
@@ -969,11 +1231,11 @@ class Jarvis:
                 continue   # keep the agent loop going
 
             # Everything else: stream with the full budget
-            yield from self._claude_final_stream(system, max_tokens=budget)
+            yield from self._claude_final_stream(_system_blocks(_stable), system, max_tokens=budget)
             return
 
         # Hit max rounds without finishing — force a clean response
-        yield from self._claude_final_stream(system, max_tokens=budget)
+        yield from self._claude_final_stream(_system_blocks(_stable), system, max_tokens=budget)
 
     def _auto_remember(self, user_input: str) -> None:
         """
@@ -987,6 +1249,7 @@ class Jarvis:
                 from brain.memory import save_fact
                 check = self._claude.messages.create(
                     model=self.model,
+                    thinking={"type": "disabled"},   # cheap background extraction — no thinking
                     system=(
                         "Extract memorable personal facts from this message. "
                         "Output ONLY a JSON array of short, specific fact strings about the user (Dylan Roe). "
@@ -1017,16 +1280,27 @@ class Jarvis:
         threading.Thread(target=_extract, daemon=True, name="auto-memory").start()
 
     def _claude_final_stream(
-        self, system: str, max_tokens: int = 1024
+        self, system: list, volatile: str = "", max_tokens: int = 1024
     ) -> Generator[str, None, None]:
-        """Streaming response from Claude — no tools, pure text."""
+        """
+        Streaming text-only response from Claude.
+
+        The tool array is still sent, with tool_choice="none" to forbid new calls.
+        It cannot be omitted: history may hold a tool_use for a DEFERRED tool, and
+        replaying that without the definitions fails with "Tool reference 'X' not
+        found in available tools".  tool_choice="none" keeps this a pure text turn.
+        """
         try:
             full: list[str] = []
-            with self._claude.messages.stream(
+            with self._claude.beta.messages.stream(
                 model=self.model,
+                thinking={"type": "disabled"},   # keep voice replies instant (see _claude_chat)
                 system=system,
-                messages=self._claude_messages(),
+                messages=self._claude_messages(volatile=volatile),
+                tools=_search_tools(TOOL_DEFINITIONS),
+                tool_choice={"type": "none"},
                 max_tokens=max_tokens,
+                betas=[_TOOL_SEARCH_BETA],
             ) as stream:
                 for chunk in stream.text_stream:
                     full.append(chunk)
@@ -1041,10 +1315,17 @@ class Jarvis:
             self._append_assistant_text(err)
             yield err
 
-    def _claude_messages(self) -> list[dict]:
+    def _claude_messages(self, volatile: str = "") -> list[dict]:
         """
         Convert self.messages to Claude's required format.
         Handles both plain string content and block lists (tool use / tool results).
+
+        `volatile` (clock, mode, status, per-turn mode notes) is appended as a trailing
+        block on the final message — the last position in the whole request — so that
+        everything before it can cache.  It is deliberately NOT persisted into
+        self.messages: the cache breakpoint sits on the message's own content, so the
+        prefix ends before the volatile block and still matches next turn, once this
+        message is history and the state text is gone.
 
         Slim overlay tool results to prevent context overflow.  A full show_overlay
         call can contain 20+ spec items (1-3 KB each) that the model doesn't need
@@ -1073,6 +1354,41 @@ class Jarvis:
                 out.append({"role": role, "content": slimmed})
             else:
                 out.append({"role": role, "content": str(content) if content else ""})
+
+        # Cache the conversation too, not just the prompt.  History runs ~3.8k tokens
+        # and was billed in full every turn — more than the character prompt costs once
+        # that one is cached.  The breakpoint goes on the message's real content and
+        # the volatile state block is added AFTER it, so the cached prefix stops short
+        # of the state text.  Next turn this message is history without that block, and
+        # the prefix still matches — which is what lets the conversation read back at
+        # 10% instead of being rewritten.
+        if out:
+            last    = out[-1]
+            content = last["content"]
+            if isinstance(content, str):
+                content = [{"type": "text", "text": content}] if content else []
+            content = list(content)
+            if content and isinstance(content[-1], dict):
+                content[-1] = {**content[-1],
+                               "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+            if volatile:
+                # Worded hard as background.  Sitting in the user turn, this is the
+                # most-attended position in the request, and a plainly-labelled state
+                # dump reads as something to remark on — JARVIS started opening every
+                # reply with the clock ("11:25, sir...") even though the character
+                # prompt forbids it.  The reference data has to be here for caching;
+                # the instruction not to perform it has to be here too.
+                content.append({
+                    "type": "text",
+                    "text": (
+                        f"[Background state. {USER_NAME} did not say this and cannot see it. "
+                        f"Reference only — do NOT mention the time, mode, or status unless "
+                        f"he actually asks, or it genuinely changes your answer. Never open "
+                        f"a reply with the clock.]\n{volatile}"
+                    ),
+                })
+            if content:
+                out[-1] = {**last, "content": content}
         return out
 
     def _append_assistant_text(self, text: str) -> None:

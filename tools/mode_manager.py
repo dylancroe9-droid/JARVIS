@@ -78,11 +78,20 @@ _NORMAL_APPS = (
 )
 
 # Modes that, once entered, PIN themselves and wait for an explicit voice exit
-# instead of tracking the screen. Gaming is sticky because players alt-tab to
-# Discord / a wiki / a loading screen constantly, and flapping out of gaming
-# mode every 30s would be worse than useless. Watch and work track the screen
-# fluidly, so they aren't sticky.
-_STICKY_MODES = frozenset({"gaming"})
+# instead of tracking the screen.
+#
+# Gaming is sticky because players alt-tab to Discord / a wiki / a loading screen
+# constantly, and flapping out of gaming mode every 30s would be worse than useless.
+#
+# Work is sticky for the same reason, only more so: working IS switching windows —
+# editor to browser to terminal to notes. As a non-sticky pin it released on the
+# very first app switch and dropped straight back to normal, so "work mode" lasted
+# until you did any work. It is also the one mode auto-detection can never enter
+# (see _poll_once) — the only way in is asking out loud, so the only way out should
+# be saying so too.
+#
+# Watch stays non-sticky: it IS auto-detected, and it should follow the media.
+_STICKY_MODES = frozenset({"gaming", "work"})
 
 
 def _frontmost() -> tuple[str, str]:
@@ -364,6 +373,14 @@ class ModeManager:
                 self._forced = None
                 self._forced_app = None
             m, r = classify(app, title)
+            # Do NOT auto-enter WORK mode. A frontmost editor/terminal — especially
+            # the Terminal you launched JARVIS from — kept flipping the HUD to "work"
+            # unprompted, which was confusing ("I asked for music and it went to work
+            # mode?!"). Work is now VOICE-ONLY ("work mode" / set_mode). Auto-switching
+            # still handles the immersive states that actually benefit: watch (a video
+            # is playing) and gaming (a game is fullscreen).
+            if m == "work":
+                m, r = "normal", app
             # Keep watch mode while a video/music is still playing, even if you
             # tabbed away from Peacock to a normal/work app (e.g. Claude) — don't
             # yank the big desktop HUD back over a video that's still going. Only

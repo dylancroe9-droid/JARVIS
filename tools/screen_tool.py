@@ -153,6 +153,33 @@ def _logical_screen_size() -> tuple:
         return 1440, 900
 
 
+def capture_screen_png_b64(for_control: bool = False):
+    """
+    Capture the screen and return (base64_png, width, height), or (None, 0, 0) on
+    failure. Unlike take_screenshot() this does NOT run a vision model — it hands
+    the raw image back so the Claude brain can read it with its OWN vision, which
+    is far more reliable for math problems, diagrams, code, and fine text.
+    """
+    r = subprocess.run(["screencapture", "-x", "-t", "png", SCREENSHOT_PATH], capture_output=True)
+    if r.returncode != 0:
+        return (None, 0, 0)
+    try:
+        if os.path.getsize(SCREENSHOT_PATH) < _MIN_SCREENSHOT_BYTES:
+            return (None, 0, 0)          # blank image → Screen Recording likely denied
+    except Exception:
+        return (None, 0, 0)
+    sw, sh = _logical_screen_size()
+    if for_control:
+        subprocess.run(["sips", "-z", str(sh), str(sw), SCREENSHOT_PATH], capture_output=True)
+    else:
+        subprocess.run(["sips", "-Z", "1600", SCREENSHOT_PATH], capture_output=True)  # sharp enough to read math
+    try:
+        with open(SCREENSHOT_PATH, "rb") as f:
+            return (base64.standard_b64encode(f.read()).decode("utf-8"), sw, sh)
+    except Exception:
+        return (None, 0, 0)
+
+
 def take_screenshot(question: str = "", for_control: bool = False) -> str:
     """
     Capture the full screen and ask the vision model a question about it.

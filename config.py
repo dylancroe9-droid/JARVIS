@@ -21,7 +21,10 @@ def _macos_full_name() -> str:
 
 # ── Anthropic / Claude (primary brain) ───────────────────────────────────────
 ANTHROPIC_API_KEY   = os.getenv("ANTHROPIC_API_KEY", "")
-ANTHROPIC_MODEL     = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-5")  # override in .env
+# Default brain: Sonnet — strong at tool use + reasoning, ~5x cheaper than Opus.
+# Override in .env: ANTHROPIC_MODEL=claude-opus-4-5 (smarter, pricier) or a Haiku
+# id (cheaper, a touch less sharp).  Sonnet is the sweet spot for a voice assistant.
+ANTHROPIC_MODEL     = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5")
 
 # ── Groq (cloud fallback — tool-heavy tasks and complex reasoning) ────────────
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")

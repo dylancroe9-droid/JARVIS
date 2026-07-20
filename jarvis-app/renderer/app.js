@@ -1233,6 +1233,9 @@ function connect () {
       updateWeatherWidget(msg)
     } else if (msg.type === 'agenda_update') {
       updateAgendaWidget(msg.events)
+      if (window._widgetsAgenda) window._widgetsAgenda(msg.events)
+    } else if (msg.type === 'widget_control') {
+      if (window._widgetControl) window._widgetControl(msg)
     } else if (msg.type === 'files_update') {
       updateFilesWidget(msg.files)
 

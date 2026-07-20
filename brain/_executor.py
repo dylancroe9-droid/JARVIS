@@ -705,9 +705,45 @@ class ToolsExecutor:
             if args.get("for_control"):
                 self._ca("screenshot", "Scanning screen…")
             try:
-                from tools.screen_tool import take_screenshot
+                from tools.screen_tool import take_screenshot, capture_screen_png_b64
             except ImportError as exc:
                 return f"Screen tool unavailable: {exc}"
+            # On the Claude brain, give Claude the ACTUAL screenshot so it reads the
+            # screen with its own vision — far more reliable for math, diagrams, code,
+            # and fine text than the Groq vision model's text description. Returns
+            # Anthropic content blocks; _claude_chat forwards them into the tool result.
+            try:
+                from brain.jarvis import _USE_CLAUDE
+            except Exception:
+                _USE_CLAUDE = False
+            if _USE_CLAUDE:
+                _for_control = bool(args.get("for_control"))
+                b64, sw, sh = capture_screen_png_b64(for_control=_for_control)
+                if b64:
+                    q = (args.get("question") or "").strip() or \
+                        "Read exactly what's on Dylan's screen and answer his request precisely."
+                    if _for_control:
+                        # for_control used to skip Claude's vision entirely and hand
+                        # back Groq's TEXT description of the screen — so the one mode
+                        # meant for clicking was the one where Claude couldn't see, and
+                        # it had no real coordinates to click. Give it the actual image
+                        # at exact screen dimensions so it can read off pixel positions.
+                        note = (
+                            f"[Screenshot of Dylan's screen, EXACTLY {sw}x{sh} pixels, "
+                            f"matching the screen's coordinate space 1:1. {q} "
+                            f"To act on something, report its CENTER as (x, y) with "
+                            f"x in 0-{sw} and y in 0-{sh}, and pass those straight to "
+                            f"click_screen. Read the real text; do not guess.]"
+                        )
+                    else:
+                        note = (f"[Screenshot of Dylan's screen — {q} "
+                                "Read the real numbers/text; do not guess.]")
+                    return [
+                        {"type": "image", "source": {"type": "base64",
+                         "media_type": "image/png", "data": b64}},
+                        {"type": "text", "text": note},
+                    ]
+                # capture failed → fall through to the text/permission path
             return take_screenshot(
                 question=args.get("question", ""),
                 for_control=args.get("for_control", False),
@@ -924,6 +960,91 @@ class ToolsExecutor:
         elif name == "set_focus_mode":
             from tools.smart_tools import set_focus_mode
             return set_focus_mode(enabled=args["enabled"], minutes=args.get("minutes", 0))
+
+        elif name == "set_mode":
+            # Switch JARVIS's own HUD/attention mode via the ModeManager, which
+            # fires the server's _on_mode_change (HUD + notifications + brain
+            # self-awareness). This is what lets the AI change modes from INTENT
+            # instead of the hard-coded phrase list.
+            from tools.mode_manager import get_manager
+            mgr = get_manager()
+            mode = (args.get("mode") or "").strip().lower()
+            if mgr is None:
+                return "Mode manager isn't running."
+            if mode == "auto_on":
+                mgr.set_auto(True);  return "Auto mode on — I'll adjust as your screen changes, sir."
+            if mode == "auto_off":
+                mgr.set_auto(False); return "Auto mode off, sir."
+            if mode == "normal":
+                mgr.exit_forced();   return "Back to normal, sir."
+            if mode in ("gaming", "work", "watch"):
+                mgr.force(mode);     return f"{mode.title()} mode, sir."
+            return f"I don't have a '{mode}' mode."
+
+        elif name == "widget_control":
+            # Push a show/hide/reset command to the HUD dashboard (widgets.js).
+            action = (args.get("action") or "show").lower()
+            widget = (args.get("widget") or "").lower().strip()
+            if self.broadcast_callback:
+                self.broadcast_callback({"type": "widget_control",
+                                         "action": action, "widget": widget})
+            if action == "reset":
+                return "Everything's back in its place, sir."
+            verb = {"show": "Pulled up", "hide": "Cleared", "toggle": "Toggled"}.get(action, "Done")
+            return f"{verb} the {widget}, sir." if widget else f"{verb} that, sir."
+
+        elif name == "get_stock_price":
+            from tools.live_data import get_stock_price
+            return get_stock_price(args.get("symbol", ""))
+
+        elif name == "get_crypto_price":
+            from tools.live_data import get_crypto_price
+            return get_crypto_price(args.get("coin", ""))
+
+        elif name == "get_sports_scores":
+            from tools.live_data import get_sports_scores
+            return get_sports_scores(args.get("query", ""))
+
+        elif name == "read_document":
+            from tools.mac_extras import read_document
+            return read_document(args.get("path", ""))
+
+        elif name == "convert_image":
+            from tools.mac_extras import convert_image
+            return convert_image(args.get("path", ""), args.get("to_format", "png"))
+
+        elif name == "facetime_call":
+            from tools.mac_extras import facetime_call
+            return facetime_call(args.get("target", ""))
+
+        elif name == "get_directions":
+            from tools.mac_extras import get_directions
+            return get_directions(args.get("destination", ""), args.get("origin", ""))
+
+        elif name == "empty_trash":
+            from tools.mac_extras import empty_trash
+            return empty_trash()
+
+        elif name == "health_reminders":
+            from tools.health_nudges import health_reminders
+            return health_reminders(args.get("action", "start"),
+                                    args.get("kind", ""), args.get("interval_min", 30))
+
+        elif name == "watch_movie":
+            # Movie concierge: find where the title streams (prioritising Dylan's OWN
+            # subscriptions) and open it in his logged-in Chrome. Also drops JARVIS into
+            # watch mode so the HUD gets out of the way while it plays.
+            from tools.streaming import watch
+            title = (args.get("title") or "").strip()
+            and_play = bool(args.get("and_play", False))
+            try:
+                from tools.mode_manager import get_manager
+                mgr = get_manager()
+                if mgr is not None:
+                    mgr.force("watch")
+            except Exception:
+                pass
+            return watch(title, and_play)
 
         elif name == "random_number":
             from tools.smart_tools import random_number

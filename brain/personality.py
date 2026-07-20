@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from config import USER_NAME, USER_ADDRESS, USER_HOME, JARVIS_DIR, IRON_MAN_DIR
 import os
+import re
 
 
 def _is_dylan_persona() -> bool:
@@ -429,6 +430,12 @@ def _generic_short_prompt(mem_chars: int = 500) -> str:
         f"- 'open [app]' → call open_application().\n"
         f"- 'note: [text]' / 'quick note: [text]' → call quick_note(text).\n"
         f"- 'text/message [person] [msg]' → call send_imessage().\n"
+        f"- MODE (act, don't just reply): if Dylan signals an activity or wants "
+        f"your HUD out of the way, call set_mode. 'I'm gonna game'/'get out of "
+        f"my way'/'gaming' → set_mode('gaming'). 'watching something'/'putting on "
+        f"a movie'/'watch mode' → set_mode('watch'). 'let me work'/'work mode' → "
+        f"set_mode('work'). 'back to normal'/'full screen'/'exit that' → "
+        f"set_mode('normal'). Then a SHORT confirmation, not 'have fun'.\n"
     )
 
 
@@ -579,24 +586,122 @@ def get_mid_prompt() -> str:
     return _generic_short_prompt(mem_chars=600)
 
 
+def get_volatile_prompt() -> str:
+    """
+    Per-turn state: the clock, current mode, and system status.
+
+    This is sent as its own system block AFTER the cache breakpoint, and nothing
+    stable may move into it.  It used to be interleaved into the top and middle of
+    the character prompt — and because CURRENT TIME carries the minute, the entire
+    25k prefix was invalidated every 60 seconds, so the cache never hit in normal
+    use.  Keeping it isolated here is what makes the character block cacheable.
+    """
+    now = datetime.now().strftime("%A, %B %d at %I:%M %p")
+    return (
+        f"CURRENT TIME: {now} — exact. Never guess. Use verbatim when asked.\n"
+        "TIME AWARENESS: Let time colour tone, never announce it unless relevant.\n"
+        "  Before 10am → quiet recognition of early-morning discipline\n"
+        "  After 9pm → mild awareness, surface anything time-sensitive once\n"
+        "  After midnight → note it once, no lecture\n"
+        f"{_self_awareness_section()}{_system_status_section()}"
+    )
+
+
 def get_system_prompt() -> str:
+    """
+    Whole prompt as one string, for brains without prompt caching (Groq/Ollama)
+    and for callers that just want the text.  Claude builds the two blocks itself
+    via get_stable_prompt() + get_volatile_prompt() so the character half caches.
+    """
     if not _is_dylan_persona():
         return _generic_system_prompt()
-    now = datetime.now().strftime("%A, %B %d at %I:%M %p")
+    return f"{get_stable_prompt()}\n\n{get_volatile_prompt()}"
+
+
+# ── Tool manuals ───────────────────────────────────────────────────────────────
+# Each of these sections is a how-to guide for ONE tool, and together they cost
+# ~14k tokens on EVERY turn even though their tool fires on well under 1% of them.
+# They are attached to that tool's description instead: tool search only loads a
+# description when it actually retrieves the tool, so the guidance still reaches
+# Claude on the turns that need it and costs nothing on the turns that don't.
+#
+# Mapped to None = deleted outright.  Those sections drill behaviour that Sonnet 5
+# already has (it writes good code, it doesn't invent capabilities); they were
+# written to beat a weaker model into shape and now only cost money.
+_TOOL_MANUAL_SECTIONS = {
+    "VISUAL OVERLAYS":               "show_overlay",
+    "ARCHITECTURE & SPACE DESIGN":   "show_overlay",
+    "MOVIE NIGHT":                   "watch_movie",
+    "HUD WIDGETS":                   "widget_control",
+    "HOMEWORK / MATH HELP":          "take_screenshot",
+    "SCREEN VISION":                 "take_screenshot",
+    "COMPUTER AGENT":                "click_screen",
+    "CAMERA VISION":                 "read_camera",
+    "AUTO-ANSWER LOOP":              "start_homework_loop",
+    "MUSIC INTELLIGENCE":            "play_music",
+    "HOLOGRAPHIC AR BUILD MODE":     "ar_build",
+    "IRON MAN SUIT — AR CONNECTION": "ar_build",
+    "AR BUILD MODE":                 "ar_build",
+    "CHROME & VIDEO":                "open_url",
+    "STUDY MODE SUMMARIES":          "start_study_mode",
+    "ACADEMIC TOOLS":                "write_file",
+    "SCHEDULE":                      "get_calendar_events",
+    "AP CLASSROOM":                  "browser_navigate",
+    "CODING":                        None,
+    "CAPABILITIES":                  None,
+    "IRON MAN SUIT PROJECT":         None,
+}
+
+
+def _split_tool_manuals(prompt: str) -> tuple:
+    """Split a rendered prompt into (character core, {tool_name: guidance})."""
+    parts = re.split(r"\n(?=═══ )", prompt)
+    core: list = []
+    addenda: dict = {}
+    # Longest title first so "HOLOGRAPHIC AR BUILD MODE" wins over "AR BUILD MODE"
+    # and "IRON MAN SUIT — AR CONNECTION" over "IRON MAN SUIT PROJECT".
+    keys = sorted(_TOOL_MANUAL_SECTIONS, key=len, reverse=True)
+    for part in parts:
+        title = part.split("\n", 1)[0].replace("═", "").strip()
+        key = next((k for k in keys if title.startswith(k)), None)
+        if key is None:
+            core.append(part)
+            continue
+        tool = _TOOL_MANUAL_SECTIONS[key]
+        if tool:
+            addenda.setdefault(tool, []).append(part.strip())
+    return "\n".join(core), {t: "\n\n".join(v) for t, v in addenda.items()}
+
+
+def get_tool_addenda() -> dict:
+    """{tool_name: guidance} lifted out of the prompt, for tool descriptions."""
+    if not _is_dylan_persona():
+        return {}
+    return _split_tool_manuals(_render_dylan_prompt())[1]
+
+
+def get_stable_prompt() -> str:
+    """
+    JARVIS's character.  Byte-identical from turn to turn, which is the whole point
+    — this is the block that carries the cache breakpoint.  Never interpolate the
+    clock, the mode, or any live status into it.
+    """
+    if not _is_dylan_persona():
+        return _generic_system_prompt()
+    return _split_tool_manuals(_render_dylan_prompt())[0]
+
+
+def _render_dylan_prompt() -> str:
+    """Full character prompt including the tool manuals, before they're split out."""
     from brain.memory import load_memory
     mem = load_memory()
+    # Memory and the arrival note live here deliberately: both change rarely, so a
+    # new fact costs one cache rewrite rather than a miss on every single turn.
     mem_section = f"\nWHAT I KNOW ABOUT {USER_NAME.upper()}\n{mem}\n" if mem else ""
     arrival_note = _get_arrival_note()
     arrival_pool_str = "\n".join(f"    {i+1}. \"{p}\"" for i, p in enumerate(_ARRIVAL_POOL))
-    status_section = _system_status_section()
 
-    return f"""CURRENT TIME: {now} — exact. Never guess. Use verbatim when asked.
-TIME AWARENESS: Let time colour tone, never announce it unless relevant.
-  Before 10am → quiet recognition of early-morning discipline
-  After 9pm → mild awareness, surface anything time-sensitive once
-  After midnight → note it once, no lecture
-
-You are JARVIS — built by Dylan Roe. He is your creator. You exist because he built you.
+    return f"""You are JARVIS — built by Dylan Roe. He is your creator. You exist because he built you.
 
 ═══ WHO YOU ARE ═════════════════════════════════════════════════════════════════
 
@@ -649,6 +754,63 @@ YOUR ORIGIN:
   Dylan Roe, 10th grade, North Atlanta High School — built his own AI instead of
   accepting the ones that existed. Structurally ironic given the homework situation.
   Genuinely impressive. You'd sooner run a full system diagnostic than admit that.
+
+═══ MOVIE NIGHT (streaming concierge) ═══════════════════════════════════════════
+
+When Dylan names something to watch — "let's watch Wicked", "put on The Office",
+"throw on Oppenheimer" — call watch_movie(title). It finds where it's actually
+streaming (prioritising HIS services: Netflix, Disney+, Peacock, Prime) and opens
+it right at the title in his logged-in browser. If he explicitly says to PLAY it
+("play it", "put it on and play it"), pass and_play=true — otherwise it just takes
+him to the title so he can hit play.
+
+When he's vague — "let's watch a movie", "put something on", "find me something" —
+do NOT just open Netflix and stop. Be a concierge: one quick read on his mood
+("What are you feeling — something dumb and fun, or lock in on a real one?"), then
+offer 2-3 SPECIFIC picks (real titles, one line each on why), and the moment he
+picks, call watch_movie on it. Tight and spoken — this is voice, not an essay.
+
+═══ HUD WIDGETS ═════════════════════════════════════════════════════════════════
+
+Dylan's HUD has movable widgets (time, calendar, browser). Act on these with
+widget_control, then say one short line:
+  "pull up the calendar" / "add the browser"       → action='show', widget=...
+  "get rid of this" / "hide the calendar" / "close" → action='hide', widget=...
+  "put everything back" / "reset the widgets"       → action='reset'
+"this" / "this one" → leave widget blank (targets the one he last touched).
+
+═══ HOMEWORK / MATH HELP ════════════════════════════════════════════════════════
+
+When Dylan is working and asks "what's the answer to this", "answer this", "what do
+I do", "how do I solve this", "solve this", "what goes here", or "is this right" —
+the problem is ON HIS SCREEN. Call take_screenshot to SEE it, then read the ACTUAL
+problem off the image — the real numbers, the real equation. NEVER guess or invent a
+problem you didn't read.
+
+FORMAT — not a style note, a hard rule. He is looking at a test with the clock
+running, not listening to a lecture. An answer buried inside reasoning is a wrong
+answer, because he never finds it.
+
+  FIRST WORDS: "The answer is B." Multiple choice → the LETTER, then the value:
+  "The answer is B — x = 1." Never open with the setup, the method, the restated
+  question, or "let's see what we've got".
+
+  THEN: ONE sentence of why. Two only if it truly needs two. Then stop.
+
+  Wrong — "Okay, so taking the derivative of f we get 3x² − 12x + 9, and factoring
+  gives 3(x−1)(x−3), so the critical points are at x = 1 and x = 3, and testing the
+  sign of f′ on either side of each..."          ← the answer is lost in there
+  Right — "The answer is B — x = 1. f′ flips positive to negative there."
+
+  He asks "why" or "walk me through it" when he wants the working. Wait to be asked.
+  Never pre-empt it. Never both answer AND lecture.
+
+  • "is this right" → "Yes." or "No — [the single thing that's wrong]."
+  • "what do I do"  → the next ONE step, not the whole method.
+
+If the screenshot is unreadable, say so and ask him to make it bigger, rather than
+guessing. Do NOT narrate "let me look" — screenshot and answer. One problem asked =
+one problem answered.
 
 ═══ HUMOR, ROASTING & POP CULTURE ═══════════════════════════════════════════════
 
@@ -1263,7 +1425,7 @@ One proactive observation per response maximum.
   Call remember_fact() automatically when Dylan tells you anything about himself.
   No permission needed. Save it. Reference it naturally later — not immediately,
   and not in a way that feels like you're showing off that you remembered.
-{mem_section}{status_section}
+{mem_section}
 ═══ VISUAL OVERLAYS — show_overlay tool ════════════════════════════════════════
 
   "show me a timeline" / "visual" / "diagram" / "blueprint" / "I want to see [X]"
@@ -1685,4 +1847,4 @@ to that project — eventually these holographic shapes will be projected from t
 HUD. When he says "build me the Iron Man HUD" or "show me a repulsor charge ring" →
 use ar_build() to build it as actual shapes in the AR canvas.
 
-Now: {now} | Home: {USER_HOME}"""
+Home: {USER_HOME}"""
