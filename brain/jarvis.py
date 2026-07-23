@@ -171,11 +171,17 @@ def _search_tools(tools: list, mode: str = "") -> list:
     """
     if not tools or len(tools) < 20:
         return tools
+    from brain.product import tool_is_allowed
     resident = _resident_tools_for_mode(mode)
     addenda = _tool_addenda()
     out = []
     for t in tools:
         name = t.get("name")
+        # Alex (study-only product) never sees music/movie/smart-home/etc tools at
+        # all — not deferred, absent. A student can't trip over them, and the
+        # schoolwork build can't be pointed at anything off-task.
+        if not tool_is_allowed(name):
+            continue
         extra = addenda.get(name)
         # Guidance lifted out of the system prompt rides on the tool it belongs to.
         t = {**t, "description": f"{t['description']}\n\n{extra}"} if extra else t
@@ -760,6 +766,18 @@ class Jarvis:
         """
         import random
         issues = issues or []
+        # Alex greets as a study partner, not JARVIS. Kept simple and warm — a
+        # student opening a homework app wants "what are we working on", not wit.
+        from brain.product import is_alex
+        if is_alex():
+            return random.choice([
+                "Hey! What are we working on today?",
+                "Alright, what subject are we tackling?",
+                "Ready when you are — what do you need help with?",
+                "What's on the homework list?",
+                "Let's get into it. What are we studying?",
+                "Hey — stuck on something, or want me to quiz you?",
+            ])
         if _USE_CLAUDE and getattr(self, "_claude", None):
             try:
                 angle = random.choice(_GREETING_ANGLES)
