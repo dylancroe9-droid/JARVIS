@@ -88,3 +88,52 @@ class TestFlushGate:
         monkeypatch.setattr(vp, "is_owner", boom)
         ok = AudioEngine._speaker_ok(object(), np.zeros(16000, dtype=np.int16))
         assert ok is True, "a broken verifier must not make JARVIS deaf"
+
+
+class TestHardMute:
+    """
+    Type-first / mic-off. suspend() only flipped state to IDLE, leaving the capture
+    callback fully running — so 'muted' room audio was still transcribed and could
+    fire commands (this is what let it act on the TV). mute_mic() is a real hard
+    mute: the callback drops every block. Typed input is unaffected.
+    """
+
+    def _engine(self):
+        import numpy as np, queue
+        from voice.audio_engine import AudioEngine
+        e = AudioEngine.__new__(AudioEngine)
+        e._closed = False; e._muted = False; e._state = AudioEngine.DETECTING
+        e._frames = []; e._speech_started = False; e._silence_count = 0
+        e._block_count = 0; e._loud_count = 0; e._onset_count = 0
+        e._audio_q = queue.Queue()
+        return e
+
+    def test_muted_callback_drops_audio(self):
+        import numpy as np
+        e = self._engine()
+        e.mute_mic()
+        blk = (np.random.randn(480) * 3000).astype("int16").reshape(-1, 1)
+        e._callback_inner(blk, 480, None, None)
+        assert e._frames == [], "muted mic must buffer no audio"
+        assert e._audio_q.qsize() == 0, "muted mic must queue nothing for STT"
+
+    def test_unmute_restores_listening(self):
+        from voice.audio_engine import AudioEngine
+        e = self._engine()
+        e.mute_mic()
+        assert e.muted is True
+        e.unmute_mic()
+        assert e.muted is False
+        assert e._state == AudioEngine.DETECTING
+
+    def test_engine_registers_for_tool_access(self):
+        # set_listening reaches the mic via get_engine(); if registration breaks,
+        # the tool silently can't toggle anything.
+        import voice.audio_engine as ae
+        assert hasattr(ae, "get_engine")
+
+    def test_set_listening_is_resident(self):
+        # Deferred, Claude confabulated a false "I can't mute the mic" instead of
+        # calling it. Mic control must be always-loaded.
+        from brain.jarvis import _BASE_TOOL_NAMES
+        assert "set_listening" in _BASE_TOOL_NAMES

@@ -1,0 +1,61 @@
+{
+  "appId": "app.alex.study",
+  "productName": "Alex",
+  "copyright": "Dylan Roe",
+  "files": [
+    "**/*",
+    "!node_modules/.cache",
+    "!electron-builder-alex.json"
+  ],
+  "extraResources": [
+    {
+      "from": "../",
+      "to": "jarvis",
+      "filter": [
+        "brain/**/*.py",
+        "voice/**/*.py",
+        "tools/**/*.py",
+        "memory/**/*.py",
+        "server.py",
+        "chat.py",
+        "main.py",
+        "config.py",
+        "setup.py",
+        "setup_api.py",
+        "requirements.txt",
+        "setup.sh",
+        ".env.example",
+        "!**/.env",
+        "!**/.env.*",
+        "!**/.setup_done",
+        "!**/memory.txt",
+        "!**/__pycache__/**",
+        "!**/*.pyc",
+        "!**/.venv/**",
+        "!**/node_modules/**",
+        "!jarvis-app/**",
+        "!agents/**",
+        "!.octogent/**",
+        "!study_notes/**",
+        "!dist/**"
+      ]
+    }
+  ],
+  "mac": {
+    "category": "public.app-category.education",
+    "icon": "assets/icon-alex.icns",
+    "target": [
+      { "target": "dmg", "arch": ["arm64"] }
+    ],
+    "darkModeSupport": true
+  },
+  "dmg": {
+    "title": "Alex Installer",
+    "contents": [
+      { "x": 130, "y": 180, "type": "file" },
+      { "x": 420, "y": 180, "type": "link", "path": "/Applications" },
+      { "x": 130, "y": 340, "type": "file", "path": "dist-extras/Install Alex.md" },
+      { "x": 420, "y": 340, "type": "file", "path": "dist-extras/Unlock Alex.command" }
+    ]
+  }
+}

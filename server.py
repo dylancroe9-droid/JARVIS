@@ -3647,13 +3647,13 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                 elif kind == "mute":
                     _mic_muted = True
                     if audio:
-                        audio.suspend()
+                        audio.mute_mic()      # hard mute — callback drops all audio
                     await websocket.send_text(json.dumps({"type": "muted"}))
 
                 elif kind == "unmute":
                     _mic_muted = False
                     if audio:
-                        _resume_audio()
+                        audio.unmute_mic()
                     await websocket.send_text(json.dumps({"type": "unmuted"}))
 
                 elif kind == "confirm_response":

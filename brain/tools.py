@@ -724,6 +724,22 @@ TOOL_DEFINITIONS = [
     {"name": "stop_study_mode", "description": "Stop study mode and summarize what was captured.",
      "input_schema": {"type": "object", "properties": {}, "required": []}},
 
+    # ── Mic / listening ───────────────────────────────────────────────────
+    {"name": "set_listening",
+     "description": (
+         "Turn the microphone ON or OFF. Use when Dylan wants to go quiet / "
+         "type-only — 'mute the mic', 'stop listening', 'type mode', 'go quiet', "
+         "'I'll just type', 'mic off' → off; 'start listening again', 'you can "
+         "listen', 'mic on', 'unmute' → on. "
+         "OFF is a hard mute: the mic stops processing all audio, so nothing in "
+         "the room can be picked up. Typed messages and spoken replies keep "
+         "working either way — turning the mic off does NOT make you go silent, it "
+         "just stops you listening. This is the right call whenever he's typing to "
+         "you with headphones in."),
+     "input_schema": {"type": "object", "properties": {
+         "on": {"type": "boolean", "description": "true = listen, false = mic off (type-only)"}
+     }, "required": ["on"]}},
+
     # ── Practice tests ────────────────────────────────────────────────────
     {"name": "create_practice_test",
      "description": (

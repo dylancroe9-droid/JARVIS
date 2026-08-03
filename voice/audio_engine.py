@@ -157,6 +157,16 @@ def _pick_input_device(devices) -> int | None:
     return None
 
 
+# The live engine, so tools can reach the mic without importing server.py.
+# Set in AudioEngine.__init__; mirrors mode_manager.get_manager().
+_active_engine = None
+
+
+def get_engine():
+    """Return the running AudioEngine, or None if voice isn't up."""
+    return _active_engine
+
+
 class AudioEngine:
     """
     State-machine audio engine over a single sounddevice input stream.
@@ -223,6 +233,16 @@ class AudioEngine:
         self._stream: Optional[sd.InputStream] = None
         self._ready    = False
         self._closed   = False
+        # Hard mute for type-first / mic-off mode. When True the capture callback
+        # drops every block immediately — no VAD, no STT, no room audio processed
+        # at all. suspend() only flipped state to IDLE, which left the callback
+        # fully running, so "muted" audio was still transcribed and could still
+        # fire commands (this is what let it act on the TV). Typed input is
+        # unaffected: it never touches this path.
+        self._muted    = False
+
+        global _active_engine
+        _active_engine = self          # so tools can reach the live mic (get_engine)
 
         threading.Thread(target=self._init, daemon=True, name="audio-init").start()
 
@@ -385,8 +405,28 @@ class AudioEngine:
         self._reset()
         self._state = self.STUDY
 
+    def mute_mic(self) -> None:
+        """
+        Hard mute — type-first / mic-off mode. The capture callback drops every
+        block, so no room audio is ever transcribed or acted on. Typed input and
+        spoken replies are unaffected; they don't use this path. Reversible via
+        unmute_mic().
+        """
+        self._muted = True
+        self._state = self.IDLE
+        self._reset()          # discard anything mid-capture
+
+    def unmute_mic(self) -> None:
+        """Leave mic-off mode and start listening again."""
+        self._muted = False
+        self._state = self.DETECTING
+
+    @property
+    def muted(self) -> bool:
+        return self._muted
+
     def suspend(self) -> None:
-        """Keep stream open but ignore all audio."""
+        """Keep stream open but ignore all audio (soft — state only)."""
         self._state = self.IDLE
 
     def close(self) -> None:
@@ -412,8 +452,8 @@ class AudioEngine:
             console.print(f"[yellow]Audio callback error (suppressed): {exc}[/yellow]")
 
     def _callback_inner(self, indata, _frames, _time, _status) -> None:
-        if self._closed:
-            return
+        if self._closed or self._muted:
+            return          # hard mute: drop the block before any VAD/STT work
 
         chunk = indata.copy().flatten()
         rms   = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2)))

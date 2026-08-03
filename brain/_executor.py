@@ -967,26 +967,36 @@ class ToolsExecutor:
             # self-awareness). This is what lets the AI change modes from INTENT
             # instead of the hard-coded phrase list.
             from tools.mode_manager import get_manager
+            from brain.product import is_alex
+            _alex = is_alex()
             mgr = get_manager()
             mode = (args.get("mode") or "").strip().lower()
             if mgr is None:
                 return "Mode manager isn't running."
             if mode == "auto_on":
-                mgr.set_auto(True);  return "Auto mode on — I'll adjust as your screen changes, sir."
+                mgr.set_auto(True)
+                return ("Okay, I'll follow along as your screen changes."
+                        if _alex else "Auto mode on — I'll adjust as your screen changes, sir.")
             if mode == "auto_off":
-                mgr.set_auto(False); return "Auto mode off, sir."
+                mgr.set_auto(False)
+                return "Okay, I'll stay put." if _alex else "Auto mode off, sir."
             if mode == "normal":
-                mgr.exit_forced();   return "Back to normal, sir."
+                mgr.exit_forced()
+                return "Okay." if _alex else "Back to normal, sir."
             if mode == "study":
                 # Entering study is what LOADS the schoolwork tools — outside this
                 # mode take_screenshot and the practice-test tools aren't even sent
                 # to the model, so homework behaviour can't leak into ordinary
-                # desktop use.
+                # desktop use. (Alex is locked to study anyway — see get_current_mode.)
                 mgr.force(mode)
+                if _alex:
+                    return ("Study mode — just show me a problem on your screen, or ask me "
+                            "to make you a practice test.")
                 return ("Study mode, sir. Screen's mine when you need a problem read, "
                         "and I can build you a practice test on anything.")
             if mode in ("gaming", "work", "watch"):
-                mgr.force(mode);     return f"{mode.title()} mode, sir."
+                mgr.force(mode)
+                return f"{mode.title()} mode." if _alex else f"{mode.title()} mode, sir."
             return f"I don't have a '{mode}' mode."
 
         elif name == "widget_control":
@@ -1227,6 +1237,22 @@ class ToolsExecutor:
             return (
                 f"Here's your {title}. Click any card to hear it."
             )
+
+        # ── Mic / listening ──────────────────────────────────────────────
+        elif name == "set_listening":
+            try:
+                from voice.audio_engine import get_engine
+            except ImportError as exc:
+                return f"Mic control unavailable: {exc}"
+            eng = get_engine()
+            if eng is None:
+                return "Voice isn't running, so there's no mic to toggle."
+            on = bool(args.get("on"))
+            if on:
+                eng.unmute_mic()
+                return "Listening again."
+            eng.mute_mic()
+            return "Mic's off — I'll still answer whatever you type, out loud."
 
         # ── Practice tests ───────────────────────────────────────────────
         elif name == "create_practice_test":

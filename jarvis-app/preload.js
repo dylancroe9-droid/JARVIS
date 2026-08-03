@@ -1,5 +1,12 @@
 const { contextBridge, ipcRenderer } = require('electron')
 
+// Product identity, resolved synchronously at preload so every renderer script
+// (branding.js, app.js) can read window.PRODUCT before it runs. Falls back to
+// JARVIS if the main process is somehow unavailable.
+let _product = { key: 'jarvis', name: 'JARVIS', tagline: "Dylan's assistant.", accent: '#00d4ff' }
+try { _product = ipcRenderer.sendSync('get-product-sync') || _product } catch (_) {}
+contextBridge.exposeInMainWorld('PRODUCT', _product)
+
 contextBridge.exposeInMainWorld('jarvis', {
   close:           () => ipcRenderer.send('window-close'),
   hide:            () => ipcRenderer.send('window-hide'),
@@ -17,4 +24,6 @@ contextBridge.exposeInMainWorld('jarvis', {
   // Support / observability:
   getVersion:      () => ipcRenderer.invoke('get-version'),
   exportLogs:      () => ipcRenderer.invoke('export-logs'),
+  // Product identity (JARVIS vs Alex) for renderer branding:
+  getProduct:      () => ipcRenderer.invoke('get-product'),
 })

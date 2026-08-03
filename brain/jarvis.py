@@ -54,8 +54,11 @@ _TOOL_SEARCH_BETA = "advanced-tool-use-2025-11-20"
 # cannot retrieve it — measured 1/6 deferred vs 6/6 resident, with no reflexive
 # screenshots on plain conversation (6/6 clean).
 # Tools resident on EVERY turn, in every mode. Keep this tiny — each one is billed
-# on every single request.
-_BASE_TOOL_NAMES = {"play_music", "pause_music", "set_mode"}
+# on every single request. set_listening is here because a type-first user needs
+# "mute the mic" to work instantly in any mode; deferred, Claude never searched for
+# it and instead confabulated a FALSE denial ("I can't mute the mic") — the exact
+# room-audio misconception this feature fixes.
+_BASE_TOOL_NAMES = {"play_music", "pause_music", "set_mode", "set_listening"}
 
 # Schoolwork tools. Resident only in STUDY mode.
 #
@@ -718,6 +721,28 @@ class Jarvis:
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def chat(self, user_input: str) -> Generator[str, None, None]:
+        # ── Alex credits gate (study-only product) ──────────────────────────────
+        # Handled before anything else so redeeming, checking a balance, and the
+        # empty-tank case never call the model or touch history. JARVIS is never
+        # metered — this whole block is is_alex()-guarded. See brain/credits.py.
+        from brain.product import is_alex
+        if is_alex():
+            from brain import credits
+            _stripped = (user_input or "").strip()
+            _low = _stripped.lower()
+            if _low.startswith("redeem "):
+                _ok, _msg, _bal = credits.redeem(_stripped.split(None, 1)[1])
+                yield _msg
+                return
+            if _low in ("credits", "balance", "credits left", "check credits",
+                        "how many credits", "how many credits do i have",
+                        "how many credits do i have left"):
+                yield f"You've got {credits.balance()} credits left."
+                return
+            if not credits.has_credit():
+                yield credits.out_of_credits_message()
+                return
+
         # Strip injected context prefixes before storing in history —
         # [WORK MODE — SCREEN: ...] blobs compound fast and blow up the context window.
         import re as _re
@@ -743,7 +768,15 @@ class Jarvis:
         if _USE_CLAUDE:
             # Silently extract memorable facts in background — no await, never blocks
             self._auto_remember(user_input)
-            yield from self._claude_chat()
+            if is_alex():
+                # Meter the turn on its ACTUAL measured cost, converted to credits.
+                # Runs once the consumer finishes streaming this turn's chunks.
+                _start_usd = _COST_TOTAL["usd"]
+                yield from self._claude_chat()
+                from brain import credits
+                credits.charge_usd(_COST_TOTAL["usd"] - _start_usd, reason="turn")
+            else:
+                yield from self._claude_chat()
         else:
             _lower_input = user_input.lower()
             # [STUDY] prompts — skip tools entirely
@@ -766,18 +799,12 @@ class Jarvis:
         """
         import random
         issues = issues or []
-        # Alex greets as a study partner, not JARVIS. Kept simple and warm — a
-        # student opening a homework app wants "what are we working on", not wit.
+        # Alex greets as a study partner, not JARVIS. The greeting pool lives in
+        # brain/alex.py so Alex's content isn't buried inside the JARVIS brain.
         from brain.product import is_alex
         if is_alex():
-            return random.choice([
-                "Hey! What are we working on today?",
-                "Alright, what subject are we tackling?",
-                "Ready when you are — what do you need help with?",
-                "What's on the homework list?",
-                "Let's get into it. What are we studying?",
-                "Hey — stuck on something, or want me to quiz you?",
-            ])
+            from brain.alex import STARTUP_GREETINGS
+            return random.choice(STARTUP_GREETINGS)
         if _USE_CLAUDE and getattr(self, "_claude", None):
             try:
                 angle = random.choice(_GREETING_ANGLES)

@@ -3,29 +3,60 @@ const { spawn }  = require('child_process')
 const path       = require('path')
 const net        = require('net')
 const fs         = require('fs')
+const os         = require('os')
+const { currentProduct } = require('./product')
 
+const PRODUCT    = currentProduct()          // JARVIS or Alex — from JARVIS_PRODUCT
 const PORT       = 8765
-const JARVIS_DIR = path.join(__dirname, '..')
+
+// Where the Python source lives. In dev it's the repo root; in a packaged app
+// electron-builder copies it to Resources/jarvis (see extraResources).
+const JARVIS_DIR = app.isPackaged
+  ? path.join(process.resourcesPath, 'jarvis')
+  : path.join(__dirname, '..')
 
 let mainWindow   = null
 let tray         = null
 let pyProcess    = null
 
+// ── Locate a Python interpreter ───────────────────────────────────────────────
+// Priority: bundled self-contained runtime → per-user venv this app created →
+// the dev repo venv → system python3. This lets one main.js work in dev AND in a
+// packaged, terminal-free install once a runtime is bundled/bootstrapped.
+
+function resolvePython () {
+  const candidates = [
+    // 1. Self-contained runtime shipped inside the app bundle
+    process.resourcesPath && path.join(process.resourcesPath, 'runtime', 'bin', 'python3'),
+    // 2. Per-user venv created on first launch (product-scoped)
+    path.join(os.homedir(), `.${PRODUCT.key}`, 'venv', 'bin', 'python'),
+    // 3. The developer venv in the repo
+    path.join(JARVIS_DIR, '.venv', 'bin', 'python'),
+  ].filter(Boolean)
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c
+  }
+  return 'python3'   // last resort — a system Python on PATH
+}
+
 // ── Spawn Python server ───────────────────────────────────────────────────────
 
 function startServer () {
-  const python = path.join(JARVIS_DIR, '.venv', 'bin', 'python')
+  const python = resolvePython()
   const script = path.join(JARVIS_DIR, 'server.py')
 
-  if (!fs.existsSync(python)) {
-    console.error('Python venv not found at', python)
+  if (!fs.existsSync(script)) {
+    console.error('Server script not found at', script)
     return
   }
+  console.log(`[py] launching ${PRODUCT.name} via ${python}`)
 
   pyProcess = spawn(python, [script], {
     cwd:   JARVIS_DIR,
     stdio: ['ignore', 'pipe', 'pipe'],
-    env:   { ...process.env, TK_SILENCE_DEPRECATION: '1' },
+    // JARVIS_PRODUCT is what selects the persona, tool whitelist and branding on
+    // the Python side — the single switch that makes this build Alex vs JARVIS.
+    env:   { ...process.env, TK_SILENCE_DEPRECATION: '1', JARVIS_PRODUCT: PRODUCT.key },
   })
 
   pyProcess.stdout.on('data', d => { process.stdout.write('[py] ' + d); _appendLog(d.toString()) })
@@ -103,12 +134,12 @@ function createTray () {
   )
   tray = new Tray(icon)
   const menu = Menu.buildFromTemplate([
-    { label: 'Show JARVIS',  click: () => mainWindow?.show() },
-    { label: 'Hide',         click: () => mainWindow?.hide() },
+    { label: `Show ${PRODUCT.name}`,  click: () => mainWindow?.show() },
+    { label: 'Hide',                  click: () => mainWindow?.hide() },
     { type: 'separator' },
-    { label: 'Quit JARVIS',  click: () => app.quit() },
+    { label: `Quit ${PRODUCT.name}`,  click: () => app.quit() },
   ])
-  tray.setToolTip('JARVIS')
+  tray.setToolTip(PRODUCT.name)
   tray.setContextMenu(menu)
   tray.on('click', () => {
     if (mainWindow) {
@@ -125,6 +156,8 @@ ipcMain.on('window-hide',     () => mainWindow?.hide())      // only for explici
 ipcMain.on('quit-app',        () => app.quit())
 ipcMain.handle('get-port',    () => PORT)
 ipcMain.handle('get-version', () => app.getVersion())
+ipcMain.handle('get-product', () => PRODUCT)   // {key,name,tagline,accent} for renderer branding
+ipcMain.on('get-product-sync', (e) => { e.returnValue = PRODUCT })  // sync: available before renderer scripts run
 
 // Last N kB of stdout/stderr from the Python child — kept in a ring buffer
 // so the user can hit "Send Logs" and we have something to give support.

@@ -1000,8 +1000,8 @@ function showBackendDownBanner () {
       <div class="bdb-shell">
         <div class="bdb-icon">⚠</div>
         <div class="bdb-body">
-          <div class="bdb-title">JARVIS server isn't responding.</div>
-          <div class="bdb-sub">The Python backend on port 8765 is down — the voice loop and chat won't work until it's back.</div>
+          <div class="bdb-title">${(window.PRODUCT && window.PRODUCT.name) || 'JARVIS'} isn't responding.</div>
+          <div class="bdb-sub">The backend on port 8765 is down — ${window.PRODUCT && window.PRODUCT.key === 'alex' ? 'answers and practice tests' : 'the voice loop and chat'} won't work until it's back.</div>
         </div>
         <button class="bdb-btn" id="bdb-retry">Retry now</button>
         <button class="bdb-btn ghost" id="bdb-relaunch">Relaunch app</button>
@@ -2248,7 +2248,14 @@ document.querySelectorAll('.chip').forEach(chip => {
 
 // ─── Placeholder rotation ────────────────────────────────────────────────────
 
-const HINTS = [
+const HINTS = (window.PRODUCT && window.PRODUCT.key === 'alex') ? [
+  'ASK ME ANYTHING...',
+  '"WHAT\'S THE ANSWER TO THIS?"',
+  '"HELP ME WITH THIS PROBLEM"',
+  '"MAKE ME A PRACTICE TEST"',
+  '"QUIZ ME ON PHOTOSYNTHESIS"',
+  '"HOW MANY CREDITS DO I HAVE"',
+] : [
   'INPUT COMMAND...',
   'SAY "HEY JARVIS" TO ACTIVATE...',
   '"PLAY MY GYM PLAYLIST"',
