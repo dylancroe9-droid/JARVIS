@@ -305,10 +305,10 @@ def _detect_cookie_banner(boxes: list[OCRBox], win: FocusedWindow) -> Optional[t
         return None
     # Prefer REJECT to honor privacy default
     for b in boxes:
-        if b.text.strip().lower() in _COOKIE_REJECTS and b.confidence > 0.5:
+        if b.text.strip().lower() in _COOKIE_REJECTS and b.confidence >= _MIN_OCR_CONF:
             return (b.cx, b.cy)
     for b in boxes:
-        if b.text.strip().lower() in _COOKIE_ACCEPTS and b.confidence > 0.5:
+        if b.text.strip().lower() in _COOKIE_ACCEPTS and b.confidence >= _MIN_OCR_CONF:
             return (b.cx, b.cy)
     return None
 
@@ -325,7 +325,7 @@ def _detect_still_watching(boxes: list[OCRBox], win: FocusedWindow) -> Optional[
     if not any(t in text_all for t in _STILL_WATCHING_TRIGGERS):
         return None
     for b in boxes:
-        if b.text.strip().lower() in _STILL_WATCHING_BUTTONS and b.confidence > 0.5:
+        if b.text.strip().lower() in _STILL_WATCHING_BUTTONS and b.confidence >= _MIN_OCR_CONF:
             return (b.cx, b.cy)
     return None
 
@@ -345,7 +345,7 @@ def _detect_macos_update(boxes: list[OCRBox], win: FocusedWindow) -> Optional[tu
     if hits < 2:
         return None
     for b in boxes:
-        if b.text.strip().lower() in _UPDATE_DISMISS and b.confidence > 0.5:
+        if b.text.strip().lower() in _UPDATE_DISMISS and b.confidence >= _MIN_OCR_CONF:
             return (b.cx, b.cy)
     return None
 

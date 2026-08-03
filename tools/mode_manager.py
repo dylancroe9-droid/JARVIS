@@ -39,8 +39,8 @@ except Exception:
 # Streaming / video — matched against the window TITLE (browsers) or app name.
 _WATCH_TITLE_HINTS = (
     "youtube", "netflix", "hulu", "peacock", "disney+", "disneyplus",
-    "hbo max", "max", "prime video", "paramount+", "crunchyroll", "twitch",
-    "apple tv", "espn", "- youtube", "vimeo", "plex",
+    "hbo max", "max.com", "prime video", "paramount+", "crunchyroll", "twitch",
+    "apple tv", "espn.com", "- youtube", "vimeo", "plex",
 )
 _WATCH_APPS = (
     "QuickTime Player", "VLC", "IINA", "TV", "Infuse", "Plex",
