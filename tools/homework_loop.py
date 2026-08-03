@@ -304,19 +304,20 @@ def _ask_vision(b64: str) -> Optional[dict]:
 
 
 def _click(x, y) -> None:
+    # Was import pyautogui (never installed), so the whole homework loop ran its
+    # vision pass and printed status but never actually clicked — a silent no-op,
+    # same class as the old click_screen bug. Route through the working Quartz path.
     try:
-        import pyautogui
-        pyautogui.FAILSAFE = False
-        pyautogui.click(int(x), int(y))
+        from tools.control_tools import click_screen
+        click_screen(int(x), int(y))
     except Exception as exc:
         print(f"[hw-loop] click error: {exc}")
 
 
 def _scroll_down(amount: int = 3) -> None:
     try:
-        import pyautogui
-        pyautogui.FAILSAFE = False
-        pyautogui.scroll(-amount * 100)
+        from tools.control_tools import scroll_screen
+        scroll_screen("down", amount)
     except Exception as exc:
         print(f"[hw-loop] scroll error: {exc}")
 

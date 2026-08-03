@@ -127,20 +127,43 @@ def _generate(topic: str, n: int, level: str) -> list:
     return _parse_questions(txt)
 
 
+def _extract_answer_letter(said: str):
+    """
+    Pull the verifier's CHOSEN letter out of its reply.
+
+    Taking the first standalone A/B/C/D is wrong: a verifier that reasons aloud
+    ("A is tempting, but the answer is B") gets read as A, so a wrong key is kept or
+    a right one dropped — which silently breaks the whole "answer keys verified"
+    guarantee. An explicit declaration wins; otherwise the LAST standalone letter,
+    since the conclusion comes at the end.
+    """
+    if not said:
+        return None
+    decl = re.findall(
+        r"(?:answer|correct|it'?s|choose|choice|pick|go(?:ing)? with)\D{0,15}\b([ABCD])\b",
+        said, re.I)
+    if decl:
+        return decl[-1].upper()
+    letters = re.findall(r"\b([ABCD])\b", said)
+    return letters[-1].upper() if letters else None
+
+
 def _verify(questions: list) -> tuple:
     """Re-solve each question blind and drop any whose key doesn't hold up."""
     client, model = _claude()
     kept, dropped = [], 0
     for q in questions:
         try:
+            # Thinking off + tiny cap so it emits just the letter — no reasoning to
+            # misparse. The extractor is a backstop for models that add a word anyway.
             r = client.messages.create(
-                model=model, max_tokens=1500,
+                model=model, max_tokens=16,
+                thinking={"type": "disabled"},
                 messages=[{"role": "user", "content": _VERIFY_PROMPT.format(
                     stem=q["question"], **q["choices"])}],
             )
             said = "".join(b.text for b in r.content if b.type == "text")
-            m = re.search(r"\b([ABCD])\b", said)
-            if m and m.group(1) == q["answer"]:
+            if _extract_answer_letter(said) == q["answer"]:
                 kept.append(q)
             else:
                 dropped += 1

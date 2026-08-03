@@ -27,12 +27,6 @@ _NO_QUARTZ = ("Quartz unavailable — reinstall deps: "
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _gui():
-    import pyautogui
-    pyautogui.FAILSAFE = False
-    return pyautogui
-
-
 def _post(evt_type, x: float, y: float, button=None, clicks: int = 1) -> None:
     """Post one mouse event at (x, y), optionally tagged with a click count."""
     btn = Quartz.kCGMouseButtonLeft if button is None else button
@@ -107,50 +101,44 @@ def scroll_screen(direction: str = "down", amount: int = 3) -> str:
 
 def type_text(text: str) -> str:
     """
-    Type text at the current cursor position.
-    Uses clipboard paste so all characters (including emoji, unicode) work.
+    Type text at the current cursor position via clipboard paste, so ALL characters
+    work — emoji, accents, curly quotes, symbols.
+
+    The old path did `import pyautogui`, which is not installed, so it ALWAYS fell
+    through to an ASCII-only AppleScript keystroke and silently dropped any unicode —
+    and it returned "Typed text." even when the keystroke failed. This does the paste
+    with Cmd+V through System Events (the clipboard holds the unicode, so the paste is
+    encoding-clean) and checks the real return code.
     """
+    if not text:
+        return "Nothing to type."
+    # Save the current clipboard so we can restore it after.
     try:
-        import pyautogui as pg
-        pg.FAILSAFE = False
-
-        # Save current clipboard so we can restore it after the paste
-        try:
-            old = subprocess.check_output(["pbpaste"]).decode("utf-8", errors="replace")
-        except Exception:
-            old = ""
-
-        # try/finally guarantees the clipboard restore runs even if pyautogui
-        # raises (previous code lost the user's clipboard data on any hotkey
-        # failure between the load and the restore).
-        try:
-            # Load new text into clipboard
-            p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-            p.communicate(text.encode("utf-8"))
-            time.sleep(0.05)
-
-            # Paste
-            pg.hotkey("command", "v")
-            time.sleep(0.15)
-            return "Typed text."
-        finally:
-            # Restore old clipboard — best effort, never raises out of finally
-            try:
-                p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-                p.communicate(old.encode("utf-8"))
-            except Exception:
-                pass
-    except ImportError:
-        # Fallback: AppleScript (ASCII only)
-        escaped = text.replace("\\", "\\\\").replace('"', '\\"')
-        subprocess.run(
+        old = subprocess.check_output(["pbpaste"], timeout=5).decode("utf-8", errors="replace")
+    except Exception:
+        old = ""
+    try:
+        p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+        p.communicate(text.encode("utf-8"), timeout=5)
+        time.sleep(0.05)
+        r = subprocess.run(
             ["osascript", "-e",
-             f'tell application "System Events" to keystroke "{escaped}"'],
-            capture_output=True,
+             'tell application "System Events" to keystroke "v" using command down'],
+            capture_output=True, text=True, timeout=10,
         )
-        return "Typed text."
+        if r.returncode != 0:
+            return f"Type failed: {(r.stderr or '').strip()[:120]}"
+        time.sleep(0.12)
+        return "Typed it."
     except Exception as exc:
         return f"Type failed: {exc}"
+    finally:
+        # Restore the clipboard — best effort, never raises out of finally.
+        try:
+            p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+            p.communicate(old.encode("utf-8"), timeout=5)
+        except Exception:
+            pass
 
 
 def press_key(keys: str) -> str:
