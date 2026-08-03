@@ -82,6 +82,7 @@ _state    = "idle"
 _study_mode = False
 _pending_confirms: dict[str, list] = {}   # id → [threading.Event, approved: bool]
 _last_reply: str = ""                      # JARVIS's most recent spoken response
+_last_tts_active_at: float = 0.0           # last time afplay was seen mid-playback
 _camera_frames: dict[str, list] = {}      # id → [threading.Event, image_b64 | None]
 
 # ── System component status — updated by the Electron renderer + health checks ──
@@ -798,8 +799,11 @@ def _is_echo(text: str) -> bool:
       3. Recent reply exists + heavy word overlap (>45%) → echo.
     """
     # Most reliable guard: if afplay is mid-playback, this is JARVIS.
+    import time as _t
+    global _last_tts_active_at
     try:
         if speaker._play_proc is not None and speaker._play_proc.poll() is None:
+            _last_tts_active_at = _t.time()
             return True
     except Exception:
         pass
@@ -807,9 +811,14 @@ def _is_echo(text: str) -> bool:
     if not _last_reply or not text:
         return False
     words = text.split()
-    # Very short utterances after speaking are almost always mic artifacts
+    # Very short utterances are treated as mic bleed ONLY for a moment after JARVIS
+    # actually finished speaking. This used to drop EVERY sub-3-word utterance
+    # whenever _last_reply was non-empty — and _last_reply is set at the startup
+    # greeting and effectively never cleared, so "open Spotify" / "go back" / "stop"
+    # / "next" were dropped as echo permanently. Bounding it to ~2s after real
+    # playback catches the tail bleed without deafening JARVIS to short commands.
     if len(words) < 3:
-        return True
+        return (_t.time() - _last_tts_active_at) < 2.0
     t_words = set(text.lower().split())
     r_words = set(_last_reply.lower().split())
     if not r_words:
