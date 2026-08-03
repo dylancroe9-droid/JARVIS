@@ -54,25 +54,25 @@ _TOOL_SEARCH_BETA = "advanced-tool-use-2025-11-20"
 # cannot retrieve it — measured 1/6 deferred vs 6/6 resident, with no reflexive
 # screenshots on plain conversation (6/6 clean).
 # Tools resident on EVERY turn, in every mode. Keep this tiny — each one is billed
-# on every single request. set_listening is here because a type-first user needs
-# "mute the mic" to work instantly in any mode; deferred, Claude never searched for
-# it and instead confabulated a FALSE denial ("I can't mute the mic") — the exact
-# room-audio misconception this feature fixes.
-_BASE_TOOL_NAMES = {"play_music", "pause_music", "set_mode", "set_listening"}
+# on every single request.
+#
+# set_listening: a type-first user needs "mute the mic" instantly in any mode.
+# create_practice_test / show_test_answers: "quiz me on X" is unambiguous and never
+#   misfires, so — unlike take_screenshot — these are safe to keep always-on, which
+#   lets JARVIS do everything Alex can (make a verified practice test on command)
+#   from any mode, not only study mode. Deferred, Claude just typed questions into
+#   chat instead of building a real test (measured 0 tool calls).
+_BASE_TOOL_NAMES = {"play_music", "pause_music", "set_mode", "set_listening",
+                    "create_practice_test", "show_test_answers"}
 
-# Schoolwork tools. Resident only in STUDY mode.
+# Schoolwork tools resident ONLY in study mode.
 #
-# They have to be resident to work at all: a deferred tool is only used if Claude
-# thinks to SEARCH for it, and both of these cover things he can fake from memory
-# — he'll type quiz questions into chat, or answer "what do I do?" as life advice
-# without ever looking at the screen. Measured 0 tool calls when deferred.
-#
-# But resident everywhere is wrong too. take_screenshot is deliberately tuned to
-# treat a dangling "this"/"that" as a screen reference, which is right when Dylan
-# is on a problem set and wrong the rest of the time — asking "what do I do?" while
-# browsing should not silently screenshot his desktop. Gating on mode is what keeps
-# homework behaviour inside homework.
-_STUDY_TOOL_NAMES = {"take_screenshot", "create_practice_test", "show_test_answers"}
+# take_screenshot is deliberately tuned to treat a dangling "this"/"that" as a
+# screen reference — right when Dylan is on a problem set, wrong the rest of the
+# time (asking "what do I do?" while browsing must not silently screenshot his
+# desktop). That is the one that leaks, so it stays mode-gated. The practice-test
+# tools moved to BASE above because they never leak.
+_STUDY_TOOL_NAMES = {"take_screenshot"}
 
 _CORE_TOOL_NAMES = _BASE_TOOL_NAMES | _STUDY_TOOL_NAMES
 

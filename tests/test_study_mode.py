@@ -53,9 +53,20 @@ class TestToolGating:
         assert _search_tools(TOOL_DEFINITIONS, "normal") == _search_tools(TOOL_DEFINITIONS, "normal")
 
     def test_resident_set_stays_small_in_both_modes(self):
-        # Every resident tool is billed on every turn.
-        assert len(_resident("normal")) <= 6
+        # Every resident tool is billed on every turn. normal = 6 base tools +
+        # the search tool; study adds take_screenshot. Practice-test tools are
+        # in base now (they never leak, and it lets JARVIS do everything Alex can).
+        assert len(_resident("normal")) <= 8
         assert len(_resident("study")) <= 9
+
+    def test_practice_tests_available_in_every_mode(self):
+        # "quiz me" must work from any mode — it's unambiguous and never misfires,
+        # so it isn't gated like take_screenshot. This is what lets JARVIS match
+        # Alex's practice-test capability everywhere.
+        for mode in ("normal", "study", "watch", "gaming", "work"):
+            res = _resident(mode)
+            assert "create_practice_test" in res, mode
+            assert "show_test_answers" in res, mode
 
 
 class TestModeBehaviour:
