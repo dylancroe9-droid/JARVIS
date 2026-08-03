@@ -1426,6 +1426,24 @@ class Jarvis:
             else:
                 out.append({"role": role, "content": str(content) if content else ""})
 
+        # Boundary guard — the single biggest daily-chat hazard.
+        #
+        # The history trim (self.messages[-40:]) is blind, so it can leave the window
+        # starting on an assistant message, or on a user message whose content is an
+        # orphan tool_result (its parent tool_use fell out of the window). Claude 400s
+        # on either ("first message must use the user role" / "tool_result without
+        # tool_use"), and because the trim keeps landing there, EVERY following turn
+        # 400s too — silently dropping Dylan to the weaker Groq model, or losing the
+        # turn. It fires in plain conversation with no tools involved. Drop leading
+        # messages until the window begins on a real user turn.
+        def _is_orphan_tool_result(msg) -> bool:
+            c = msg.get("content")
+            return (isinstance(c, list) and any(
+                isinstance(b, dict) and b.get("type") == "tool_result" for b in c))
+
+        while out and (out[0]["role"] != "user" or _is_orphan_tool_result(out[0])):
+            out.pop(0)
+
         # Cache the conversation too, not just the prompt.  History runs ~3.8k tokens
         # and was billed in full every turn — more than the character prompt costs once
         # that one is cached.  The breakpoint goes on the message's real content and
