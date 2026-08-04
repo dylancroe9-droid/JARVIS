@@ -63,16 +63,21 @@ _TOOL_SEARCH_BETA = "advanced-tool-use-2025-11-20"
 #   from any mode, not only study mode. Deferred, Claude just typed questions into
 #   chat instead of building a real test (measured 0 tool calls).
 _BASE_TOOL_NAMES = {"play_music", "pause_music", "set_mode", "set_listening",
-                    "create_practice_test", "show_test_answers"}
+                    "create_practice_test", "show_test_answers",
+                    # take_screenshot is resident everywhere. Gating it to study
+                    # mode broke the core feature: "look at my screen and do this"
+                    # outside study mode found the tool not even loaded, so JARVIS
+                    # couldn't see the screen at all. The tool DESCRIPTION already
+                    # does the discrimination (fire on a real screen reference /
+                    # dangling "this"; ignore casual conversation — measured 6/6
+                    # homework, 6/6 no-false-fire), so mode-gating only removed the
+                    # ability, it didn't add safety.
+                    "take_screenshot"}
 
-# Schoolwork tools resident ONLY in study mode.
-#
-# take_screenshot is deliberately tuned to treat a dangling "this"/"that" as a
-# screen reference — right when Dylan is on a problem set, wrong the rest of the
-# time (asking "what do I do?" while browsing must not silently screenshot his
-# desktop). That is the one that leaks, so it stays mode-gated. The practice-test
-# tools moved to BASE above because they never leak.
-_STUDY_TOOL_NAMES = {"take_screenshot"}
+# Nothing is study-mode-exclusive anymore — the tools that matter are all in BASE,
+# and their descriptions control WHEN they fire. Study mode still exists as a
+# focus/persona mode, it just no longer gates tool availability.
+_STUDY_TOOL_NAMES: set = set()
 
 _CORE_TOOL_NAMES = _BASE_TOOL_NAMES | _STUDY_TOOL_NAMES
 

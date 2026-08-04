@@ -13,6 +13,7 @@ Having one stream eliminates the double-stream conflicts that plagued the old de
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 from typing import Callable, Optional
@@ -239,7 +240,13 @@ class AudioEngine:
         # fully running, so "muted" audio was still transcribed and could still
         # fire commands (this is what let it act on the TV). Typed input is
         # unaffected: it never touches this path.
-        self._muted    = False
+        # Start MUTED by default. Dylan is text-first (types with AirPods in, often
+        # with a video playing), and an always-on mic in that setting is pure
+        # downside — it grabbed room audio and fired spurious mode switches and
+        # refusal cards. Typed input and spoken replies work fully while muted; he
+        # types/says "start listening" (set_listening) to turn voice on when he
+        # actually wants it. JARVIS_START_MUTED=0 boots with the mic live.
+        self._muted    = os.getenv("JARVIS_START_MUTED", "1") != "0"
 
         global _active_engine
         _active_engine = self          # so tools can reach the live mic (get_engine)

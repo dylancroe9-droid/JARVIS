@@ -32,11 +32,14 @@ class TestToolGating:
         for name in _STUDY_TOOL_NAMES:
             assert name in res, f"{name} must be loaded in study mode"
 
-    def test_screenshot_is_the_one_that_matters(self):
-        # This is the specific leak: a casual "what do I do?" on the desktop.
-        assert "take_screenshot" in _resident("study")
-        assert "take_screenshot" not in _resident("normal")
-        assert "take_screenshot" not in _resident("watch")
+    def test_screenshot_is_available_in_every_mode(self):
+        # take_screenshot is resident everywhere. Gating it to study mode broke the
+        # core feature — "look at my screen and do this" outside study mode found
+        # the tool not even loaded, so JARVIS couldn't see the screen at all. WHEN
+        # it fires is controlled by the tool description (dangling reference = look;
+        # casual chat = don't), not by which mode you're in.
+        for mode in ("normal", "study", "watch", "work"):
+            assert "take_screenshot" in _resident(mode), mode
 
     def test_base_tools_survive_every_mode(self):
         for mode in ("normal", "study", "watch", "gaming", "work"):
