@@ -326,14 +326,12 @@ _BLUEPRINT_TRIGGER_PHRASES = frozenset({
     
     
     
-    # Pull up / bring up
-    "pull up the ", "pull up a ", "pull up an ",
-    
-    
-    # Display / render / visualize
-    
-    "render the ", "render a ", "render an ",
-    "visualize the ", "visualize a ",
+    # NOTE — deliberately NOT here: "pull up a/the/an", "render a/the/an",
+    # "visualize a/the". These match ordinary requests — "pull up a picture of a
+    # peach", "pull up my email", "render a preview" — and forcing show_overlay
+    # turned "pull up a picture" into a hologram. A specific noun below ("the
+    # bugatti", "the f-22") carries the real blueprint signal, so "pull up the
+    # Bugatti" still works without hijacking every "pull up" in English.
     
     # Blueprint / specs explicit — "blueprint the/a/an/of/for/on X"
     "blueprint the ", "blueprint a ", "blueprint an ",
