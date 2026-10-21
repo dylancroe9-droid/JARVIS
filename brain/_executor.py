@@ -14,6 +14,17 @@ console = Console()
 class ToolsExecutor:
     """Dispatches tool calls by name and returns string results."""
 
+    # ── Self-inspect rate limiting ──────────────────────────────────────────
+    # Hard cap on how many self-inspect tool calls one conversational turn
+    # can make. Prevents a runaway loop where JARVIS keeps grepping his own
+    # code without converging on an answer. brain/jarvis.py calls
+    # reset_self_inspect_counter() at the start of each turn.
+    _SELF_INSPECT_TOOL_NAMES = {
+        "read_my_code", "search_my_code", "list_my_files",
+        "read_my_logs", "read_my_history", "get_last_diagnostic_findings",
+    }
+    SELF_INSPECT_PER_TURN_CAP = 6
+
     def __init__(self):
         # Set by server.py so show_overlay can broadcast to the Electron frontend
         self.broadcast_callback = None
@@ -23,7 +34,32 @@ class ToolsExecutor:
         self.computer_agent_callback = None
         # Set to True when a media action runs (YouTube, open_url, open_application).
         # server.py checks this and uses detecting mode so video audio isn't captured.
+        # Reads/writes happen from multiple threads — use `consume_media_opened`
+        # for the atomic test-and-clear that server.py needs (see below).
+        import threading as _threading
+        self._media_lock = _threading.Lock()
         self.media_opened = False
+        # Per-turn counter for self-inspect tool calls
+        self._self_inspect_count = 0
+
+    def consume_media_opened(self) -> bool:
+        """
+        Atomic test-and-clear for `media_opened`. server.py was previously
+        doing `if exec.media_opened: exec.media_opened = False` — a classic
+        TOCTOU. If a tool thread sets the flag between the read and the
+        write, we lose the new media event. This method holds an internal
+        lock so the read and clear can't be interleaved.
+
+        Returns the value the flag had at the moment it was cleared.
+        """
+        with self._media_lock:
+            was_opened = self.media_opened
+            self.media_opened = False
+        return was_opened
+
+    def reset_self_inspect_counter(self) -> None:
+        """Called at the start of each conversational turn from brain/jarvis.py."""
+        self._self_inspect_count = 0
 
     def _ca(self, action: str, detail: str = "") -> None:
         """Broadcast a computer-agent action event to the HUD (best-effort)."""
@@ -34,6 +70,20 @@ class ToolsExecutor:
                 pass
 
     def execute(self, name: str, args: dict) -> str:
+        # Audit + rate-limit self-inspect calls so JARVIS can't grep himself
+        # into an infinite loop. Both branches print to stdout so the audit
+        # trail flows into /tmp/jarvis_server.log via start.sh's tee.
+        if name in self._SELF_INSPECT_TOOL_NAMES:
+            self._self_inspect_count += 1
+            if self._self_inspect_count > self.SELF_INSPECT_PER_TURN_CAP:
+                print(f"[self-inspect-cap] DENIED {name} — cap of "
+                      f"{self.SELF_INSPECT_PER_TURN_CAP}/turn reached", flush=True)
+                return (f"__self_inspect_cap__: I've already inspected my own "
+                        f"state {self._self_inspect_count - 1} times this turn — "
+                        f"answer with what you have instead of another lookup.")
+            print(f"[self-inspect] #{self._self_inspect_count} {name}("
+                  f"{', '.join(f'{k}={v!r}' for k, v in args.items())[:200]})",
+                  flush=True)
         try:
             return self._dispatch(name, args)
         except Exception as exc:
@@ -46,6 +96,13 @@ class ToolsExecutor:
             except ImportError as exc:
                 return f"Calendar tool unavailable: {exc}"
             return get_calendar_events(days=args.get("days", 7))
+
+        elif name == "read_calendar_visually":
+            try:
+                from tools.calendar_tool import read_calendar_visually
+            except ImportError as exc:
+                return f"Visual calendar reader unavailable: {exc}"
+            return read_calendar_visually(question=args.get("question", ""))
 
         elif name == "create_calendar_event":
             try:
@@ -130,7 +187,7 @@ class ToolsExecutor:
                 return f"edit_file error: {exc}"
 
         elif name == "grep_code":
-            import subprocess, shlex
+            import subprocess
             pattern   = args["pattern"]
             path      = args.get("path", JARVIS_DIR)
             max_lines = int(args.get("max_lines", 40))
@@ -159,6 +216,76 @@ class ToolsExecutor:
                 path=args.get("path"),
                 show_hidden=args.get("show_hidden", False),
             )
+
+        # ── Self-inspection — read own code, logs, history ───────────────
+        elif name == "read_my_code":
+            try:
+                from tools.self_inspect import read_jarvis_file
+            except ImportError as exc:
+                return f"Self-inspect unavailable: {exc}"
+            return read_jarvis_file(path=args.get("path", ""))
+
+        elif name == "search_my_code":
+            try:
+                from tools.self_inspect import grep_jarvis
+            except ImportError as exc:
+                return f"Self-inspect unavailable: {exc}"
+            return grep_jarvis(
+                pattern=args.get("pattern", ""),
+                file_glob=args.get("file_glob", "**/*.py"),
+                max_results=int(args.get("max_results", 30)),
+            )
+
+        elif name == "list_my_files":
+            try:
+                from tools.self_inspect import list_jarvis_dir
+            except ImportError as exc:
+                return f"Self-inspect unavailable: {exc}"
+            return list_jarvis_dir(path=args.get("path", "."))
+
+        elif name == "read_my_logs":
+            try:
+                from tools.self_inspect import read_jarvis_log
+            except ImportError as exc:
+                return f"Self-inspect unavailable: {exc}"
+            return read_jarvis_log(lines=int(args.get("lines", 100)))
+
+        elif name == "read_my_history":
+            try:
+                from tools.self_inspect import read_jarvis_history
+            except ImportError as exc:
+                return f"Self-inspect unavailable: {exc}"
+            return read_jarvis_history(max_turns=int(args.get("max_turns", 20)))
+
+        elif name == "get_last_diagnostic_findings":
+            try:
+                from tools.diagnostics import get_last_investigations
+            except ImportError as exc:
+                return f"Diagnostics unavailable: {exc}"
+            findings = get_last_investigations()
+            if not findings:
+                return ("No recent diagnostic findings — either no diagnostic "
+                        "has been run yet this session, or every check passed.")
+            target = args.get("check_name", "").strip()
+            if target:
+                if target not in findings:
+                    return f"No findings recorded for check '{target}'. Available: {list(findings.keys())}"
+                f = findings[target]
+                out = [f"# Investigation: {f['label']} ({f['check']})", f"Summary: {f['summary']}"]
+                if f['log_matches']:
+                    out.append("Related log lines:")
+                    out.extend(f"  {ln}" for ln in f['log_matches'])
+                if f['source_files']:
+                    out.append("Relevant source files (use read_my_code):")
+                    out.extend(f"  {p}" for p in f['source_files'])
+                return "\n".join(out)
+            # All findings — compact summary so the brain can decide where to dig
+            out = [f"# {len(findings)} diagnostic finding(s) from the last run:"]
+            for name_, f in findings.items():
+                out.append(f"- {f['label']} ({name_}): {f['summary']}  "
+                           f"[{len(f['log_matches'])} log line(s), "
+                           f"{len(f['source_files'])} source file(s)]")
+            return "\n".join(out)
 
         elif name == "search_files":
             try:
@@ -578,9 +705,45 @@ class ToolsExecutor:
             if args.get("for_control"):
                 self._ca("screenshot", "Scanning screen…")
             try:
-                from tools.screen_tool import take_screenshot
+                from tools.screen_tool import take_screenshot, capture_screen_png_b64
             except ImportError as exc:
                 return f"Screen tool unavailable: {exc}"
+            # On the Claude brain, give Claude the ACTUAL screenshot so it reads the
+            # screen with its own vision — far more reliable for math, diagrams, code,
+            # and fine text than the Groq vision model's text description. Returns
+            # Anthropic content blocks; _claude_chat forwards them into the tool result.
+            try:
+                from brain.jarvis import _USE_CLAUDE
+            except Exception:
+                _USE_CLAUDE = False
+            if _USE_CLAUDE:
+                _for_control = bool(args.get("for_control"))
+                b64, sw, sh = capture_screen_png_b64(for_control=_for_control)
+                if b64:
+                    q = (args.get("question") or "").strip() or \
+                        "Read exactly what's on Dylan's screen and answer his request precisely."
+                    if _for_control:
+                        # for_control used to skip Claude's vision entirely and hand
+                        # back Groq's TEXT description of the screen — so the one mode
+                        # meant for clicking was the one where Claude couldn't see, and
+                        # it had no real coordinates to click. Give it the actual image
+                        # at exact screen dimensions so it can read off pixel positions.
+                        note = (
+                            f"[Screenshot of Dylan's screen, EXACTLY {sw}x{sh} pixels, "
+                            f"matching the screen's coordinate space 1:1. {q} "
+                            f"To act on something, report its CENTER as (x, y) with "
+                            f"x in 0-{sw} and y in 0-{sh}, and pass those straight to "
+                            f"click_screen. Read the real text; do not guess.]"
+                        )
+                    else:
+                        note = (f"[Screenshot of Dylan's screen — {q} "
+                                "Read the real numbers/text; do not guess.]")
+                    return [
+                        {"type": "image", "source": {"type": "base64",
+                         "media_type": "image/png", "data": b64}},
+                        {"type": "text", "text": note},
+                    ]
+                # capture failed → fall through to the text/permission path
             return take_screenshot(
                 question=args.get("question", ""),
                 for_control=args.get("for_control", False),
@@ -798,6 +961,109 @@ class ToolsExecutor:
             from tools.smart_tools import set_focus_mode
             return set_focus_mode(enabled=args["enabled"], minutes=args.get("minutes", 0))
 
+        elif name == "set_mode":
+            # Switch JARVIS's own HUD/attention mode via the ModeManager, which
+            # fires the server's _on_mode_change (HUD + notifications + brain
+            # self-awareness). This is what lets the AI change modes from INTENT
+            # instead of the hard-coded phrase list.
+            from tools.mode_manager import get_manager
+            from brain.product import is_alex
+            _alex = is_alex()
+            mgr = get_manager()
+            mode = (args.get("mode") or "").strip().lower()
+            if mgr is None:
+                return "Mode manager isn't running."
+            if mode == "auto_on":
+                mgr.set_auto(True)
+                return ("Okay, I'll follow along as your screen changes."
+                        if _alex else "Auto mode on — I'll adjust as your screen changes, sir.")
+            if mode == "auto_off":
+                mgr.set_auto(False)
+                return "Okay, I'll stay put." if _alex else "Auto mode off, sir."
+            if mode == "normal":
+                mgr.exit_forced()
+                return "Okay." if _alex else "Back to normal, sir."
+            if mode == "study":
+                # Entering study is what LOADS the schoolwork tools — outside this
+                # mode take_screenshot and the practice-test tools aren't even sent
+                # to the model, so homework behaviour can't leak into ordinary
+                # desktop use. (Alex is locked to study anyway — see get_current_mode.)
+                mgr.force(mode)
+                if _alex:
+                    return ("Study mode — just show me a problem on your screen, or ask me "
+                            "to make you a practice test.")
+                return ("Study mode, sir. Screen's mine when you need a problem read, "
+                        "and I can build you a practice test on anything.")
+            if mode in ("gaming", "work", "watch"):
+                mgr.force(mode)
+                return f"{mode.title()} mode." if _alex else f"{mode.title()} mode, sir."
+            return f"I don't have a '{mode}' mode."
+
+        elif name == "widget_control":
+            # Push a show/hide/reset command to the HUD dashboard (widgets.js).
+            action = (args.get("action") or "show").lower()
+            widget = (args.get("widget") or "").lower().strip()
+            if self.broadcast_callback:
+                self.broadcast_callback({"type": "widget_control",
+                                         "action": action, "widget": widget})
+            if action == "reset":
+                return "Everything's back in its place, sir."
+            verb = {"show": "Pulled up", "hide": "Cleared", "toggle": "Toggled"}.get(action, "Done")
+            return f"{verb} the {widget}, sir." if widget else f"{verb} that, sir."
+
+        elif name == "get_stock_price":
+            from tools.live_data import get_stock_price
+            return get_stock_price(args.get("symbol", ""))
+
+        elif name == "get_crypto_price":
+            from tools.live_data import get_crypto_price
+            return get_crypto_price(args.get("coin", ""))
+
+        elif name == "get_sports_scores":
+            from tools.live_data import get_sports_scores
+            return get_sports_scores(args.get("query", ""))
+
+        elif name == "read_document":
+            from tools.mac_extras import read_document
+            return read_document(args.get("path", ""))
+
+        elif name == "convert_image":
+            from tools.mac_extras import convert_image
+            return convert_image(args.get("path", ""), args.get("to_format", "png"))
+
+        elif name == "facetime_call":
+            from tools.mac_extras import facetime_call
+            return facetime_call(args.get("target", ""))
+
+        elif name == "get_directions":
+            from tools.mac_extras import get_directions
+            return get_directions(args.get("destination", ""), args.get("origin", ""))
+
+        elif name == "empty_trash":
+            from tools.mac_extras import empty_trash
+            return empty_trash()
+
+        elif name == "health_reminders":
+            from tools.health_nudges import health_reminders
+            return health_reminders(args.get("action", "start"),
+                                    args.get("kind", ""), args.get("interval_min", 30))
+
+        elif name == "watch_movie":
+            # Movie concierge: find where the title streams (prioritising Dylan's OWN
+            # subscriptions) and open it in his logged-in Chrome. Also drops JARVIS into
+            # watch mode so the HUD gets out of the way while it plays.
+            from tools.streaming import watch
+            title = (args.get("title") or "").strip()
+            and_play = bool(args.get("and_play", False))
+            try:
+                from tools.mode_manager import get_manager
+                mgr = get_manager()
+                if mgr is not None:
+                    mgr.force("watch")
+            except Exception:
+                pass
+            return watch(title, and_play)
+
         elif name == "random_number":
             from tools.smart_tools import random_number
             return random_number(min_val=args.get("min_val", 1), max_val=args.get("max_val", 100))
@@ -878,8 +1144,11 @@ class ToolsExecutor:
                         }],
                     )
                     return resp.content[0].text
-            except Exception:
-                pass
+            except Exception as _claude_exc:
+                # Fall back to Groq vision — but log WHY Claude failed so a
+                # real problem (bad key, network, quota) isn't invisible.
+                print(f"[vision] Claude vision failed, falling back to Groq: "
+                      f"{type(_claude_exc).__name__}: {_claude_exc}", flush=True)
 
             # Groq vision fallback
             try:
@@ -938,8 +1207,11 @@ class ToolsExecutor:
                     if not is_ar_mode():
                         set_ar_mode(True)
                         self.broadcast_callback({"type": "ar_mode_enter"})
-                except Exception:
-                    pass
+                except Exception as _ar_exc:
+                    # Best-effort auto-enter — the scene still broadcasts below.
+                    # Log so a persistent failure to enter AR mode is visible.
+                    print(f"[ar] auto-enter failed (scene still shown): "
+                          f"{type(_ar_exc).__name__}: {_ar_exc}", flush=True)
                 self.broadcast_callback({"type": "ar_scene_update", "scene": scene})
             return result
 
@@ -965,6 +1237,41 @@ class ToolsExecutor:
             return (
                 f"Here's your {title}. Click any card to hear it."
             )
+
+        # ── Mic / listening ──────────────────────────────────────────────
+        elif name == "set_listening":
+            try:
+                from voice.audio_engine import get_engine
+            except ImportError as exc:
+                return f"Mic control unavailable: {exc}"
+            eng = get_engine()
+            if eng is None:
+                return "Voice isn't running, so there's no mic to toggle."
+            on = bool(args.get("on"))
+            if on:
+                eng.unmute_mic()
+                return "Listening again."
+            eng.mute_mic()
+            return "Mic's off — I'll still answer whatever you type, out loud."
+
+        # ── Practice tests ───────────────────────────────────────────────
+        elif name == "create_practice_test":
+            try:
+                from tools.practice_test import create_practice_test
+            except ImportError as exc:
+                return f"Practice test tool unavailable: {exc}"
+            return create_practice_test(
+                topic=args.get("topic", ""),
+                count=args.get("count", 8),
+                difficulty=args.get("difficulty", "AP level"),
+            )
+
+        elif name == "show_test_answers":
+            try:
+                from tools.practice_test import show_test_answers
+            except ImportError as exc:
+                return f"Practice test tool unavailable: {exc}"
+            return show_test_answers()
 
         else:
             return f"Unknown tool: {name}"

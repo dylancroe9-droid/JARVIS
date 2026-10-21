@@ -4,8 +4,6 @@ File system tools: read, write, list, search, and scaffold projects.
 
 import glob as glob_module
 import os
-import shutil
-import stat
 from pathlib import Path
 from typing import Optional
 
@@ -55,7 +53,6 @@ def read_file(path: str) -> str:
 def write_file(path: str, content: str, append: bool = False) -> str:
     full = _resolve(path)
     from tools.permissions import request
-    action_word = "append to" if append else "write to"
     if not request(f"Write to {full}?"):
         return "Permission denied."
     os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
@@ -232,8 +229,20 @@ def create_project(
         f.write(_GITIGNORE.get(project_type, _GITIGNORE["general"]))
     created.append(".gitignore")
 
-    # Init git
-    os.system(f"git -C {project_dir!r} init -q 2>/dev/null")
+    # Init git — list-form subprocess so the shell never gets to interpret
+    # `project_dir`. The previous `os.system(f"git -C {project_dir!r}…")`
+    # used `!r` to repr-quote but still went through a shell, leaving room
+    # for surprises with quirky characters in the path.
+    import subprocess as _sp
+    try:
+        _sp.run(
+            ["git", "-C", project_dir, "init", "-q"],
+            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, timeout=10,
+        )
+    except Exception as exc:
+        # Non-fatal — project files were created; git init failure is
+        # surfaced in the message below but doesn't break the function.
+        print(f"[create_project] git init failed: {exc}", flush=True)
 
     lines = [
         f"Project '{name}' created at {project_dir}",
@@ -313,7 +322,6 @@ def create_spreadsheet(
 
         out_path = dest_dir / f"{name_no_ext}.xlsx"
         wb.save(str(out_path))
-        ext = ".xlsx"
     except ImportError:
         # openpyxl not available — write CSV
         import csv
@@ -322,7 +330,6 @@ def create_spreadsheet(
             writer = csv.writer(f)
             writer.writerow(headers)
             writer.writerows(rows)
-        ext = ".csv"
 
     if open_after:
         subprocess.Popen(["open", str(out_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -339,6 +346,43 @@ def create_spreadsheet(
 # --------------------------------------------------------------------------- #
 # File management (find / delete / count by pattern + age)                     #
 # --------------------------------------------------------------------------- #
+
+def _fs_id(p: Path):
+    """(device, inode) identity of a path, or None if it can't be stat'd."""
+    try:
+        st = p.stat()
+        return (st.st_dev, st.st_ino)
+    except OSError:
+        return None
+
+
+def _refuse_delete_scope(dir_path: Path) -> Optional[str]:
+    """
+    Return a refusal message if `dir_path` is too dangerous to bulk-delete from
+    (the home directory itself, the filesystem root, or a parent of home), else
+    None.
+
+    Compares by FILESYSTEM IDENTITY (device + inode), NOT by resolved-path
+    string. macOS's default filesystem is case-INSENSITIVE, and Path.resolve()
+    does not case-fold — so a string compare let 'directory="/USERS/DYLANROE"'
+    slip past the home check while rglob still walked the real home dir. Inode
+    identity is case- and symlink-proof.
+    """
+    try:
+        target = dir_path.resolve()
+        home = Path.home().resolve()
+    except Exception:
+        return "Couldn't resolve that path safely — not deleting anything."
+    t_id = _fs_id(target)
+    if t_id is None:
+        return None  # doesn't exist; the "no files matched" path handles it
+    forbidden = {home, Path("/"), *home.parents}
+    forbidden_ids = {fid for fid in (_fs_id(p) for p in forbidden) if fid is not None}
+    if t_id in forbidden_ids:
+        return (f"Refusing to bulk-delete from {target} — that's your home or a "
+                f"root directory. Point me at a specific subfolder.")
+    return None
+
 
 def manage_files(
     action: str,
@@ -357,10 +401,10 @@ def manage_files(
     pattern: glob pattern, e.g. "Screenshot*.png", "*.tmp", "*.pdf"
     age_hours: delete files OLDER than this many hours (0 = any age)
     newer_than_hours: only match files created in the last N hours (0 = any age)
-    confirm: if True, list files before deleting (set to True always — model decides)
+    confirm: legacy no-op. Deletes ALWAYS prompt the user via the UI now and
+             refuse home/root scope, regardless of this flag.
     """
     import time as _time
-    import fnmatch
 
     dir_path = Path(directory).expanduser()
     if not dir_path.exists():
@@ -403,8 +447,27 @@ def manage_files(
         return f"{len(matched)} file(s):\n" + "\n".join(lines) + suffix
 
     if action == "delete":
+        # HARD REFUSAL for catastrophic scope — never bulk-delete the home dir
+        # or a filesystem root, even if the model (or an approval) says to.
+        # Uses filesystem identity so it can't be bypassed by path casing on a
+        # case-insensitive macOS volume.
+        _refusal = _refuse_delete_scope(dir_path)
+        if _refusal:
+            return _refusal
+
         if not matched:
             return f"No files matching '{pattern}' in {dir_path} to delete."
+
+        # Require explicit user confirmation via the UI before deleting anything.
+        # (Auto-approved only in test/terminal mode where no callback is set.)
+        # The old code deleted immediately and ignored its own `confirm` flag —
+        # "clean up my desktop" could wipe every file with no prompt.
+        _preview = ", ".join(p.name for p in matched[:5])
+        _more = f" (+{len(matched) - 5} more)" if len(matched) > 5 else ""
+        from tools.permissions import request
+        if not request(f"Delete {len(matched)} file(s) from {dir_path}? {_preview}{_more}"):
+            return f"Cancelled — nothing deleted from {dir_path}."
+
         deleted, failed = [], []
         for p in matched:
             try:

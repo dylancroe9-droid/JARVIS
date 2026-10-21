@@ -29,7 +29,15 @@ fi
 # ── Start Python brain server in background ───────────────────────────────────
 echo "🧠  Starting JARVIS brain..."
 source .venv/bin/activate
-python server.py &
+# Tee server output to /tmp/jarvis_server.log so JARVIS can read his own
+# runtime errors via tools/self_inspect.py (read_jarvis_log). Truncated on
+# each start so the log only ever covers the current session.
+JARVIS_LOG=/tmp/jarvis_server.log
+: > "$JARVIS_LOG"
+# Use process substitution (not a pipe) so $! is the SERVER's PID, not tee's.
+# With `python ... | tee &`, $! captured tee — so the crash check watched the
+# wrong process and the shutdown `kill` left the real server orphaned on 8765.
+python server.py > >(tee "$JARVIS_LOG") 2>&1 &
 SERVER_PID=$!
 
 # ── Wait for server to be healthy (max 20s) ───────────────────────────────────

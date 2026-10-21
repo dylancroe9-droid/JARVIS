@@ -7,6 +7,7 @@ Fallback: Groq              — when only GROQ_API_KEY is available
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections import deque
 from typing import Generator
@@ -15,8 +16,11 @@ from rich.console import Console
 
 from datetime import datetime
 
-from config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL, GROQ_API_KEY, GROQ_MODEL, OLLAMA_URL, OLLAMA_MODEL
-from brain.personality import get_system_prompt, get_fast_prompt, get_mid_prompt
+from config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL, GROQ_API_KEY, GROQ_MODEL, OLLAMA_URL, OLLAMA_MODEL, USER_NAME
+from brain.personality import (
+    get_system_prompt, get_fast_prompt, get_mid_prompt,
+    get_stable_prompt, get_volatile_prompt, get_current_mode,
+)
 from brain.tools import TOOL_DEFINITIONS, get_openai_tools, get_core_tools, get_8b_tools
 
 console = Console()
@@ -36,6 +40,200 @@ def _clean_text(text: str) -> str:
 # placeholder values like "YOUR_KEY_HERE" causing failed API calls on every request.
 _USE_CLAUDE = ANTHROPIC_API_KEY.startswith("sk-ant-")
 
+
+# Anthropic beta flag required for defer_loading + the tool-search server tool.
+_TOOL_SEARCH_BETA = "advanced-tool-use-2025-11-20"
+
+# Tools kept resident in the prompt on every turn.  Everything else is deferred and
+# reached through tool search.  Keep this list SHORT and free of generic catch-alls:
+# a visible do-anything tool (web_search) shadows the specialists, and Claude stops
+# searching — measured 2/6 correct with web_search resident vs 7/6 without.
+#
+# take_screenshot MUST stay resident.  Deferring it breaks homework help outright:
+# "what is the answer to this?" shares no words with "take_screenshot", so BM25
+# cannot retrieve it — measured 1/6 deferred vs 6/6 resident, with no reflexive
+# screenshots on plain conversation (6/6 clean).
+# Tools resident on EVERY turn, in every mode. Keep this tiny — each one is billed
+# on every single request.
+#
+# set_listening: a type-first user needs "mute the mic" instantly in any mode.
+# create_practice_test / show_test_answers: "quiz me on X" is unambiguous and never
+#   misfires, so — unlike take_screenshot — these are safe to keep always-on, which
+#   lets JARVIS do everything Alex can (make a verified practice test on command)
+#   from any mode, not only study mode. Deferred, Claude just typed questions into
+#   chat instead of building a real test (measured 0 tool calls).
+_BASE_TOOL_NAMES = {"play_music", "pause_music", "set_mode", "set_listening",
+                    "create_practice_test", "show_test_answers",
+                    # take_screenshot is resident everywhere. Gating it to study
+                    # mode broke the core feature: "look at my screen and do this"
+                    # outside study mode found the tool not even loaded, so JARVIS
+                    # couldn't see the screen at all. The tool DESCRIPTION already
+                    # does the discrimination (fire on a real screen reference /
+                    # dangling "this"; ignore casual conversation — measured 6/6
+                    # homework, 6/6 no-false-fire), so mode-gating only removed the
+                    # ability, it didn't add safety.
+                    "take_screenshot"}
+
+# Nothing is study-mode-exclusive anymore — the tools that matter are all in BASE,
+# and their descriptions control WHEN they fire. Study mode still exists as a
+# focus/persona mode, it just no longer gates tool availability.
+_STUDY_TOOL_NAMES: set = set()
+
+_CORE_TOOL_NAMES = _BASE_TOOL_NAMES | _STUDY_TOOL_NAMES
+
+
+def _resident_tools_for_mode(mode: str) -> set:
+    """Which tools stay loaded, given the mode JARVIS is currently in."""
+    if (mode or "normal").lower() == "study":
+        return _BASE_TOOL_NAMES | _STUDY_TOOL_NAMES
+    return _BASE_TOOL_NAMES
+
+# Computed once and reused: the text must be byte-identical every turn or the tool
+# array shifts and takes the cached system prefix down with it.
+_TOOL_ADDENDA_CACHE: dict | None = None
+
+
+def _tool_addenda() -> dict:
+    global _TOOL_ADDENDA_CACHE
+    if _TOOL_ADDENDA_CACHE is None:
+        from brain.personality import get_tool_addenda
+        try:
+            _TOOL_ADDENDA_CACHE = get_tool_addenda()
+        except Exception as exc:      # never let prompt slimming break tool use
+            console.print(f"[yellow]tool addenda unavailable: {exc}[/yellow]")
+            _TOOL_ADDENDA_CACHE = {}
+    return _TOOL_ADDENDA_CACHE
+
+
+# Running total for the process, so cost is observable instead of asserted.
+_COST_TOTAL = {"usd": 0.0, "turns": 0}
+
+# $ per MILLION tokens. cache read is 0.1x input; a 1h-TTL write is 2x.
+_PRICES = {
+    "claude-sonnet-5":  (3.00, 15.00),
+    "claude-haiku-4-5": (1.00,  5.00),
+    "claude-opus-4-8":  (15.00, 75.00),
+}
+
+
+def _log_cost(usage, model: str) -> None:
+    """
+    Print what the turn actually cost, straight off the wire.
+
+    This exists because "it's cheaper now" is worthless as a claim you can't see.
+    cache_read should be large and steady; cache_write should be near zero after
+    the first turn. If write stays high, something is changing the prefix between
+    turns and the caching is silently doing nothing.
+    """
+    try:
+        i_rate, o_rate = _PRICES.get(model, (3.00, 15.00))
+        billed = getattr(usage, "input_tokens", 0) or 0
+        write  = getattr(usage, "cache_creation_input_tokens", 0) or 0
+        read   = getattr(usage, "cache_read_input_tokens", 0) or 0
+        out    = getattr(usage, "output_tokens", 0) or 0
+        usd = (billed * i_rate + write * i_rate * 2.0 + read * i_rate * 0.1
+               + out * o_rate) / 1e6
+        _COST_TOTAL["usd"] += usd
+        _COST_TOTAL["turns"] += 1
+        # Escape the tag — rich parses a bare [cost] as markup and swallows it.
+        console.print(
+            f"[dim]\\[cost] in={billed:,} write={write:,} read={read:,} out={out:,} "
+            f"→ ${usd:.4f}  (session ${_COST_TOTAL['usd']:.3f} over "
+            f"{_COST_TOTAL['turns']} calls)[/dim]"
+        )
+    except Exception:
+        pass          # cost telemetry must never break a reply
+
+
+def _system_blocks(stable: str) -> list:
+    """
+    The character prompt as a single cached system block.
+
+    Per-turn state does NOT go here.  The cache prefix runs tools → system →
+    messages, so a volatile system block poisons everything after it: with the clock
+    in block two, the conversation history could never cache and was re-written at 2x
+    every turn (measured $38.52/user/mo vs $28.96 doing nothing).  Volatile state is
+    appended to the final message instead — see _claude_messages.
+
+    1-hour TTL, not the 5-minute default: JARVIS is spoken to in bursts, and a gap
+    longer than the window turns every turn into a fresh write at 1.25x — measurably
+    worse than not caching at all.
+    """
+    return [{"type": "text", "text": stable,
+             "cache_control": {"type": "ephemeral", "ttl": "1h"}}]
+
+
+def _search_tools(tools: list, mode: str = "") -> list:
+    """
+    Return `tools` rewritten for Anthropic tool search: core tools stay resident,
+    the rest are marked defer_loading so their schemas are fetched only when Claude
+    searches for them.  Sending all 118 schemas cost 19,175 tokens on EVERY turn;
+    deferring costs ~1,900 — the same 118 tools remain callable.
+
+    Restricted sets (forced show_overlay, etc.) are passed through untouched: they
+    are already small, and deferring a tool we are about to force would strand it.
+
+    No cache_control here — the API rejects deferred tools carrying a cache
+    breakpoint.  The system block holds the breakpoint instead, which caches the
+    tools+system prefix together anyway.
+    """
+    if not tools or len(tools) < 20:
+        return tools
+    from brain.product import tool_is_allowed
+    resident = _resident_tools_for_mode(mode)
+    addenda = _tool_addenda()
+    out = []
+    for t in tools:
+        name = t.get("name")
+        # Alex (study-only product) never sees music/movie/smart-home/etc tools at
+        # all — not deferred, absent. A student can't trip over them, and the
+        # schoolwork build can't be pointed at anything off-task.
+        if not tool_is_allowed(name):
+            continue
+        extra = addenda.get(name)
+        # Guidance lifted out of the system prompt rides on the tool it belongs to.
+        t = {**t, "description": f"{t['description']}\n\n{extra}"} if extra else t
+        out.append(t if name in resident else {**t, "defer_loading": True})
+    # BM25 ranks by relevance and beat regex 7/8 vs 5/8 on real phrasings.
+    out.append({"type": "tool_search_tool_bm25_20251119", "name": "tool_search_tool_bm25"})
+    return out
+
+
+# ── Startup greeting pool ───────────────────────────────────────────────────────
+# Fallback when Claude can't generate one live. Casual, varied, ONE flowing line
+# each — never the old robotic "all systems operational" template.
+_GREETING_POOL = [
+    "Hey — what's on the agenda today?",
+    "Back at it. What are we getting into?",
+    "Alright, I'm up. What's the move?",
+    "What are we feeling — work, or something fun?",
+    "Ready when you are. Wanna knock something out, or just chill?",
+    "Yo. What's the plan, sir?",
+    "I'm here — watch something, get some work done, or just talk?",
+    "What's good? What are we doing today?",
+    "Up and running. Where do you wanna start?",
+    "Alright, hit me — what's first?",
+    "Wanna throw something on, or get to work?",
+    "What are we building today?",
+    "Let's do something. What's it gonna be?",
+    "I'm around. What do you need?",
+]
+
+# A random angle is injected per greeting so Claude doesn't fall into the same
+# structure every launch — forces genuine variety.
+_GREETING_ANGLES = [
+    "Ask what's on the agenda today.",
+    "Suggest putting something on to watch.",
+    "Nudge him toward getting some work done.",
+    "Just a low-key hello — ask what he needs.",
+    "Riff lightly on the time of day.",
+    "Ask what he feels like building or working on.",
+    "Be playful — tease him a little, warmly.",
+    "Offer a couple of options: chill, work, or watch something.",
+    "Ask how he's doing, genuinely, in one line.",
+    "Just say you're here and ready — short and easy.",
+]
+
 # ── Music intent keywords ──────────────────────────────────────────────────────
 _MUSIC_PLAY_WORDS  = frozenset({"play", "music", "song", "track", "spotify",
                                  "apple music", "playlist", "album", "artist",
@@ -48,6 +246,51 @@ _MUSIC_SKIP_WORDS  = frozenset({"skip", "next song", "next track", "skip this",
 _MUSIC_PREV_WORDS  = frozenset({"previous song", "previous track", "last song",
                                  "last track", "last one", "go back", "previous"})
 _MUSIC_WORDS = _MUSIC_PLAY_WORDS | _MUSIC_PAUSE_WORDS | _MUSIC_SKIP_WORDS | _MUSIC_PREV_WORDS
+
+
+# Tools the tiny 8b fallback tends to fire spuriously on garbled/ambiguous
+# input (e.g. take_screenshot on "run a-", open_application on "system search").
+# Each requires at least one matching keyword in the user's actual words, or
+# the call is treated as a hallucination and dropped.
+_SURPRISING_TOOL_KEYWORDS = {
+    "open_application": ("open", "launch", "start", "fire up", "pull up",
+                         "go to", "bring up"),
+    "take_screenshot":  ("screenshot", "screen", "look at", "what's on",
+                         "whats on", "see my", "capture", "what do you see"),
+    "read_camera":      ("camera", "look at this", "what am i holding",
+                         "what is this", "see this", "hold"),
+}
+
+
+def _tool_call_plausible(name: str, user_text: str) -> bool:
+    """
+    True if a tool call is plausible given the user's words. Only gates the
+    'surprising' tools above — everything else is always allowed. Prevents the
+    8b fallback from firing a screenshot / app-launch on input that never
+    asked for one.
+    """
+    kws = _SURPRISING_TOOL_KEYWORDS.get(name)
+    if not kws:
+        return True
+    low = (user_text or "").lower()
+    return any(k in low for k in kws)
+
+
+def _has_music_word(text: str, words) -> bool:
+    """
+    Match music keywords against text:
+      - Single-word entries match on word boundary ("skip" ≠ "skipping")
+      - Multi-word phrases match as substring ("next song" → in text)
+    Prevents disasters like 'skipping ads' triggering next_track.
+    """
+    import re
+    for w in words:
+        if " " in w:
+            if w in text:
+                return True
+        elif re.search(r"\b" + re.escape(w) + r"\b", text):
+            return True
+    return False
 
 # Overlay trigger phrases — force show_overlay tool when detected.
 # Phrase match: ANY of these substrings in the user message → force overlay.
@@ -80,18 +323,16 @@ _OVERLAY_VISUAL_WORDS = frozenset({"visual", "diagram", "concept map"})
 # Designed to be CONVERSATIONAL — user should not need magic words.
 _BLUEPRINT_TRIGGER_PHRASES = frozenset({
     # Direct show commands
-    "show me the ", "show me a ", "show me an ",
-    "show the ", "show a ", "show an ",
-    "show it", "show that",
-    # Pull up / bring up
-    "pull up the ", "pull up a ", "pull up an ",
-    "pull it up", "pull that up",
-    "bring up the ", "bring up a ", "bring it up", "bring that up",
-    # Display / render / visualize
-    "display the ", "display a ", "display an ",
-    "render the ", "render a ", "render an ",
-    "visualize the ", "visualize a ",
-    "put up a ", "put up the ",
+    
+    
+    
+    # NOTE — deliberately NOT here: "pull up a/the/an", "render a/the/an",
+    # "visualize a/the". These match ordinary requests — "pull up a picture of a
+    # peach", "pull up my email", "render a preview" — and forcing show_overlay
+    # turned "pull up a picture" into a hologram. A specific noun below ("the
+    # bugatti", "the f-22") carries the real blueprint signal, so "pull up the
+    # Bugatti" still works without hijacking every "pull up" in English.
+    
     # Blueprint / specs explicit — "blueprint the/a/an/of/for/on X"
     "blueprint the ", "blueprint a ", "blueprint an ",
     "blueprint of", "blueprint for", "blueprint on",
@@ -102,23 +343,24 @@ _BLUEPRINT_TRIGGER_PHRASES = frozenset({
     "create a blueprint", "generate a blueprint",
     # Want to see
     "i want to see the ", "i want to see a ", "i want to see an ",
-    "i wanna see the ", "i wanna see a ", "i wanna see it",
+    
     "let me see the ", "let me see a ", "let me see an ",
     "want to see the ", "want to see a ", "want to see an ",
     "i'd like to see ", "i would like to see ",
-    "show me what ", "let me look at ",
+    
     # Can you / could you
-    "can you show me the ", "can you show me a ", "can you show me an ",
-    "can you show me what ",
+    
+    
     "can you pull up", "can you bring up",
     "can you display", "can you render",
-    # Look at
-    "look at the ", "look at a ", "look at an ",
-    "take a look at ", "let's look at ",
-    # What does X look like
-    "what does the ", "what does a ", "what does an ",
-    "what do the ", "what do a ",
-    "what's the ", "what's a ",     # "what's the bugatti chiron" in context
+    # NOTE — deliberately absent: "what's the ", "what's a ", "look at the ",
+    # "take a look at ", "let me look at ", "what does the ", "show me what ".
+    # These match ordinary English, and a match here FORCES the tool array down to
+    # show_overlay alone, so JARVIS physically cannot look at the screen or use any
+    # other tool. "what's the answer to this?" drew a Bugatti blueprint; "take a
+    # look at this problem" — a screen request — did the same. A specific noun below
+    # ("the bugatti", "the f-22") already carries the real signal, so "show me the
+    # Bugatti" still triggers without dragging every question in English along.
     # Hologram / 3D
     "hologram of", "hologram for",
     "3d model of", "3d model for",
@@ -127,18 +369,20 @@ _BLUEPRINT_TRIGGER_PHRASES = frozenset({
     "model of the ", "model of a ",
     # Anatomy / science
     "anatomy of", "diagram of", "structure of",
+    "the solar system", "the milky way", "planet earth",
+    "the human dna", "double helix",
     "what does a human ", "what does the human ",
-    "show me how ", "show me what a ",
+    
     # "put it on screen", "throw it up"
-    "put it on", "throw it up", "project the ", "project a ",
+    
     # Build / design mode activators (mode-word triggers — conversational phrases
     # like "build me a X" are now routed to 3D build canvas in server.py first)
     "build mode", "design mode", "architect mode",
-    "design a ", "design the ",
-    "architect a ", "draft a ", "sketch a ",
+    
+    
     # Specific objects people naturally say
-    "i'm talking about the ", "i'm thinking about the ",
-    "you know the ", "you know that ",
+    
+    
     # Brand / object shortcuts — vehicles
     "the bugatti", "the ferrari", "the lamborghini", "the porsche",
     "the falcon 9", "the starship", "the f-22", "the f-35",
@@ -149,8 +393,8 @@ _BLUEPRINT_TRIGGER_PHRASES = frozenset({
     "the eiffel tower", "the empire state", "the burj khalifa",
     "the pyramids", "the colosseum", "the space needle",
     # Nature / science
-    "the solar system", "the milky way", "planet earth", "the moon",
-    "the heart", "the brain", "the lungs", "the spine", "the dna",
+    
+    
     "human heart", "human brain", "human lungs", "human skull", "human body",
     "the human heart", "the human brain", "the human lungs", "the human skull",
     "a human heart", "a human brain",
@@ -228,6 +472,7 @@ _TOOL_ACKS: dict[str, str | None] = {
     "web_search":             "Let me look that up.",
     "web_search_results":     "Searching now.",
     "get_calendar_events":    "Checking your calendar.",
+    "read_calendar_visually":  "Pulling up your calendar.",
     "create_calendar_event":  "Adding that to your schedule.",
     "get_unread_emails":      "Checking your inbox.",
     "get_recent_emails":      "Pulling up your emails.",
@@ -280,6 +525,16 @@ _COMPUTER_AGENT_PHRASES = frozenset({
     "click that", "click the button", "click on",
     "scroll down for me", "scroll the page",
     "copy and paste", "select all", "highlight",
+    # Picking an answer on a multiple-choice test. "select it" is the natural way to
+    # ask for this and matched nothing here, so it fell through to a plain spoken
+    # reply and the bubble never got clicked.
+    "select it", "select this", "select that", "select the answer", "select the right",
+    "select b", "select c", "select d", "select a",
+    "pick it", "pick that", "pick the answer", "pick the right",
+    "choose it", "choose that", "choose the answer", "choose the right",
+    "mark it", "mark that", "bubble it", "bubble in",
+    "answer and select", "answer it and select", "select it for me", "pick it for me",
+    "choose it for me", "click it", "click it for me", "click the answer",
     # Natural "stepping away" phrases — "I'll be right back, finish this"
     "be right back", "brb", "i'll be back", "i will be back",
     "finish this for me", "finish it for me", "can you finish",
@@ -379,7 +634,7 @@ def _extract_blueprint_subject(msg: str) -> str:
 # Context-only trigger words — if the user says one of these SHORT phrases AND
 # the conversation recently mentioned a vehicle/object, treat it as a blueprint request.
 _BLUEPRINT_CONTEXT_TRIGGERS = frozenset({
-    "pull it up", "show it", "show that", "bring it up", "pull that up",
+    "pull it up",  "bring it up", "pull that up",
     "yes", "yeah", "yep", "do it", "go ahead",
     "show me", "let me see it", "let me see that",
     "make it 3d", "make it a hologram", "render it", "visualize it",
@@ -399,18 +654,30 @@ _BAD_REQUEST_MSG = (
 )
 
 _FALLBACK_MODELS = [
-    # llama-4-scout removed — it outputs words without spaces (tokenizer bug)
-    "llama3-groq-8b-8192-tool-use-preview",
+    # llama-4-scout removed — outputs words without spaces (tokenizer bug)
+    # llama3-groq-8b-8192-tool-use-preview removed — DECOMMISSIONED 2025
     "llama-3.1-8b-instant",
 ]
 
 
 class Jarvis:
+    # Conversation history is persisted here so JARVIS remembers across restarts.
+    # Cap stored history at 200 messages; in-memory cap stays at 40 (last 40
+    # are sent to the LLM for context).
+    HISTORY_PATH = os.path.join(os.path.expanduser("~"), ".jarvis_history.json")
+    HISTORY_MAX  = 200
+
     def __init__(self) -> None:
-        self._executor = None
+        # Eager construction — lazy init was racy (two threads could each
+        # create a ToolsExecutor instance, doubling tool-call accounting).
+        # The executor is cheap; build it up front.
+        from brain._executor import ToolsExecutor
+        self._executor = ToolsExecutor()
         self.messages: list[dict] = []
         self._recent_replies: deque = deque(maxlen=5)
         self._last_blueprint_subject: str = ""  # context for follow-up requests like "pull it up"
+        # Load saved conversation from previous sessions
+        self._load_history()
 
         # ── Local Ollama brain (runs on YOUR hardware) ────────────────────────
         self._local: "OpenAI | None" = None
@@ -422,9 +689,9 @@ class Jarvis:
                 self._local = _OAI(base_url=f"{OLLAMA_URL}/v1", api_key="ollama")
                 console.print(f"[green]Local brain: Ollama {OLLAMA_MODEL} ✓[/green]")
             else:
-                console.print(f"[dim]Ollama not running — using cloud only[/dim]")
+                console.print("[dim]Ollama not running — using cloud only[/dim]")
         except Exception:
-            console.print(f"[dim]Ollama not found — using cloud only[/dim]")
+            console.print("[dim]Ollama not found — using cloud only[/dim]")
 
         # ── Primary: Claude ────────────────────────────────────────────────────
         if _USE_CLAUDE:
@@ -451,14 +718,34 @@ class Jarvis:
 
     @property
     def tools_executor(self):
-        if self._executor is None:
-            from brain._executor import ToolsExecutor
-            self._executor = ToolsExecutor()
+        # Built eagerly in __init__ to avoid a TOCTOU on lazy init.
         return self._executor
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def chat(self, user_input: str) -> Generator[str, None, None]:
+        # ── Alex credits gate (study-only product) ──────────────────────────────
+        # Handled before anything else so redeeming, checking a balance, and the
+        # empty-tank case never call the model or touch history. JARVIS is never
+        # metered — this whole block is is_alex()-guarded. See brain/credits.py.
+        from brain.product import is_alex
+        if is_alex():
+            from brain import credits
+            _stripped = (user_input or "").strip()
+            _low = _stripped.lower()
+            if _low.startswith("redeem "):
+                _ok, _msg, _bal = credits.redeem(_stripped.split(None, 1)[1])
+                yield _msg
+                return
+            if _low in ("credits", "balance", "credits left", "check credits",
+                        "how many credits", "how many credits do i have",
+                        "how many credits do i have left"):
+                yield f"You've got {credits.balance()} credits left."
+                return
+            if not credits.has_credit():
+                yield credits.out_of_credits_message()
+                return
+
         # Strip injected context prefixes before storing in history —
         # [WORK MODE — SCREEN: ...] blobs compound fast and blow up the context window.
         import re as _re
@@ -466,14 +753,33 @@ class Jarvis:
             r'^\[(?:WORK MODE|GAMING MODE)[^\]]*\]\s*(?:Use this[^.]*\.)?\s*(?:User said:\s*)?',
             '', user_input
         ).strip() or user_input
+        # Reset the per-turn self-inspect counter — see _executor.py for cap logic
+        try:
+            self.tools_executor.reset_self_inspect_counter()
+        except AttributeError:
+            pass
         self.messages.append({"role": "user", "content": _clean_input})
-        if len(self.messages) > 40:   # tighter cap — 60 was too many with tool results
+        # Trim in chunks, not one message per turn.  Dropping the oldest message on
+        # every turn shifts the start of the conversation every turn, and prompt
+        # caching matches on a *prefix* — so a sliding window meant history could
+        # never cache and was re-sent at full price forever.  Letting it run to 56
+        # and then cutting back to 40 keeps the prefix byte-stable for ~16 turns,
+        # which is long enough to actually get cache hits.  Same ceiling on context.
+        if len(self.messages) > 56:
             self.messages = self.messages[-40:]
 
         if _USE_CLAUDE:
             # Silently extract memorable facts in background — no await, never blocks
             self._auto_remember(user_input)
-            yield from self._claude_chat()
+            if is_alex():
+                # Meter the turn on its ACTUAL measured cost, converted to credits.
+                # Runs once the consumer finishes streaming this turn's chunks.
+                _start_usd = _COST_TOTAL["usd"]
+                yield from self._claude_chat()
+                from brain import credits
+                credits.charge_usd(_COST_TOTAL["usd"] - _start_usd, reason="turn")
+            else:
+                yield from self._claude_chat()
         else:
             _lower_input = user_input.lower()
             # [STUDY] prompts — skip tools entirely
@@ -486,8 +792,113 @@ class Jarvis:
             else:
                 yield from self._stream_with_tools()
 
+    def startup_greeting(self, tod: str, issues=None) -> str:
+        """
+        A fresh, casual, single-line greeting for when Dylan opens the app —
+        written by Claude so it's different every launch (no canned template, no
+        robotic 'all systems operational', no clock announcement).  Still honest:
+        if something is actually broken it works that in.  Falls back to a varied
+        pool if Claude is unavailable.
+        """
+        import random
+        issues = issues or []
+        # Alex greets as a study partner, not JARVIS. The greeting pool lives in
+        # brain/alex.py so Alex's content isn't buried inside the JARVIS brain.
+        from brain.product import is_alex
+        if is_alex():
+            from brain.alex import STARTUP_GREETINGS
+            return random.choice(STARTUP_GREETINGS)
+        if _USE_CLAUDE and getattr(self, "_claude", None):
+            try:
+                angle = random.choice(_GREETING_ANGLES)
+                sys = (
+                    "You are JARVIS. Dylan just opened the app — greet him with ONE short, "
+                    "casual, natural spoken line in your voice: warm, easy, a little playful. "
+                    f"It's {tod.lower()}. THIS TIME take this angle: {angle} "
+                    "Vary the opener — do NOT always start with 'Evening' or his name. Use 'sir' "
+                    "only once in a while. NEVER announce the clock time, NEVER say 'all systems "
+                    "operational' or 'welcome back'. One flowing sentence, no lists. "
+                    "Reply with ONLY the line, no quotes."
+                )
+                if issues:
+                    sys += f" Also work in, casually, that there's a problem: {issues[0]}."
+                r = self._claude.messages.create(
+                    model=self.model,
+                    thinking={"type": "disabled"},
+                    max_tokens=90,
+                    system=sys,
+                    messages=[{"role": "user", "content": "(the app just opened)"}],
+                )
+                line = "".join(
+                    b.text for b in r.content if getattr(b, "type", "") == "text"
+                ).strip().strip('"').strip()
+                if line:
+                    return line
+            except Exception as exc:
+                console.print(f"[dim]greeting gen failed: {exc}[/dim]")
+        # Fallback: varied casual pool
+        line = random.choice(_GREETING_POOL)
+        if issues:
+            line = line.rstrip(".?! ") + f" — though heads up, {issues[0]}."
+        return line
+
     def reset(self) -> None:
         self.messages.clear()
+        # Clear persisted history too — fresh start
+        try:
+            if os.path.exists(self.HISTORY_PATH):
+                os.unlink(self.HISTORY_PATH)
+        except Exception:
+            pass
+
+    def _load_history(self) -> None:
+        """Restore conversation messages from disk on startup."""
+        try:
+            if not os.path.exists(self.HISTORY_PATH):
+                return
+            import json as _json
+            with open(self.HISTORY_PATH, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+            if isinstance(data, list):
+                # Only keep messages whose content is a plain string — skip
+                # any old tool-use/result blocks that may have stale references.
+                cleaned = []
+                for m in data[-self.HISTORY_MAX:]:
+                    if not isinstance(m, dict):
+                        continue
+                    if m.get("role") not in ("user", "assistant"):
+                        continue
+                    if not isinstance(m.get("content"), str):
+                        continue
+                    cleaned.append(m)
+                # Trim to recent in-memory cap for active context
+                self.messages = cleaned[-40:]
+                if cleaned:
+                    console.print(
+                        f"[dim]Conversation memory: loaded {len(cleaned)} prior messages ({len(self.messages)} active in context)[/dim]"
+                    )
+        except Exception as exc:
+            console.print(f"[dim]Could not load history: {exc}[/dim]")
+
+    def _save_history(self) -> None:
+        """Persist conversation messages to disk. Called after each turn."""
+        try:
+            import json as _json
+            # Only persist plain text messages — tool-result blocks reference
+            # mid-turn state that won't make sense after restart.
+            persistable = [
+                m for m in self.messages
+                if isinstance(m, dict) and isinstance(m.get("content"), str)
+                and m.get("role") in ("user", "assistant")
+            ]
+            # Cap at HISTORY_MAX to avoid file bloat
+            persistable = persistable[-self.HISTORY_MAX:]
+            tmp = self.HISTORY_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                _json.dump(persistable, f, ensure_ascii=False)
+            os.replace(tmp, self.HISTORY_PATH)
+        except Exception:
+            pass
 
     def _get_recent_replies_note(self) -> str:
         if not self._recent_replies:
@@ -526,7 +937,7 @@ class Jarvis:
         # CRITICAL: only inject real calendar data. Never invent events from memory.
         try:
             from tools.calendar_tool import get_calendar_events
-            cal = get_calendar_events(days=1)
+            cal = get_calendar_events(days=7)
             if cal and "nothing" not in cal.lower() and "unavailable" not in cal.lower():
                 notes.append(
                     f"TODAY'S REAL CALENDAR DATA (from device): {cal[:400]}\n"
@@ -595,8 +1006,12 @@ class Jarvis:
           3. Stream the final conversational response
         Up to 4 rounds. Falls back to Groq if Claude errors out.
         """
+        # `system` is the VOLATILE half only — the character half is held apart in
+        # _stable so it stays byte-identical and caches.  Every mode note below
+        # appends to `system`, which is correct: those are per-turn instructions.
+        _stable = get_stable_prompt()
         system = (
-            get_system_prompt()
+            get_volatile_prompt()
             + self._get_proactive_context()
             + self._get_recent_replies_note()
         )
@@ -699,22 +1114,51 @@ class Jarvis:
             )
         else:
             _overlay_tool_choice = {"type": "auto"}
+            # Tool set is deliberately identical on every turn.  The cache prefix is
+            # tools → system, so a tool array that changes shape between turns also
+            # invalidates the cached system prompt.  The old keyword vision gate did
+            # exactly that; Sonnet 5 declines to screenshot plain conversation on its
+            # own (measured 6/6 clean), so the gate is no longer earning its cost.
             _active_tools = TOOL_DEFINITIONS
 
         for _round in range(_MAX_ROUNDS):
+            _streamed_text = False
             try:
-                response = self._claude.messages.create(
+                # STREAM the turn so a conversational reply starts speaking within a
+                # beat instead of after the whole thought is generated (the old
+                # non-streaming create() made JARVIS wait for the full answer, then
+                # dump it all at once — that was the "crazy slow" lag).  Text deltas
+                # are yielded live to TTS; tool_use blocks are collected and handled
+                # after via get_final_message().  A pure command emits only a tool_use
+                # (no text), so nothing is spoken before the action.
+                # thinking disabled = no pre-answer pause (Sonnet 5 defaults to adaptive).
+                with self._claude.beta.messages.stream(
                     model=self.model,
-                    system=system,
-                    messages=self._claude_messages(),
-                    tools=_active_tools,
+                    thinking={"type": "disabled"},
+                    system=_system_blocks(_stable),
+                    messages=self._claude_messages(volatile=system),
+                    tools=_search_tools(_active_tools, get_current_mode()),
                     tool_choice=_overlay_tool_choice,
                     max_tokens=_loop_max_tokens,
-                )
+                    betas=[_TOOL_SEARCH_BETA],
+                ) as stream:
+                    for event in stream:
+                        if (event.type == "content_block_delta"
+                                and getattr(event.delta, "type", "") == "text_delta"
+                                and event.delta.text):
+                            _streamed_text = True
+                            yield event.delta.text
+                    response = stream.get_final_message()
+                _log_cost(response.usage, self.model)
                 # After first round, stop forcing (let Claude continue naturally)
                 _overlay_tool_choice = {"type": "auto"}
                 _active_tools        = TOOL_DEFINITIONS
             except Exception as exc:
+                # If we already streamed part of the answer, don't fall back and
+                # repeat it — just end cleanly.
+                if _streamed_text:
+                    console.print(f"[yellow]Claude stream cut off: {exc}[/yellow]")
+                    return
                 console.print(f"[yellow]Claude error ({type(exc).__name__}): {exc}[/yellow]")
                 exc_str = str(exc).lower()
                 # Auth / billing errors — tell the user exactly what's wrong
@@ -759,9 +1203,10 @@ class Jarvis:
                 if text:
                     self._append_assistant_text(text)
                     self._recent_replies.append(text[:60])
-                    yield text
+                    if not _streamed_text:      # already spoken live during the stream
+                        yield text
                 else:
-                    yield from self._claude_final_stream(system, max_tokens=budget)
+                    yield from self._claude_final_stream(_system_blocks(_stable), system, max_tokens=budget)
                 return
 
             # ── Has tool calls ────────────────────────────────────────────────
@@ -774,7 +1219,7 @@ class Jarvis:
 
             # Speak before the first tool runs
             first_ack = _TOOL_ACKS.get(tool_uses[0].name, "")
-            if first_ack:
+            if first_ack and not _streamed_text:
                 yield first_ack + " "
 
             for tu in tool_uses:
@@ -784,14 +1229,22 @@ class Jarvis:
                     result = self.tools_executor.execute(tu.name, dict(tu.input))
                 except Exception as exc:
                     result = f"Tool error: {exc}"
-                content = (
-                    str(result) if not isinstance(result, list)
-                    else "\n".join(
-                        b.get("text", "")
-                        for b in result
-                        if isinstance(b, dict) and b.get("type") == "text"
+                # If a tool returned image blocks (e.g. take_screenshot on the Claude
+                # brain), forward them straight into the tool_result so Claude SEES the
+                # screen with its own vision — critical for reading math/diagrams. Else
+                # collapse to text as before.
+                if isinstance(result, list) and any(
+                        isinstance(b, dict) and b.get("type") == "image" for b in result):
+                    content = result
+                else:
+                    content = (
+                        str(result) if not isinstance(result, list)
+                        else "\n".join(
+                            b.get("text", "")
+                            for b in result
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        )
                     )
-                )
                 tool_results.append({
                     "type":        "tool_result",
                     "tool_use_id": tu.id,
@@ -827,7 +1280,7 @@ class Jarvis:
             # Music play → short streaming comment (what's now playing)
             if executed & {"play_music", "play_playlist", "list_playlists",
                             "add_to_playlist", "create_playlist"}:
-                yield from self._claude_final_stream(system, max_tokens=120)
+                yield from self._claude_final_stream(_system_blocks(_stable), system, max_tokens=120)
                 return
 
             # ── Overlay research pipeline fix ────────────────────────────────
@@ -852,11 +1305,11 @@ class Jarvis:
                 continue   # keep the agent loop going
 
             # Everything else: stream with the full budget
-            yield from self._claude_final_stream(system, max_tokens=budget)
+            yield from self._claude_final_stream(_system_blocks(_stable), system, max_tokens=budget)
             return
 
         # Hit max rounds without finishing — force a clean response
-        yield from self._claude_final_stream(system, max_tokens=budget)
+        yield from self._claude_final_stream(_system_blocks(_stable), system, max_tokens=budget)
 
     def _auto_remember(self, user_input: str) -> None:
         """
@@ -870,6 +1323,7 @@ class Jarvis:
                 from brain.memory import save_fact
                 check = self._claude.messages.create(
                     model=self.model,
+                    thinking={"type": "disabled"},   # cheap background extraction — no thinking
                     system=(
                         "Extract memorable personal facts from this message. "
                         "Output ONLY a JSON array of short, specific fact strings about the user (Dylan Roe). "
@@ -900,16 +1354,27 @@ class Jarvis:
         threading.Thread(target=_extract, daemon=True, name="auto-memory").start()
 
     def _claude_final_stream(
-        self, system: str, max_tokens: int = 1024
+        self, system: list, volatile: str = "", max_tokens: int = 1024
     ) -> Generator[str, None, None]:
-        """Streaming response from Claude — no tools, pure text."""
+        """
+        Streaming text-only response from Claude.
+
+        The tool array is still sent, with tool_choice="none" to forbid new calls.
+        It cannot be omitted: history may hold a tool_use for a DEFERRED tool, and
+        replaying that without the definitions fails with "Tool reference 'X' not
+        found in available tools".  tool_choice="none" keeps this a pure text turn.
+        """
         try:
             full: list[str] = []
-            with self._claude.messages.stream(
+            with self._claude.beta.messages.stream(
                 model=self.model,
+                thinking={"type": "disabled"},   # keep voice replies instant (see _claude_chat)
                 system=system,
-                messages=self._claude_messages(),
+                messages=self._claude_messages(volatile=volatile),
+                tools=_search_tools(TOOL_DEFINITIONS, get_current_mode()),
+                tool_choice={"type": "none"},
                 max_tokens=max_tokens,
+                betas=[_TOOL_SEARCH_BETA],
             ) as stream:
                 for chunk in stream.text_stream:
                     full.append(chunk)
@@ -924,10 +1389,17 @@ class Jarvis:
             self._append_assistant_text(err)
             yield err
 
-    def _claude_messages(self) -> list[dict]:
+    def _claude_messages(self, volatile: str = "") -> list[dict]:
         """
         Convert self.messages to Claude's required format.
         Handles both plain string content and block lists (tool use / tool results).
+
+        `volatile` (clock, mode, status, per-turn mode notes) is appended as a trailing
+        block on the final message — the last position in the whole request — so that
+        everything before it can cache.  It is deliberately NOT persisted into
+        self.messages: the cache breakpoint sits on the message's own content, so the
+        prefix ends before the volatile block and still matches next turn, once this
+        message is history and the state text is gone.
 
         Slim overlay tool results to prevent context overflow.  A full show_overlay
         call can contain 20+ spec items (1-3 KB each) that the model doesn't need
@@ -956,10 +1428,65 @@ class Jarvis:
                 out.append({"role": role, "content": slimmed})
             else:
                 out.append({"role": role, "content": str(content) if content else ""})
+
+        # Boundary guard — the single biggest daily-chat hazard.
+        #
+        # The history trim (self.messages[-40:]) is blind, so it can leave the window
+        # starting on an assistant message, or on a user message whose content is an
+        # orphan tool_result (its parent tool_use fell out of the window). Claude 400s
+        # on either ("first message must use the user role" / "tool_result without
+        # tool_use"), and because the trim keeps landing there, EVERY following turn
+        # 400s too — silently dropping Dylan to the weaker Groq model, or losing the
+        # turn. It fires in plain conversation with no tools involved. Drop leading
+        # messages until the window begins on a real user turn.
+        def _is_orphan_tool_result(msg) -> bool:
+            c = msg.get("content")
+            return (isinstance(c, list) and any(
+                isinstance(b, dict) and b.get("type") == "tool_result" for b in c))
+
+        while out and (out[0]["role"] != "user" or _is_orphan_tool_result(out[0])):
+            out.pop(0)
+
+        # Cache the conversation too, not just the prompt.  History runs ~3.8k tokens
+        # and was billed in full every turn — more than the character prompt costs once
+        # that one is cached.  The breakpoint goes on the message's real content and
+        # the volatile state block is added AFTER it, so the cached prefix stops short
+        # of the state text.  Next turn this message is history without that block, and
+        # the prefix still matches — which is what lets the conversation read back at
+        # 10% instead of being rewritten.
+        if out:
+            last    = out[-1]
+            content = last["content"]
+            if isinstance(content, str):
+                content = [{"type": "text", "text": content}] if content else []
+            content = list(content)
+            if content and isinstance(content[-1], dict):
+                content[-1] = {**content[-1],
+                               "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+            if volatile:
+                # Worded hard as background.  Sitting in the user turn, this is the
+                # most-attended position in the request, and a plainly-labelled state
+                # dump reads as something to remark on — JARVIS started opening every
+                # reply with the clock ("11:25, sir...") even though the character
+                # prompt forbids it.  The reference data has to be here for caching;
+                # the instruction not to perform it has to be here too.
+                content.append({
+                    "type": "text",
+                    "text": (
+                        f"[Background state. {USER_NAME} did not say this and cannot see it. "
+                        f"Reference only — do NOT mention the time, mode, or status unless "
+                        f"he actually asks, or it genuinely changes your answer. Never open "
+                        f"a reply with the clock.]\n{volatile}"
+                    ),
+                })
+            if content:
+                out[-1] = {**last, "content": content}
         return out
 
     def _append_assistant_text(self, text: str) -> None:
         self.messages.append({"role": "assistant", "content": text})
+        # Persist conversation after each assistant turn so we survive restarts.
+        self._save_history()
 
     # ── Groq path (original — preserved as fallback) ───────────────────────────
 
@@ -1010,6 +1537,19 @@ class Jarvis:
         show_overlay with 20+ spec items.  The model doesn't need to re-read the
         full item list; knowing the call was made is enough.
         """
+        # Drop leading ORPHAN tool messages. A tail slice (self.messages[-N:])
+        # can begin partway through a tool exchange — on a role:"tool" message
+        # whose parent assistant(tool_calls) fell just outside the window. Groq
+        # then 400s ("tool message must be preceded by the assistant tool_calls
+        # message"), which _stream_with_tools mislabels as "API access
+        # restricted" and drops the user's turn. Trimming leading tool messages
+        # makes any window start on a valid boundary (user / system / an
+        # assistant whose tool_calls ARE followed by their results in-window).
+        start = 0
+        while start < len(msgs) and msgs[start].get("role") == "tool":
+            start += 1
+        msgs = msgs[start:]
+
         _TC_ARG_LIMIT = 120  # characters to keep from tool_call arguments
         out = []
         for m in msgs:
@@ -1080,8 +1620,16 @@ class Jarvis:
         _is_study_gen = _last_msg_lower.startswith("[study]")
 
         if emergency:
-            # Absolute minimum — just the current user turn.  Avoids any 413.
-            system, history, max_tok = get_fast_prompt(), self._slim_history(self.messages[-2:]), 256
+            # Absolute minimum — Groq 8b free tier is 6000 TPM. The fast prompt
+            # is ~2400 tokens; with tools + history we exceeded 6k on a 'project
+            # iron' turn. Hard-code a TINY system prompt for emergency retries.
+            system  = (
+                "You are JARVIS, Dylan's AI. Helpful, capable, calm authority. "
+                "British style. Short replies. Say 'sir' occasionally. "
+                "Never invent capabilities or facts. If unsure, say so."
+            )
+            history = self._slim_history(self.messages[-2:], max_chars=120)
+            max_tok = 256
         elif is_primary:
             # Use the condensed prompt for Groq — the full prompt is ~3000 tokens
             # and burns through the free-tier token-per-minute quota before the
@@ -1104,20 +1652,32 @@ class Jarvis:
         if note:
             all_messages[0]["content"] += note
 
+        # Temperature 0.9 — higher than the default 0.7 to push variety in
+        # conversational/humor responses. 0.7 was producing same-y replies to
+        # the same prompts across sessions; 0.9 keeps the model on-voice while
+        # giving it room to riff differently each time.
         kwargs = dict(
             model=model,
             messages=all_messages,
             stream=True,
             max_tokens=max_tok,
-            temperature=0.7,
+            temperature=0.9,
         )
         if with_tools:
             if is_primary:
-                kwargs["tools"] = get_openai_tools()
+                # Groq free tier is 6-12k TOKENS-PER-MINUTE. The full 106-tool
+                # schema is ~11k tokens and the fuller core set ~8.5k — a single
+                # such request blows the entire minute's budget, which is what
+                # produced the 47-second "Request too large" cascades. Use the
+                # compact ~17-tool set (~1.5k tokens) so the primary request
+                # fits with room to spare. The long-tail tools are reached
+                # through the hard-coded intercepts (overlays, AR, calendar,
+                # music, deep scan, etc.), not this general path.
+                kwargs["tools"] = get_8b_tools()
             elif is_fast:
                 kwargs["tools"] = get_8b_tools()   # compact set — avoids 413 payload errors
             else:
-                kwargs["tools"] = get_core_tools()  # scout gets the fuller set
+                kwargs["tools"] = get_8b_tools()  # keep every Groq path lean
             last_user = next(
                 (m["content"] for m in reversed(history) if m.get("role") == "user"), ""
             ).lower()
@@ -1256,19 +1816,22 @@ class Jarvis:
                 kwargs["tool_choice"] = {"type": "function",
                                          "function": {"name": "show_overlay"}}
                 kwargs["max_tokens"] = max_tok
-            elif any(w in last_user for w in _MUSIC_PAUSE_WORDS):
+            elif _has_music_word(last_user, _MUSIC_PAUSE_WORDS):
                 kwargs["tool_choice"] = {"type": "function", "function": {"name": "pause_music"}}
-            elif any(w in last_user for w in _MUSIC_SKIP_WORDS):
+            elif _has_music_word(last_user, _MUSIC_SKIP_WORDS):
                 kwargs["tool_choice"] = {"type": "function", "function": {"name": "next_track"}}
-            elif any(w in last_user for w in _MUSIC_PREV_WORDS):
+            elif _has_music_word(last_user, _MUSIC_PREV_WORDS):
                 kwargs["tool_choice"] = {"type": "function", "function": {"name": "previous_track"}}
-            elif any(w in last_user for w in _MUSIC_PLAY_WORDS):
+            elif _has_music_word(last_user, _MUSIC_PLAY_WORDS):
                 kwargs["tool_choice"] = {"type": "function", "function": {"name": "play_music"}}
             elif any(w in last_user for w in {
-                "timer", "set a timer", "set timer", "start a timer", "start timer",
-                "countdown", "count down", "set an alarm", "set alarm",
+                "set a timer", "set timer", "start a timer", "start timer",
+                "timer for", "set a countdown", "set countdown",
+                "countdown for", "set an alarm", "set alarm", "alarm for",
             }):
-                # Force set_timer tool — models prefer run_command otherwise
+                # Force set_timer tool — models prefer run_command otherwise.
+                # Bare "timer" intentionally dropped — Whisper often mis-hears
+                # math expressions ("300 over 38") with words containing "timer".
                 timer_tool = [t for t in get_openai_tools()
                               if t["function"]["name"] == "set_timer"]
                 if timer_tool:
@@ -1439,6 +2002,20 @@ class Jarvis:
                 except json.JSONDecodeError:
                     args = {}
 
+                # A fallback model (8b) is hallucination-prone: drop 'surprising'
+                # tool calls (screenshot / app-launch / camera) whose trigger
+                # words never appeared in what the user said. The primary 70b is
+                # trustworthy, so gate only when we actually fell back — the same
+                # protection _minimal_tool_retry has, which the main loop lacked.
+                if model != GROQ_MODEL and not _tool_call_plausible(name, _last_user):
+                    console.print(f"[yellow]  ⚠ dropped implausible {name}() "
+                                  f"from fallback model[/yellow]")
+                    self.messages.append({
+                        "role": "tool", "tool_call_id": tc["id"],
+                        "content": "(skipped — not what the user asked for)",
+                    })
+                    continue
+
                 console.print(f"[dim]  ⚙  {name}({_summarise(args)})[/dim]")
                 result = self.tools_executor.execute(name, args)
 
@@ -1483,6 +2060,14 @@ class Jarvis:
                             "add_to_playlist", "create_playlist"}:
                 yield from self._plain_stream()
                 break
+        else:
+            # Loop fell through _MAX_TOOL_ROUNDS with no terminal answer — every
+            # round kept calling non-finishing tools (read_file, grep_code, …).
+            # Force a final plain (tool-free) response so the turn isn't silently
+            # dropped AND self.messages doesn't end on a dangling tool message
+            # (which would orphan the next turn's history window). Mirrors what
+            # the Claude tool loop does after its own round budget.
+            yield from self._plain_stream()
 
     def _blueprint_recovery(self, last_user: str) -> Generator[str, None, None]:
         """
@@ -1597,11 +2182,10 @@ class Jarvis:
         ]
 
         from openai import RateLimitError
-        # Try models in order — prefer tool-use-optimised models for recovery
+        # Try models in order. llama3-groq-8b-tool-use-preview and llama-4-scout
+        # both removed — first decommissioned, second has tokenizer bugs.
         _recovery_models = [
             GROQ_MODEL,
-            "llama3-groq-8b-8192-tool-use-preview",  # Groq fine-tuned for tools
-            "meta-llama/llama-4-scout-17b-16e-instruct",
             "llama-3.1-8b-instant",
         ]
         for _rm in _recovery_models:
@@ -1643,23 +2227,26 @@ class Jarvis:
         console.print("[yellow]Blueprint recovery: all models exhausted[/yellow]")
 
     def _minimal_tool_retry(self) -> Generator[str, None, None]:
-        from openai import RateLimitError
         from brain.tools import get_minimal_tools
+        from brain.personality import get_tiny_prompt
         fast_model = "llama-3.1-8b-instant"
-        system = get_fast_prompt()
-        # Use only the last 6 messages — the 8B model has a very tight TPM limit
-        messages = [{"role": "system", "content": system}] + self.messages[-6:]
+        # Tiny prompt (~120 tok) not get_fast_prompt (~3000 tok): the emergency
+        # path must stay under the 8b's 6,000 TPM limit or it 413s and the user
+        # gets nothing. Slim history too.
+        system = get_tiny_prompt()
+        messages = [{"role": "system", "content": system}] + self._slim_history(
+            self.messages[-4:], max_chars=140)
         try:
             last_u = next(
                 (m["content"] for m in reversed(self.messages) if m.get("role") == "user"), ""
             ).lower()
-            if any(w in last_u for w in _MUSIC_PAUSE_WORDS):
+            if _has_music_word(last_u, _MUSIC_PAUSE_WORDS):
                 _forced = {"type": "function", "function": {"name": "pause_music"}}
-            elif any(w in last_u for w in _MUSIC_SKIP_WORDS):
+            elif _has_music_word(last_u, _MUSIC_SKIP_WORDS):
                 _forced = {"type": "function", "function": {"name": "next_track"}}
-            elif any(w in last_u for w in _MUSIC_PREV_WORDS):
+            elif _has_music_word(last_u, _MUSIC_PREV_WORDS):
                 _forced = {"type": "function", "function": {"name": "previous_track"}}
-            elif any(w in last_u for w in _MUSIC_PLAY_WORDS):
+            elif _has_music_word(last_u, _MUSIC_PLAY_WORDS):
                 _forced = {"type": "function", "function": {"name": "play_music"}}
             elif any(w in last_u for w in ("remind me", "set a reminder", "add a reminder", "reminder")):
                 _forced = {"type": "function", "function": {"name": "add_reminder"}}
@@ -1714,12 +2301,29 @@ class Jarvis:
                 "role": "assistant", "content": full_text or None,
                 "tool_calls": tool_calls_formatted,
             })
+            # Last thing the user actually said — used to sanity-check the
+            # fallback model's tool choices.
+            _last_user_text = next(
+                (m["content"] for m in reversed(self.messages)
+                 if m.get("role") == "user" and isinstance(m.get("content"), str)),
+                "",
+            )
             for tc in tool_calls_formatted:
                 name = tc["function"]["name"]
                 try:
                     args = json.loads(tc["function"]["arguments"])
                 except json.JSONDecodeError:
                     args = {}
+                # Drop hallucinated 'surprising' tool calls — the 8b fallback
+                # fires screenshots / app-launches on input that never asked.
+                if not _tool_call_plausible(name, _last_user_text):
+                    console.print(f"[yellow]  ⚠ dropped implausible {name}() — "
+                                  f"no matching keyword in {_last_user_text[:40]!r}[/yellow]")
+                    self.messages.append({
+                        "role": "tool", "tool_call_id": tc["id"],
+                        "content": "(skipped — not what the user asked for)",
+                    })
+                    continue
                 console.print(f"[dim]  ⚙  {name}({_summarise(args)})[/dim]")
                 result = self.tools_executor.execute(name, args)
                 content = str(result) if not isinstance(result, list) else \
@@ -1758,16 +2362,16 @@ class Jarvis:
             last_user = next(
                 (m["content"] for m in reversed(self.messages) if m.get("role") == "user"), ""
             ).lower()
-            if any(w in last_user for w in _MUSIC_PAUSE_WORDS):
+            if _has_music_word(last_user, _MUSIC_PAUSE_WORDS):
                 self.tools_executor.execute("pause_music", {})
                 reply = "Paused."
-            elif any(w in last_user for w in _MUSIC_SKIP_WORDS):
+            elif _has_music_word(last_user, _MUSIC_SKIP_WORDS):
                 self.tools_executor.execute("next_track", {})
                 reply = "Next."
-            elif any(w in last_user for w in _MUSIC_PREV_WORDS):
+            elif _has_music_word(last_user, _MUSIC_PREV_WORDS):
                 self.tools_executor.execute("previous_track", {})
                 reply = "Going back."
-            elif any(w in last_user for w in _MUSIC_PLAY_WORDS):
+            elif _has_music_word(last_user, _MUSIC_PLAY_WORDS):
                 self.tools_executor.execute("play_music", {})
                 reply = "Playing."
             else:

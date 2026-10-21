@@ -34,3 +34,6 @@ memory/
 .vscode/
 .idea/
 *.swp
+
+# Alex build marker (written by build-alex.sh)
+jarvis-app/product.build

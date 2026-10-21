@@ -6,6 +6,31 @@ No extra permissions beyond what Mail.app normally has.
 import subprocess
 
 
+def _esc(s: str) -> str:
+    """
+    Escape a value for safe embedding inside an AppleScript double-quoted
+    string. Backslash FIRST (so we don't double-escape our own additions),
+    then double-quote, then flatten CR/LF/tab to spaces so a value can't
+    break out of the string into new AppleScript statements. The model
+    controls these fields (mailbox, subject, to, body), so this closes a
+    real injection path — osascript can `do shell script`.
+    """
+    if s is None:
+        return ""
+    return (
+        str(s).replace("\\", "\\\\").replace('"', '\\"')
+        .replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    )
+
+
+def _clamp_count(count, hi: int = 25) -> int:
+    """Coerce a possibly-string, possibly-negative count into [1, hi]."""
+    try:
+        return max(1, min(int(count), hi))
+    except (TypeError, ValueError):
+        return 10
+
+
 def _run(script: str, timeout: int = 15) -> tuple[bool, str]:
     try:
         r = subprocess.run(
@@ -30,7 +55,7 @@ _PERM_MSG = (
 
 def get_unread_emails(count: int = 10) -> str:
     """Get unread emails from Mail.app — subject, sender, preview."""
-    count = min(count, 25)
+    count = _clamp_count(count)
     script = f"""
 tell application "Mail"
     set unread to (messages of inbox whose read status is false)
@@ -61,10 +86,10 @@ end tell
 
 def get_recent_emails(count: int = 10, mailbox: str = "inbox") -> str:
     """Get the most recent emails regardless of read status."""
-    count = min(count, 25)
+    count = _clamp_count(count)
     script = f"""
 tell application "Mail"
-    set mbox to mailbox "{mailbox}"
+    set mbox to mailbox "{_esc(mailbox)}"
     set msgs to (messages of mbox)
     set output to ""
     set counter to 0
@@ -90,7 +115,7 @@ end tell
 
 def read_email(subject_keyword: str) -> str:
     """Read the full content of an email matching a subject keyword."""
-    safe = subject_keyword.replace('"', "'")
+    safe = _esc(subject_keyword)
     script = f"""
 tell application "Mail"
     set matched to (messages of inbox whose subject contains "{safe}")
@@ -114,9 +139,9 @@ end tell
 
 def send_email(to: str, subject: str, body: str) -> str:
     """Send an email via Mail.app."""
-    safe_to      = to.replace('"', "'")
-    safe_subject = subject.replace('"', "'")
-    safe_body    = body.replace("\\", "\\\\").replace('"', '\\"')
+    safe_to      = _esc(to)
+    safe_subject = _esc(subject)
+    safe_body    = _esc(body)
     script = f"""
 tell application "Mail"
     set newMsg to make new outgoing message with properties {{subject:"{safe_subject}", content:"{safe_body}", visible:true}}
@@ -135,9 +160,9 @@ return "sent"
 
 def draft_email(to: str, subject: str, body: str) -> str:
     """Open a draft email in Mail.app without sending — user reviews before sending."""
-    safe_to      = to.replace('"', "'")
-    safe_subject = subject.replace('"', "'")
-    safe_body    = body.replace("\\", "\\\\").replace('"', '\\"')
+    safe_to      = _esc(to)
+    safe_subject = _esc(subject)
+    safe_body    = _esc(body)
     script = f"""
 tell application "Mail"
     activate
@@ -151,4 +176,4 @@ return "drafted"
     ok, out = _run(script)
     if not ok:
         return _PERM_MSG if any(k in out.lower() for k in ["not allowed", "access", "1743"]) else f"Couldn't draft: {out}"
-    return f"Draft opened in Mail — review and send when ready."
+    return "Draft opened in Mail — review and send when ready."

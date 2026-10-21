@@ -14,9 +14,7 @@ Coordinate system (matches canvas rendering):
 
 from __future__ import annotations
 
-import json
 import uuid
-from typing import Optional
 
 # ── Scene singleton ────────────────────────────────────────────────────────────
 
@@ -137,6 +135,14 @@ def apply_operations(ops: list[dict]) -> str:
         elif action == "modify":
             target_id = op.get("id") or op.get("shape", {}).get("id")
             updates   = op.get("shape", op.get("updates", {}))
+            # Smaller models sometimes emit the changed fields as top-level
+            # keys ({"action":"modify","id":"s_x","color":"red"}) instead of
+            # nesting them under "shape"/"updates". Fall back to those so the
+            # modify actually applies instead of being a silent no-op that
+            # still reports success.
+            if not updates:
+                updates = {k: v for k, v in op.items()
+                           if k not in ("action", "id", "shape", "updates")}
             matched   = False
             for s in shapes:
                 if s["id"] == target_id:

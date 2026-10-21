@@ -75,10 +75,17 @@ def save_fact(fact: str) -> str:
     try:
         existing = _parse_facts()
 
-        # Replace near-duplicate if found (keeps the updated timestamp), otherwise append
+        # Replace near-duplicate if found, otherwise append.
         updated = False
         for i, e in enumerate(existing):
             if _facts_match(fact, e):
+                # If the fact text is unchanged, leave the file byte-identical. It
+                # rides in the 1h-cached stable system prompt, so re-stamping an
+                # unchanged fact rewrites memory.txt and busts the cache for that
+                # turn — the ~7k prefix gets re-written at 2x instead of read at
+                # 0.1x. Only rewrite when the content actually changed.
+                if _strip_ts(e).strip().lstrip("- ") == fact:
+                    return "Already knew that."
                 existing[i] = stamped
                 updated = True
                 break

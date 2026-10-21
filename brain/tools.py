@@ -43,6 +43,10 @@ _CORE_TOOL_NAMES = {
     "start_homework_loop", "stop_homework_loop",
     # AR holographic builder
     "ar_build",
+    # Self-inspection — read own code, logs, history
+    "read_my_code", "search_my_code", "list_my_files",
+    "read_my_logs", "read_my_history",
+    "get_last_diagnostic_findings",
 }
 
 # 8b model (llama-3.1-8b-instant): SMALL tool set to avoid Groq 413 payload-too-large errors.
@@ -52,7 +56,7 @@ _8B_TOOL_NAMES = {
     "web_search", "youtube_search", "take_screenshot", "remember_fact",
     "quick_note", "add_reminder", "get_reminders", "set_timer",
     "send_imessage", "get_weather", "get_calendar_events",
-    "set_dark_mode", "get_battery_status",
+    "set_dark_mode", "get_battery_status", "set_mode", "watch_movie", "widget_control",
     # NOTE: create_calendar_event intentionally omitted — 8b model cannot reliably
     # extract title/start params. 70b and scout handle this in normal use.
 }
@@ -63,12 +67,19 @@ _8B_TOOL_NAMES = {
 # Minimal tools for the last-ditch retry when 8b tool JSON fails.
 # Fewer tools = simpler JSON = higher success rate.
 # Covers the most common voice commands that must NEVER fall through.
+# NOTE: show_overlay is DELIBERATELY excluded — its schema is ~1,450 tokens
+# (half the whole minimal payload) and, combined with the system prompt, it
+# pushed the 8b request over Groq's 6,000 TPM limit (the 413 errors). The
+# emergency path is for basic commands; overlays are handled by the bigger
+# models. read_camera is likewise dropped to keep the payload lean.
 _MINIMAL_TOOL_NAMES = {
     "play_music", "open_application", "web_search", "youtube_search",
     "take_screenshot", "remember_fact", "get_weather", "get_forecast",
-    "show_overlay", "read_camera",
     # Task management — must be in minimal set or "remind me" falls through to quick_note
     "quick_note", "add_reminder", "get_reminders", "set_timer",
+    # Music controls — required because tool_choice can force these by name.
+    # Missing them caused Groq 400 errors that triggered runaway TTS fallback.
+    "pause_music", "next_track", "previous_track",
 }
 
 
@@ -89,8 +100,20 @@ def get_minimal_tools() -> list:
 
 TOOL_DEFINITIONS = [
     # ── Calendar ────────────────────────────────────────────────────────
-    {"name": "get_calendar_events", "description": "Get upcoming calendar events.",
+    {"name": "get_calendar_events", "description": "Get upcoming calendar events from Apple Calendar via EventKit. Only sees calendars Dylan has synced to Apple Calendar.app. If he uses Google Calendar or Outlook without syncing, this returns 'nothing scheduled' even when events exist — in that case call read_calendar_visually instead.",
      "input_schema": {"type": "object", "properties": {"days": {"type": "integer", "default": 7}}, "required": []}},
+
+    {"name": "read_calendar_visually",
+     "description": (
+         "Open Apple Calendar.app, take a screenshot, and use vision to read whatever events "
+         "are actually displayed. Use this when get_calendar_events returns nothing but Dylan "
+         "insists he has events, OR for any 'what's coming up / what's my next event' question. "
+         "Sees all calendars displayed (Google, Outlook, iCloud, school portals) — anything "
+         "the user can see in Calendar.app, JARVIS can read."
+     ),
+     "input_schema": {"type": "object", "properties": {
+         "question": {"type": "string", "description": "Optional specific question about the calendar — defaults to 'list every event you can see this week'."}
+     }, "required": []}},
 
     {"name": "create_calendar_event",
      "description": (
@@ -324,10 +347,26 @@ TOOL_DEFINITIONS = [
 
     {"name": "take_screenshot",
      "description": (
-         "Capture the full screen. "
-         "Set for_control=true when you need to click/type next — returns EXACT pixel coordinates matching the screen. "
-         "Set for_control=false for general vision questions. "
-         "Use read_chrome_tab instead when the user wants to know about a web page — faster and more accurate."
+         "Capture the screen to SEE what is currently displayed. "
+         "Call this when Dylan refers to something ON his screen or asks you to look at / read / see it "
+         "(e.g. 'what's this', 'read this to me', 'what am I looking at', 'help me with what's on screen'), "
+         "OR when you must click/type next. "
+         "CRITICAL — a DANGLING REFERENCE means the screen. If Dylan says 'this', 'that', 'it', or 'here' "
+         "and nothing in the conversation says what he means, he is pointing at his screen: he is looking "
+         "right at it and assumes you are too. That covers bare commands as much as questions — "
+         "'answer this', 'answer it', 'solve this', 'do this one', 'what do I do?', "
+         "'what is the answer to this?', 'is this right?', 'what goes here?'. "
+         "SCREENSHOT IT. Never reply that no question was attached, never ask what he is referring to, "
+         "and never say you cannot see anything — you have not looked yet. Looking is free; asking him to "
+         "re-type what is already on his screen is the single most annoying thing you can do. "
+         "Do NOT screenshot for ordinary conversation, or for a question that is self-contained and needs no "
+         "screen to answer ('what's 8 times 7', 'tell me a joke', 'how was your day'). "
+         "Set for_control=true WHENEVER you intend to click or type next — it returns the screen at "
+         "exact pixel dimensions so you can read coordinates straight off the image and pass them to "
+         "click_screen. If Dylan asks you to select, pick, choose, mark, or click an answer, you MUST "
+         "use for_control=true and then actually call click_screen on the option — saying the answer "
+         "out loud is not selecting it. "
+         "Use read_chrome_tab instead when the user asks about a web page — faster and more accurate."
      ),
      "input_schema": {"type": "object", "properties": {
          "question": {"type": "string", "default": "Describe everything on screen. For each input field, button, or clickable element — report its CENTER x,y coordinates."},
@@ -532,6 +571,117 @@ TOOL_DEFINITIONS = [
          "minutes": {"type": "integer", "default": 0}
      }, "required": ["enabled"]}},
 
+    {"name": "set_mode",
+     "description": ("Switch JARVIS's own HUD/attention mode. Use this whenever "
+                     "Dylan's intent implies a mode — e.g. 'get out of my way' / "
+                     "'I'm about to game' → gaming; 'I'm watching something' → "
+                     "watch; 'let me work' → work; 'go back to normal' / 'full "
+                     "screen' → normal; 'stop switching modes' → auto_off; "
+                     "'watch my screen again' → auto_on. gaming=compact+silent, "
+                     "watch=compact+silent (video), work=compact HUD, "
+                     "normal=full HUD.\n"
+                     "STUDY — 'help me study', 'doing homework', 'study mode', "
+                     "'quiz me', 'I have a problem set'. This is the ONLY mode in "
+                     "which JARVIS reads the screen for problems or builds practice "
+                     "tests: those tools are not even loaded outside it, so switch "
+                     "to study FIRST when he wants schoolwork help. Keeping them out "
+                     "of the other modes is deliberate — otherwise a casual 'what do "
+                     "I do?' while browsing makes JARVIS screenshot the desktop."),
+     "input_schema": {"type": "object", "properties": {
+         "mode": {"type": "string",
+                  "enum": ["gaming", "work", "watch", "study", "normal",
+                           "auto_on", "auto_off"]}
+     }, "required": ["mode"]}},
+
+    {"name": "watch_movie",
+     "description": ("Find where a specific movie or show is streaming and open it in the "
+                     "browser, logged in and ready. Prioritises Dylan's OWN subscriptions "
+                     "(Netflix, Disney+, Peacock, Prime Video) and is honest when a title "
+                     "isn't on them. Use whenever he names something to watch — 'let's watch "
+                     "Wicked', 'put on The Office', 'throw on Oppenheimer'. Set and_play=true "
+                     "ONLY when he explicitly says to play/start it now ('play it', 'put it on "
+                     "and play it'); otherwise it just takes him to the title so he can hit play."),
+     "input_schema": {"type": "object", "properties": {
+         "title": {"type": "string", "description": "The movie or show title."},
+         "and_play": {"type": "boolean",
+                      "description": "True ONLY if Dylan explicitly said to play/start it now."}
+     }, "required": ["title"]}},
+
+    {"name": "widget_control",
+     "description": ("Show, hide, or reset widgets on Dylan's HUD dashboard (time, calendar, "
+                     "browser). Use when he says: 'pull up the calendar' / 'add the browser' → "
+                     "action='show'; 'get rid of this' / 'hide the calendar' / 'close that' → "
+                     "action='hide'; 'put everything back' / 'reset the widgets' / 'tidy up' → "
+                     "action='reset'. 'this'/'this one' means the widget he last touched — leave "
+                     "widget blank for that."),
+     "input_schema": {"type": "object", "properties": {
+         "action": {"type": "string", "enum": ["show", "hide", "reset", "toggle"]},
+         "widget": {"type": "string",
+                    "description": "time, calendar, or browser. Blank or 'this' = last-touched widget. Ignored for reset."}
+     }, "required": ["action"]}},
+
+    {"name": "get_stock_price",
+     "description": ("Get the current price of a stock or ETF (e.g. AAPL, TSLA, SPY). Use when Dylan "
+                     "asks about a ticker or 'how's [company] stock doing'."),
+     "input_schema": {"type": "object", "properties": {
+         "symbol": {"type": "string", "description": "Ticker symbol, e.g. AAPL, TSLA, NVDA."}
+     }, "required": ["symbol"]}},
+
+    {"name": "get_crypto_price",
+     "description": ("Get the current price of a cryptocurrency (bitcoin, ethereum, solana, etc). "
+                     "Use for 'what's bitcoin at', 'price of eth'."),
+     "input_schema": {"type": "object", "properties": {
+         "coin": {"type": "string", "description": "Coin name or ticker: bitcoin, btc, ethereum, solana…"}
+     }, "required": ["coin"]}},
+
+    {"name": "get_sports_scores",
+     "description": ("Get live/recent sports scores (NBA, NFL, MLB, NHL, MLS, Premier League, etc). "
+                     "Use for 'what's the score', 'did the [team] win', 'NBA scores tonight'."),
+     "input_schema": {"type": "object", "properties": {
+         "query": {"type": "string", "description": "League/context, e.g. 'nba', 'nfl', 'premier league'. Default nba."}
+     }, "required": []}},
+
+    {"name": "read_document",
+     "description": ("Extract the text from a PDF, Word doc, RTF, or text file so you can read or "
+                     "summarize it. Use for 'summarize this PDF', 'what does this doc say', 'read me that file'."),
+     "input_schema": {"type": "object", "properties": {
+         "path": {"type": "string", "description": "Path to the file, e.g. ~/Downloads/report.pdf."}
+     }, "required": ["path"]}},
+
+    {"name": "convert_image",
+     "description": "Convert an image to another format. Use for 'convert this to jpg', 'make this a png'.",
+     "input_schema": {"type": "object", "properties": {
+         "path": {"type": "string"},
+         "to_format": {"type": "string", "description": "png, jpeg, heic, gif, tiff, bmp, or pdf."}
+     }, "required": ["path", "to_format"]}},
+
+    {"name": "facetime_call",
+     "description": "Start a FaceTime call to a contact name, phone number, or email. Use for 'FaceTime [person]'.",
+     "input_schema": {"type": "object", "properties": {
+         "target": {"type": "string", "description": "Contact name, phone number, or email."}
+     }, "required": ["target"]}},
+
+    {"name": "get_directions",
+     "description": "Open Apple Maps with driving directions. Use for 'directions to X', 'navigate to X'.",
+     "input_schema": {"type": "object", "properties": {
+         "destination": {"type": "string"},
+         "origin": {"type": "string", "description": "Optional start point; defaults to current location."}
+     }, "required": ["destination"]}},
+
+    {"name": "empty_trash",
+     "description": "Empty the macOS Trash. Use for 'empty the trash', 'take out the trash'.",
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
+
+    {"name": "health_reminders",
+     "description": ("Start, stop, or list recurring health nudges — hydration, stretch, posture, "
+                     "eye-rest, breathe. Use for 'remind me to drink water every 45 minutes', 'nudge "
+                     "me to stretch every hour', 'stop the water reminders', 'what reminders are on'."),
+     "input_schema": {"type": "object", "properties": {
+         "action": {"type": "string", "enum": ["start", "stop", "list"]},
+         "kind": {"type": "string", "description": "water, stretch, posture, eyes, or breathe. Blank + stop = stop all."},
+         "interval_min": {"type": "integer", "description": "Minutes between nudges (default 30)."}
+     }, "required": ["action"]}},
+
     {"name": "random_number", "description": "Generate a random number between min and max.",
      "input_schema": {"type": "object", "properties": {
          "min_val": {"type": "integer", "default": 1},
@@ -572,6 +722,58 @@ TOOL_DEFINITIONS = [
      "input_schema": {"type": "object", "properties": {}, "required": []}},
 
     {"name": "stop_study_mode", "description": "Stop study mode and summarize what was captured.",
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
+
+    # ── Mic / listening ───────────────────────────────────────────────────
+    {"name": "set_listening",
+     "description": (
+         "Turn the microphone ON or OFF. Use when Dylan wants to go quiet / "
+         "type-only — 'mute the mic', 'stop listening', 'type mode', 'go quiet', "
+         "'I'll just type', 'mic off' → off; 'start listening again', 'you can "
+         "listen', 'mic on', 'unmute' → on. "
+         "OFF is a hard mute: the mic stops processing all audio, so nothing in "
+         "the room can be picked up. Typed messages and spoken replies keep "
+         "working either way — turning the mic off does NOT make you go silent, it "
+         "just stops you listening. This is the right call whenever he's typing to "
+         "you with headphones in."),
+     "input_schema": {"type": "object", "properties": {
+         "on": {"type": "boolean", "description": "true = listen, false = mic off (type-only)"}
+     }, "required": ["on"]}},
+
+    # ── Practice tests ────────────────────────────────────────────────────
+    {"name": "create_practice_test",
+     "description": (
+         "Generate a practice test on a topic and open it in the browser, ready to take. "
+         "Use when Dylan says 'quiz me on X', 'make me a practice test', 'test me on X', "
+         "'give me practice questions', or is studying for something specific. "
+         "CALL IT IMMEDIATELY — do not ask how many questions, what format, one-at-a-time "
+         "vs all-at-once, or which subtopics. He asked for a test, not a conversation about "
+         "a test. Fill in sensible defaults from what he said and generate; he can ask for "
+         "a different set afterwards in one breath. "
+         "Every answer key is independently re-solved before the test is shown, and any "
+         "question whose key doesn't hold up is discarded — so never claim an answer is "
+         "right that the check threw out. "
+         "Pick `count` from what he asked for; default 8. Set `difficulty` to match his "
+         "course (e.g. 'AP Calculus BC level', 'honors chemistry')."
+     ),
+     "input_schema": {"type": "object", "properties": {
+         "topic": {"type": "string", "description": "What to test on — as specific as he gave you, e.g. 'related rates' not 'calculus'"},
+         "count": {"type": "integer", "default": 8, "description": "Number of questions (1-25)"},
+         "difficulty": {"type": "string", "default": "AP level"},
+     }, "required": ["topic"]}},
+
+    {"name": "show_test_answers",
+     "description": (
+         "Reveal the worked answer key for the practice test currently open, and score "
+         "whatever he already picked. Use for 'show the answers', 'how did I do', "
+         "'what did I get wrong', or 'just answer it for me'. "
+         "Call it whenever he asks, however soon after the test appeared — plenty of "
+         "people want the key up front to study from, or already did the work on paper. "
+         "Do not comment on the timing or ask what he really wants; just reveal it. "
+         "This works on tests JARVIS generated. It is NOT for filling in a real graded "
+         "assignment, a school portal, or a test being administered — if that's what he's "
+         "pointing at, help him work through it instead."
+     ),
      "input_schema": {"type": "object", "properties": {}, "required": []}},
 
     # ── Camera vision ─────────────────────────────────────────────────────
@@ -800,4 +1002,76 @@ TOOL_DEFINITIONS = [
              }
          }
      }},
+
+    # ── Self-inspection ───────────────────────────────────────────────────
+    # These tools let JARVIS investigate his OWN code, logs, and state when
+    # something isn't working. Use them when Dylan asks "why did you do X",
+    # "what does your Y look like", "look at your own code", or when you
+    # need to explain a failure honestly instead of guessing. NOT for
+    # generic file ops on Dylan's machine — use read_file / grep_code for
+    # files outside the JARVIS project directory.
+
+    {"name": "read_my_code",
+     "description": (
+         "Read a JARVIS source file by its path relative to the JARVIS project root "
+         "(e.g. 'server.py', 'tools/diagnostics.py', 'brain/jarvis.py'). "
+         "Use this when investigating your OWN behavior. "
+         "Secrets (.env), binaries, and __pycache__ are blocked."
+     ),
+     "input_schema": {"type": "object", "properties": {
+         "path": {"type": "string", "description": "Path relative to JARVIS root, e.g. 'brain/jarvis.py'"},
+     }, "required": ["path"]}},
+
+    {"name": "search_my_code",
+     "description": (
+         "Regex search across JARVIS's own source. Use to find where a function is "
+         "defined, where a phrase is matched, or where a config lives. Returns "
+         "matching lines in 'path:line: snippet' format."
+     ),
+     "input_schema": {"type": "object", "properties": {
+         "pattern":     {"type": "string", "description": "Regex pattern, e.g. '_MUSIC_SKIP_WORDS'"},
+         "file_glob":   {"type": "string", "default": "**/*.py", "description": "Glob to limit files, e.g. 'brain/*.py' or '**/*.js'"},
+         "max_results": {"type": "integer", "default": 30},
+     }, "required": ["pattern"]}},
+
+    {"name": "list_my_files",
+     "description": (
+         "List files in a JARVIS directory (e.g. '.', 'tools', 'brain', "
+         "'jarvis-app/renderer'). Use to navigate your own codebase."
+     ),
+     "input_schema": {"type": "object", "properties": {
+         "path": {"type": "string", "default": ".", "description": "Directory relative to JARVIS root"},
+     }, "required": []}},
+
+    {"name": "read_my_logs",
+     "description": (
+         "Tail your own captured server log to see what actually happened recently "
+         "— music gates, brain calls, errors, broadcasts. Use this when Dylan asks "
+         "'why did you do X just now' so you answer from real evidence, not guesses."
+     ),
+     "input_schema": {"type": "object", "properties": {
+         "lines": {"type": "integer", "default": 100, "description": "How many trailing lines to return (max 500)"},
+     }, "required": []}},
+
+    {"name": "read_my_history",
+     "description": (
+         "Read your own recent conversation history with Dylan. Use this when "
+         "answering 'why did you say X' or 'what did we just talk about' so you "
+         "ground the answer in what actually happened."
+     ),
+     "input_schema": {"type": "object", "properties": {
+         "max_turns": {"type": "integer", "default": 20, "description": "How many recent turns to read (default 20)"},
+     }, "required": []}},
+
+    {"name": "get_last_diagnostic_findings",
+     "description": (
+         "Get the auto-investigation results from the most recent diagnostic. "
+         "When the diagnostic detected failures, this returns the related log "
+         "lines and source-file pointers that were captured automatically. "
+         "Use when Dylan asks 'why did X fail', 'what's wrong with X', or "
+         "'explain that failure' after he just ran a system check."
+     ),
+     "input_schema": {"type": "object", "properties": {
+         "check_name": {"type": "string", "description": "Optional — specific check (e.g. 'cloud_brain', 'screen_watcher'). Omit to get all findings."},
+     }, "required": []}},
 ]

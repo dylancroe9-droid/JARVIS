@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import re
 import threading
-import time
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -55,6 +54,12 @@ class ProactiveEngine:
 
     # ── Main loop ──────────────────────────────────────────────────────────────
 
+    # Purge _alerted entries this old. 24 hours covers the longest
+    # imaginable cooldown a real meeting/goal/email key would need —
+    # past that, the original event is over and we don't need to keep
+    # the timestamp to suppress repeats.
+    _ALERTED_TTL_SEC = 24 * 60 * 60
+
     def _loop(self) -> None:
         # Let the server fully boot before first check (5 min wait)
         self._stop.wait(300)
@@ -63,9 +68,27 @@ class ProactiveEngine:
                 self._check_upcoming_meetings()
                 self._check_email_invitations()
                 self._check_memory_goals()
+                # Periodic memory hygiene — without this the _alerted dict
+                # grew unbounded over multi-day uptime (every unique meeting,
+                # email subject, or goal phrasing added a permanent entry).
+                self._purge_stale_alerts()
             except Exception:
                 pass  # never crash the background thread
             self._stop.wait(POLL_INTERVAL)
+
+    def _purge_stale_alerts(self) -> None:
+        """Drop _alerted entries older than _ALERTED_TTL_SEC."""
+        now = datetime.now()
+        cutoff = self._ALERTED_TTL_SEC
+        # Snapshot keys so we can mutate the dict during iteration
+        stale = [k for k, ts in list(self._alerted.items())
+                 if (now - ts).total_seconds() > cutoff]
+        for k in stale:
+            self._alerted.pop(k, None)
+        # Also cap _seen_emails — same growth pattern, fewer entries
+        if len(self._seen_emails) > 2000:
+            # Keep the most recent 1000 (arbitrary but bounded)
+            self._seen_emails = set(list(self._seen_emails)[-1000:])
 
     # ── Guards ─────────────────────────────────────────────────────────────────
 
@@ -93,7 +116,6 @@ class ProactiveEngine:
             return
 
         now       = datetime.now()
-        warn_at   = now + timedelta(minutes=MEETING_WARN_MINUTES)
 
         for line in raw.splitlines():
             line = line.strip().lstrip("•").strip()
@@ -114,7 +136,12 @@ class ProactiveEngine:
             self._mark(key)
             mins = max(0, int(diff.total_seconds() / 60))
             when = f"in {mins} minute{'s' if mins != 1 else ''}" if mins > 0 else "right now"
-            broadcast({"type": "proactive", "text": f"📅 '{title}' starts {when}."})
+            # Use the native+HUD notify helper so it pops outside the HUD too.
+            try:
+                from server import notify
+                notify(title="📅 Upcoming Event", message=f"'{title}' starts {when}.", sound=True)
+            except Exception:
+                broadcast({"type": "proactive", "text": f"📅 '{title}' starts {when}."})
 
     def _parse_dt(self, s: str) -> Optional[datetime]:
         """Parse a date string from calendar output (strips trailing calendar name)."""

@@ -106,7 +106,6 @@ Other entry points:
 |------------------|---------------------------|----------|
 | `./start.sh`     | Python server + Electron  | Normal — this is the product |
 | `./run.sh`       | `chat.py` — terminal CLI  | Headless / debugging |
-| `./run_app.sh`   | `app.py` — older HUD      | Legacy |
 | `chat.py`        | Pure Python REPL          | Quick brain tests |
 
 Build a distributable DMG: see [`jarvis-app/BUILD.md`](jarvis-app/BUILD.md).

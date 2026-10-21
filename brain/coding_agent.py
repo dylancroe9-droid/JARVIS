@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import os
 import subprocess
-import json
 import threading
 from typing import Callable
 
@@ -313,7 +312,23 @@ def run_coding_agent(
     progress_cb(phase, detail) is called at each step for live updates.
     Returns {"summary": str, "restart_needed": list[str], "success": bool}
     """
-    import anthropic
+    # The coding agent is Anthropic-only. Fail honestly and immediately if it
+    # can't run, rather than constructing a client and surfacing a confusing
+    # low-level "API error: 401" after the user was told work had started.
+    if not api_key:
+        msg = ("The coding agent needs an Anthropic API key, sir — none is "
+               "configured. Add ANTHROPIC_API_KEY to .env to enable it.")
+        if progress_cb:
+            progress_cb("error", msg)
+        return {"summary": msg, "restart_needed": [], "success": False}
+    try:
+        import anthropic
+    except ImportError:
+        msg = ("The coding agent needs the 'anthropic' package, which isn't "
+               "installed. Run: pip install anthropic")
+        if progress_cb:
+            progress_cb("error", msg)
+        return {"summary": msg, "restart_needed": [], "success": False}
     client = anthropic.Anthropic(api_key=api_key)
 
     messages = [{"role": "user", "content": request}]

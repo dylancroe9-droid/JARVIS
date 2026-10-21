@@ -5,7 +5,6 @@ import ast
 import subprocess
 import threading
 import time as _time
-from typing import Optional
 
 
 # ── Timers ───────────────────────────────────────────────────────────────────
@@ -186,13 +185,13 @@ def calculate(expression: str) -> str:
         tree = ast.parse(expression.strip(), mode="eval")
         for node in ast.walk(tree):
             if not isinstance(node, _SAFE):
-                return f"I can only evaluate pure math expressions."
+                return "I can only evaluate pure math expressions."
         result = eval(compile(tree, "<string>", "eval"))  # noqa: S307
         # Format nicely
         if isinstance(result, float) and result == int(result):
             result = int(result)
         return f"{expression} = {result}"
-    except Exception as e:
+    except Exception:
         return "I couldn't evaluate that expression — make sure it's valid math (e.g. '2 + 2', 'sqrt(16)', '5 ** 3')."
 
 

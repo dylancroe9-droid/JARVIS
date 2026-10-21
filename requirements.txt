@@ -1,4 +1,5 @@
 # Core
+anthropic>=0.40.0          # Claude — primary brain when ANTHROPIC_API_KEY is set
 openai>=1.30.0
 python-dotenv>=1.0.0
 rich>=13.0.0
@@ -12,6 +13,8 @@ openai-whisper>=20231117
 
 # macOS system integration
 pyobjc-framework-Cocoa>=9.0
+pyobjc-framework-Vision>=10.0    # Apple Vision OCR for screen watcher
+pyobjc-framework-Quartz>=10.0    # Synthetic mouse events for auto-skip / auto-dismiss
 
 # Voice — TTS (priority order: ElevenLabs → edge-tts → macOS say)
 elevenlabs>=1.0.0
@@ -27,3 +30,6 @@ httpx>=0.27.0
 playwright>=1.44.0
 webrtcvad
 resemblyzer
+
+# Streaming concierge — keyless "where to watch" lookup (JustWatch)
+simple-justwatch-python-api>=0.16

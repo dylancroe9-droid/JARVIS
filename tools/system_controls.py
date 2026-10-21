@@ -75,12 +75,12 @@ def lock_screen() -> str:
         r2 = subprocess.run(["pmset", "sleepnow"], capture_output=True, timeout=5)
         if r2.returncode == 0:
             return "Screen locked (sleep)."
-    except Exception as exc:
+    except Exception:
         pass
 
     # Last resort: screensaver
     try:
-        result = _osascript(
+        _osascript(
             'tell application "System Events" to start current screen saver'
         )
         return "Screen saver started."

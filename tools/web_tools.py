@@ -67,7 +67,6 @@ def get_weather(location: str = "") -> str:
         for i, day in enumerate(weather_days[:3]):
             hi       = day.get("maxtempF", "?")
             lo       = day.get("mintempF", "?")
-            rain_mm  = day.get("totalSnow_cm", "0")  # use precip field
             hourly   = day.get("hourly") or [{}]
             # Get midday conditions
             mid      = hourly[4] if len(hourly) > 4 else (hourly[-1] if hourly else {})
@@ -105,7 +104,7 @@ def get_forecast(location: str = "", days: int = 5) -> str:
     Get a detailed multi-day forecast optimised for trip packing decisions.
     Returns temperatures, rain chance, wind, and packing recommendations.
     """
-    import json, time
+    import json
     try:
         loc = urllib.parse.quote(location.strip() or "Atlanta Georgia")
         req = urllib.request.Request(
@@ -226,7 +225,109 @@ def _open_in_browser(url: str) -> str:
         return f"error: {exc}"
 
 
+# Known sites — when Dylan says "pull up X", go straight to the real domain
+# instead of Googling the word. Maps short names → URL.
+_KNOWN_SITES = {
+    "youtube":         "https://www.youtube.com",
+    "youtube music":   "https://music.youtube.com",
+    "yt":              "https://www.youtube.com",
+    "gmail":           "https://mail.google.com",
+    "google mail":     "https://mail.google.com",
+    "google drive":    "https://drive.google.com",
+    "drive":           "https://drive.google.com",
+    "google docs":     "https://docs.google.com",
+    "docs":            "https://docs.google.com",
+    "google sheets":   "https://sheets.google.com",
+    "sheets":          "https://sheets.google.com",
+    "google calendar": "https://calendar.google.com",
+    "google maps":     "https://maps.google.com",
+    "maps":            "https://maps.google.com",
+    "instagram":       "https://www.instagram.com",
+    "insta":           "https://www.instagram.com",
+    "ig":              "https://www.instagram.com",
+    "snapchat":        "https://web.snapchat.com",
+    "snap":            "https://web.snapchat.com",
+    "tiktok":          "https://www.tiktok.com",
+    "twitter":         "https://x.com",
+    "x":               "https://x.com",
+    "reddit":          "https://www.reddit.com",
+    "facebook":        "https://www.facebook.com",
+    "messenger":       "https://www.messenger.com",
+    "discord":         "https://discord.com/app",
+    "twitch":          "https://www.twitch.tv",
+    "amazon":          "https://www.amazon.com",
+    "ebay":            "https://www.ebay.com",
+    "netflix":         "https://www.netflix.com",
+    "hulu":            "https://www.hulu.com",
+    "disney plus":     "https://www.disneyplus.com",
+    "disney+":         "https://www.disneyplus.com",
+    "max":             "https://www.max.com",
+    "hbo":             "https://www.max.com",
+    "hbo max":         "https://www.max.com",
+    "peacock":         "https://www.peacocktv.com",
+    "peacock tv":      "https://www.peacocktv.com",
+    "prime video":     "https://www.primevideo.com",
+    "amazon prime":    "https://www.primevideo.com",
+    "paramount plus":  "https://www.paramountplus.com",
+    "paramount+":      "https://www.paramountplus.com",
+    "apple tv":        "https://tv.apple.com",
+    "crunchyroll":     "https://www.crunchyroll.com",
+    "espn plus":       "https://plus.espn.com",
+    "spotify":         "https://open.spotify.com",
+    "soundcloud":      "https://soundcloud.com",
+    "apple music":     "https://music.apple.com",
+    "github":          "https://github.com",
+    "linkedin":        "https://www.linkedin.com",
+    "chatgpt":         "https://chatgpt.com",
+    "claude":          "https://claude.ai",
+    "perplexity":      "https://www.perplexity.ai",
+    "wikipedia":       "https://www.wikipedia.org",
+    "stackoverflow":   "https://stackoverflow.com",
+    "stack overflow":  "https://stackoverflow.com",
+    "canvas":          "https://canvas.instructure.com",
+    "blackboard":      "https://blackboard.com",
+    "weather":         "https://weather.com",
+    "espn":            "https://www.espn.com",
+    "venmo":           "https://venmo.com",
+    "paypal":          "https://www.paypal.com",
+    "robinhood":       "https://robinhood.com",
+}
+
+
+def _resolve_known_site(query: str) -> str | None:
+    """
+    Match query against the known-sites map. Strips leading verbs
+    ('open', 'pull up', 'go to', 'launch') so "pull up youtube" works.
+    Returns the URL or None.
+    """
+    import re
+    q = query.strip().lower().rstrip(".!?,")
+    # Strip leading verb phrases — anything left should be a bare site name
+    q = re.sub(
+        r"^(?:please\s+)?(?:can\s+you\s+|could\s+you\s+)?"
+        r"(?:pull\s+up|open|go\s+to|launch|bring\s+up|navigate\s+to|"
+        r"show\s+me|take\s+me\s+to|fire\s+up|start\s+up)\s+",
+        "", q,
+    )
+    q = re.sub(r"^(?:the|my|some)\s+", "", q)
+    q = q.strip()
+    # Exact match
+    if q in _KNOWN_SITES:
+        return _KNOWN_SITES[q]
+    # Bare domain ("youtube.com") → use it directly
+    if re.fullmatch(r"[a-z0-9-]+\.[a-z]{2,}(?:/.*)?", q):
+        return "https://" + q
+    return None
+
+
 def web_search(query: str) -> str:
+    # Known-sites shortcut: "pull up youtube" → youtube.com, not Google search.
+    site_url = _resolve_known_site(query)
+    if site_url:
+        result = _open_in_browser(site_url)
+        if result.startswith("error"):
+            return f"Couldn't open browser: {result}"
+        return f"Opened {site_url}"
     url = "https://www.google.com/search?q=" + urllib.parse.quote(query)
     result = _open_in_browser(url)
     if result.startswith("error"):
@@ -456,7 +557,7 @@ def deep_research(query: str) -> str:
                 url,
                 headers={"User-Agent": "Mozilla/5.0"},
             )
-            with urllib.request.urlopen(page_req, timeout=6) as resp:
+            with urllib.request.urlopen(page_req, timeout=6, context=_SSL_CTX) as resp:
                 page_html = resp.read().decode("utf-8", errors="ignore")
 
             # Strip tags, get readable text
@@ -520,7 +621,7 @@ def get_wikipedia_summary(query: str, sentences: int = 12) -> str:
             extract_url,
             headers={"User-Agent": "JARVIS/1.0 (contact@jarvis.ai)"},
         )
-        with urllib.request.urlopen(req2, timeout=8) as resp:
+        with urllib.request.urlopen(req2, timeout=8, context=_SSL_CTX) as resp:
             extract_data = _json.loads(resp.read())
 
         pages = extract_data.get("query", {}).get("pages", {})
