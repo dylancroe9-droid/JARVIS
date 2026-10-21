@@ -45,8 +45,15 @@
 
   // Accent: remap the palette variables to the product accent. Most of the UI
   // reads var(--cyan); raw #00d4ff usages are cleaned up separately.
+  //
+  // Alex is study-only, so it does NOT show JARVIS's ambient "home screen" — the
+  // telemetry side panels (clock, CPU, memory, uptime, brain/link status). Those
+  // are hidden here so Alex opens as a clean study screen: just the conversation,
+  // the study quick-actions, and the input. JARVIS keeps its full HUD.
   const a = product.accent
   const style = document.createElement('style')
-  style.textContent = `:root{--cyan:${a};--cyan-dim:${a}8c;--cyan-glow:${a}1f;--accent:${a};}`
+  style.textContent =
+    `:root{--cyan:${a};--cyan-dim:${a}8c;--cyan-glow:${a}1f;--accent:${a};}` +
+    `#hud-left-panels,#hud-right-panels{display:none !important;}`
   ;(document.head || document.documentElement).appendChild(style)
 })()
